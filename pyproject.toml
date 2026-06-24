@@ -1,0 +1,12 @@
+[project]
+name = "smart-traffic-agent"
+version = "0.1.0"
+description = "Multi-agent workflow for CNC protocol traffic generation."
+requires-python = ">=3.10"
+dependencies = [
+  "langchain>=0.3",
+  "langgraph>=0.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

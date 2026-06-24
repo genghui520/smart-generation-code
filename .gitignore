@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+runs/
+
+# Generated RAG artifacts. Rebuild them with the CLI commands in README.md.
+rag_indexes/focas/*.jsonl
+!rag_indexes/focas/*.sample.jsonl
+rag_indexes/focas/rule_extraction_batches/
+rag_indexes/focas/rule_extraction_results/
+
+# Local source manuals and temporary files.
+*.pdf
+*.PDF
+*.tmp
