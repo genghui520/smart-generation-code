@@ -22,6 +22,17 @@ class SimulatedCncClient:
         self.program_name = parameters.get("program_name", self.program_name)
         return {"status_code": 0, "program_name": self.program_name, "selected": True}
 
+    def _handle_ReadProgramNumber(self, parameters: dict) -> dict:
+        program_number = 0
+        if self.program_name:
+            digits = "".join(ch for ch in self.program_name if ch.isdigit())
+            program_number = int(digits or 0)
+        return {
+            "status_code": 0,
+            "running_program": program_number if self.running else 0,
+            "main_program": program_number,
+        }
+
     def _handle_StartProgram(self, parameters: dict) -> dict:
         self.running = True
         self.tick = 0
@@ -66,4 +77,3 @@ class SimulatedCncClient:
 
     def _handle_unknown(self, parameters: dict) -> dict:
         return {"status_code": 404, "error": "unknown interface"}
-

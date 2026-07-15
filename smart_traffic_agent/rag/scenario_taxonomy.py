@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,30 @@ class ScenarioDefinition:
     recommended_api_functions: list[str]
     distinguishing_signals: list[str]
     allowed_rule_types: list[str]
+
+
+@dataclass(slots=True)
+class ProtocolTaxonomy:
+    protocol: str
+    rule_types: dict[str, str]
+    scenarios: list[ScenarioDefinition]
+    rule_extraction_schema: dict[str, Any]
+
+    @property
+    def allowed_rule_types(self) -> set[str]:
+        return set(self.rule_types)
+
+    @property
+    def allowed_scenarios(self) -> set[str]:
+        return {scenario.scenario_id for scenario in self.scenarios}
+
+    @property
+    def fallback_scenario(self) -> str:
+        if "general_status_collection" in self.allowed_scenarios:
+            return "general_status_collection"
+        if self.scenarios:
+            return self.scenarios[0].scenario_id
+        return ""
 
 
 SCENARIOS = [
@@ -372,3 +397,136 @@ TEXT:
 def write_rule_extraction_prompt(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(build_rule_extraction_prompt(), encoding="utf-8")
+
+
+def default_taxonomy() -> ProtocolTaxonomy:
+    return ProtocolTaxonomy(
+        protocol="focas",
+        rule_types=RULE_TYPES,
+        scenarios=SCENARIOS,
+        rule_extraction_schema=RULE_EXTRACTION_JSON_SCHEMA,
+    )
+
+
+def scenario_from_dict(data: dict[str, Any]) -> ScenarioDefinition:
+    return ScenarioDefinition(
+        scenario_id=str(data.get("scenario_id", "")).strip(),
+        name=str(data.get("name", "")).strip(),
+        goal=str(data.get("goal", "")).strip(),
+        traffic_value=string_list(data.get("traffic_value")),
+        typical_nc_program=string_list(data.get("typical_nc_program")),
+        operation_phases=string_list(data.get("operation_phases")),
+        recommended_api_functions=string_list(data.get("recommended_api_functions")),
+        distinguishing_signals=string_list(data.get("distinguishing_signals")),
+        allowed_rule_types=string_list(data.get("allowed_rule_types")) or list(RULE_TYPES),
+    )
+
+
+def string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    return [str(value)] if str(value).strip() else []
+
+
+def load_taxonomy(path: Path | None = None) -> ProtocolTaxonomy:
+    if path is None:
+        return default_taxonomy()
+    data = json.loads(path.read_text(encoding="utf-8"))
+    scenarios = [scenario_from_dict(row) for row in data.get("scenarios", [])]
+    scenarios = [scenario for scenario in scenarios if scenario.scenario_id]
+    if not scenarios:
+        raise ValueError(f"{path} does not contain any scenarios")
+    rule_types = data.get("rule_types") or RULE_TYPES
+    if not isinstance(rule_types, dict) or not rule_types:
+        raise ValueError(f"{path} rule_types must be a non-empty object")
+    return ProtocolTaxonomy(
+        protocol=str(data.get("protocol") or path.parent.name or "protocol"),
+        rule_types={str(key): str(value) for key, value in rule_types.items()},
+        scenarios=scenarios,
+        rule_extraction_schema=data.get("rule_extraction_schema") or RULE_EXTRACTION_JSON_SCHEMA,
+    )
+
+
+def taxonomy_dict(taxonomy: ProtocolTaxonomy | None = None) -> dict[str, Any]:
+    taxonomy = taxonomy or default_taxonomy()
+    return {
+        "protocol": taxonomy.protocol,
+        "rule_types": taxonomy.rule_types,
+        "scenarios": [asdict(scenario) for scenario in taxonomy.scenarios],
+        "rule_extraction_schema": taxonomy.rule_extraction_schema,
+    }
+
+
+def write_taxonomy(path: Path, taxonomy: ProtocolTaxonomy | None = None) -> None:
+    write_json(path, taxonomy_dict(taxonomy))
+
+
+def build_rule_extraction_prompt(taxonomy: ProtocolTaxonomy | None = None) -> str:
+    taxonomy = taxonomy or default_taxonomy()
+    scenario_lines = "\n".join(
+        f"- {scenario.scenario_id}: {scenario.name}. {scenario.goal}"
+        for scenario in taxonomy.scenarios
+    )
+    rule_type_lines = "\n".join(
+        f"- {name}: {description}" for name, description in taxonomy.rule_types.items()
+    )
+    rule_type_choices = " | ".join(taxonomy.rule_types)
+    fallback = taxonomy.fallback_scenario or "general_status_collection"
+
+    return f"""你是工业控制协议流量生成规则抽取专家。
+目标：从给定的 {taxonomy.protocol} 协议或设备资料片段中，抽取对生成高覆盖、高区分度、高质量工业协议流量有用的规则。
+
+只允许输出以下规则类型：
+{rule_type_lines}
+
+scenario 必须从以下场景列表选择，不允许自造场景名：
+{scenario_lines}
+
+不要抽取目录、前言、版权、泛泛安全提醒、与流量生成无关的纯说明。
+不要输出 source_file、source_chunk_id、page_start、page_end、section_title；这些字段由程序根据输入 chunk 自动补充。
+
+只输出合法 JSON，不要 Markdown，不要解释。格式必须是：
+{{
+  "rules": [
+    {{
+      "rule_type": "{rule_type_choices}",
+      "scenario": "",
+      "traffic_value": [],
+      "applicable_environment": ["simulator"],
+      "rule_text": "",
+      "nc_program_requirements": [],
+      "operation_sequence": [],
+      "collection_timing": [],
+      "recommended_api_functions": [],
+      "allowed_operations": [],
+      "restricted_operations": [],
+      "abnormal_traffic_allowed": [],
+      "distinguishing_signals": [],
+      "quality_checks": []
+    }}
+  ]
+}}
+
+字段要求：
+- 如果片段没有有用规则，输出 {{"rules": []}}。
+- rule_type 只能从上述 rule_types 选择。
+- scenario 必须从上面的场景列表选择；无法归类时使用 {fallback}。
+- recommended_api_functions 只填写资料中明确支持的函数、API、服务名或协议操作；不确定则留空。
+- rule_text 用中文，简洁说明这条规则如何帮助流量生成。
+- 不要编造资料片段没有支持的事实。
+
+输入片段格式：
+CHUNK_ID: ...
+SOURCE_FILE: ...
+PAGES: ...
+SECTION: ...
+TEXT:
+...
+"""
+
+
+def write_rule_extraction_prompt(path: Path, taxonomy: ProtocolTaxonomy | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(build_rule_extraction_prompt(taxonomy), encoding="utf-8")

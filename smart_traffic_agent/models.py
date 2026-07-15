@@ -10,7 +10,6 @@ WorkflowStage = Literal[
     "planning",
     "code_generation",
     "execution",
-    "annotation",
     "complete",
     "repair_plan",
     "repair_code",
@@ -28,6 +27,7 @@ class TaskRequest:
     task_id: str
     protocol: str = "cnc"
     target_environment: str = "simulator"
+    permissions: dict[str, bool] = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now)
 
 
@@ -54,6 +54,16 @@ class PlanStep:
     repeat: int = 1
     interval_seconds: float = 0.0
     expected_state: str = ""
+    protocol_function: str = ""
+
+
+@dataclass(slots=True)
+class NcProgramSpec:
+    program_name: str
+    purpose: str = ""
+    block_goals: list[str] = field(default_factory=list)
+    constraints: list[str] = field(default_factory=list)
+    generation_notes: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -65,9 +75,12 @@ class ExecutionPlan:
     target_environment: str
     nc_program_type: str
     nc_program_requirements: list[str]
+    nc_program_spec: NcProgramSpec
     steps: list[PlanStep]
     expected_outputs: list[str]
     retrieved_chunk_ids: list[str] = field(default_factory=list)
+    rag_context: dict[str, Any] = field(default_factory=dict)
+    llm_notes: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -89,6 +102,7 @@ class ApiCallLog:
     input_parameters: dict[str, Any]
     status_code: int
     response: dict[str, Any]
+    protocol_function: str = ""
     semantic_label: str = ""
     error: str | None = None
 
@@ -104,6 +118,21 @@ class CaptureEvent:
 
 
 @dataclass(slots=True)
+class ToolCallRecord:
+    tool_name: str
+    started_at: str
+    completed_at: str
+    duration_ms: int
+    success: bool
+    input_summary: dict[str, Any] = field(default_factory=dict)
+    output_summary: dict[str, Any] = field(default_factory=dict)
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class ExecutionResult:
     task_id: str
     success: bool
@@ -111,6 +140,15 @@ class ExecutionResult:
     capture_events: list[CaptureEvent]
     output_dir: Path
     errors: list[str] = field(default_factory=list)
+    tool_calls: list[ToolCallRecord] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class QualityAssessment:
+    passed: bool
+    issues: list[str] = field(default_factory=list)
+    metrics: dict[str, Any] = field(default_factory=dict)
+    recommendations: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -118,6 +156,7 @@ class MappingRecord:
     task_id: str
     log_timestamp: str
     interface_name: str
+    protocol_function: str
     semantic_label: str
     related_capture_indexes: list[int]
     input_parameters: dict[str, Any]
@@ -132,10 +171,12 @@ class WorkflowState:
     plan: ExecutionPlan | None = None
     artifacts: GeneratedArtifacts | None = None
     result: ExecutionResult | None = None
+    quality_assessment: QualityAssessment | None = None
     mapping: list[MappingRecord] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     repair_attempts: int = 0
+    repair_history: list[dict[str, Any]] = field(default_factory=list)
+    long_term_memories: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
-

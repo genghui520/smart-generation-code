@@ -1,7 +1,12 @@
 .venv/
+.env
+.tools/
+.vscode/
 __pycache__/
 *.py[cod]
 *$py.class
+*.obj
+*.exe
 
 .pytest_cache/
 .mypy_cache/
@@ -14,8 +19,20 @@ rag_indexes/focas/*.jsonl
 !rag_indexes/focas/*.sample.jsonl
 rag_indexes/focas/rule_extraction_batches/
 rag_indexes/focas/rule_extraction_results/
+rag_indexes/focas/vector_db/
+rag_indexes/focas/final_scenario_templates.json
+rag_indexes/focas/rule_extraction_results_merged.json
+rag_indexes/focas/scenario_21_clusters.json
+rag_indexes/focas/scenario_cluster_review.csv
+rag_indexes/focas/scenario_clusters*.json
+rag_indexes/focas/scenario_knowledge.json
+
+# Generated clustering reports and figures.
+docs/
 
 # Local source manuals and temporary files.
 *.pdf
 *.PDF
 *.tmp
+Fwlib*.dll
+fwlib*.dll

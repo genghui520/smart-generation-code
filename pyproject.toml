@@ -4,8 +4,11 @@ version = "0.1.0"
 description = "Multi-agent workflow for CNC protocol traffic generation."
 requires-python = ">=3.10"
 dependencies = [
+  "chromadb>=1.5",
   "langchain>=0.3",
+  "langchain-openai>=0.3",
   "langgraph>=0.2",
+  "sentence-transformers>=5.0",
 ]
 
 [tool.pytest.ini_options]
