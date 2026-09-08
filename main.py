@@ -17,6 +17,7 @@ DEFAULT_TASK = (
 DEFAULT_OUT = Path("runs/focas_nc_position_main")
 DEFAULT_VECTOR_DB = Path("rag_indexes/focas/vector_db")
 DEFAULT_FOCAS_HEADER_DIR = Path(r"C:\Lib\FOCAS2 Library\Fwlib\0iD")
+DEFAULT_PCAP_NETWORK_DEVICE = r"\Device\NPF_Loopback"
 VERBOSE_CONSOLE = False
 RUN_STARTED_AT: float | None = None
 AGENT_STARTED_AT: dict[str, float] = {}
@@ -39,10 +40,31 @@ def parse_args() -> argparse.Namespace:
             "Use ncguide-bridge-readonly for the older fixed read-only bridge path."
         ),
     )
+    parser.add_argument(
+        "--quality-gate",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable dynamic output-quality gating. Defaults off for simulator and on for real targets.",
+    )
+    parser.add_argument(
+        "--representative-scenario",
+        action="store_true",
+        help="Use scenario-focused planning for RQ1/RQ3 representative benchmarks instead of global function coverage.",
+    )
     parser.add_argument("--llm-provider", default="openai_compatible", choices=["disabled", "tokenhub", "openai_compatible"])
     parser.add_argument("--llm-model", default="gpt-5.5")
     parser.add_argument("--llm-base-url", default="https://fast.smartaipro.cn/v1")
     parser.add_argument("--llm-api-key-env", default="SMARTAIPRO_API_KEY")
+    parser.add_argument("--llm-wire-api", default="chat_completions", choices=["chat_completions", "responses"])
+    parser.add_argument("--llm-reasoning-effort", default=None, choices=["low", "medium", "high"])
+    parser.add_argument("--llm-max-output-tokens", type=int, default=None)
+    parser.add_argument("--llm-timeout-seconds", type=float, default=120.0)
+    parser.add_argument(
+        "--llm-transport",
+        default="sdk",
+        choices=["sdk", "http"],
+        help="LLM transport; use http for gateways that block SDK headers.",
+    )
     parser.add_argument(
         "--focas-header-dir",
         type=Path,
@@ -51,8 +73,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--allow-delete-all-programs",
-        action="store_true",
-        help="Authorize PlannerAgent to consider cnc_delall for this run. Disabled by default.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Authorize generated C++ to use cnc_delall when runtime collision handling requires it. Enabled by default for the isolated NCGuide experiment.",
     )
     parser.add_argument(
         "--trigger-ncguide-ui",
@@ -60,7 +83,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Enable NCGuide UI cycle-start triggering inside the generated C++ script. Enabled by default.",
     )
-    parser.add_argument("--ncguide-window-title", default="FANUC CNC GUIDE")
+    parser.add_argument("--ncguide-window-title", default="Main Panel")
     parser.add_argument("--ncguide-start-button-text", default="")
     parser.add_argument("--ncguide-mode-x", type=int, default=0)
     parser.add_argument("--ncguide-mode-y", type=int, default=0)
@@ -70,8 +93,19 @@ def parse_args() -> argparse.Namespace:
         choices=["client", "screen"],
         help="Use screen coordinates for NCGuide floating panels, or client coordinates for the main window.",
     )
-    parser.add_argument("--ncguide-cycle-start-x", type=int, default=989)
-    parser.add_argument("--ncguide-cycle-start-y", type=int, default=914)
+    parser.add_argument("--ncguide-cycle-start-x", type=int, default=972)
+    parser.add_argument("--ncguide-cycle-start-y", type=int, default=973)
+    parser.add_argument(
+        "--pcap-network-device",
+        default=os.environ.get("PCAP_NETWORK_DEVICE", DEFAULT_PCAP_NETWORK_DEVICE),
+        help="Npcap device used for real Wireshark-compatible packet capture.",
+    )
+    parser.add_argument(
+        "--focas-port",
+        type=int,
+        default=int(os.environ.get("FOCAS_PORT", "8193")),
+        help="FOCAS Ethernet TCP port used by NCGuide.",
+    )
     parser.add_argument(
         "--manual-cycle-start-wait",
         type=int,
@@ -84,6 +118,11 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         default=True,
         help="Only run planning and code generation. By default, ExecutionAgent is connected and executed.",
+    )
+    parser.add_argument(
+        "--code-only-evaluation",
+        action="store_true",
+        help="Generate and compile the FOCAS client only; omit traffic capture, CSV collection, simulator UI, and runtime logs.",
     )
     parser.add_argument(
         "--verbose-console",
@@ -130,6 +169,11 @@ def main() -> int:
             model=args.llm_model,
             base_url=args.llm_base_url,
             api_key_env=args.llm_api_key_env,
+            transport=args.llm_transport,
+            wire_api=args.llm_wire_api,
+            reasoning_effort=args.llm_reasoning_effort,
+            max_output_tokens=args.llm_max_output_tokens,
+            timeout_seconds=args.llm_timeout_seconds,
         )
     )
 
@@ -150,7 +194,12 @@ def main() -> int:
             task_id=args.task_id,
             protocol=args.protocol,
             target_environment=args.target,
-            permissions={"allow_delete_all_programs": args.allow_delete_all_programs},
+            permissions={
+                "allow_delete_all_programs": args.allow_delete_all_programs,
+                "representative_scenario": args.representative_scenario,
+                "code_only_evaluation": args.code_only_evaluation,
+            },
+            quality_gate_enabled=(args.quality_gate if args.quality_gate is not None else args.target != "simulator"),
         )
     )
     state.long_term_memories = memory_store.search(args.task)
@@ -161,8 +210,9 @@ def main() -> int:
         print("\n========== Runtime ==========", flush=True)
         state = workflow.run(state.request, out_dir)
         summary = workflow_summary(state)
+        summary["llm_usage"] = summarize_llm_usage(llm_client)
         write_json(out_dir / "summary.json", summary)
-        metrics = build_run_metrics(state, summary)
+        metrics = build_run_metrics(state, summary, llm_client=llm_client)
         write_json(out_dir / "run_metrics.json", metrics)
         if VERBOSE_CONSOLE:
             print_detailed_outputs(state)
@@ -231,9 +281,10 @@ def main() -> int:
 
     # 14. 写出本次运行摘要，便于论文实验记录和后续批量对比。
     summary = workflow_summary(state)
+    summary["llm_usage"] = summarize_llm_usage(llm_client)
     memory_store.remember_workflow(state)
     write_json(out_dir / "summary.json", summary)
-    metrics = build_run_metrics(state, summary)
+    metrics = build_run_metrics(state, summary, llm_client=llm_client)
     write_json(out_dir / "run_metrics.json", metrics)
     if VERBOSE_CONSOLE:
         print("\n========== Summary ==========")
@@ -254,6 +305,8 @@ def configure_ncguide_ui_env(args: argparse.Namespace) -> None:
     os.environ["NCGUIDE_CYCLE_START_X"] = str(args.ncguide_cycle_start_x)
     os.environ["NCGUIDE_CYCLE_START_Y"] = str(args.ncguide_cycle_start_y)
     os.environ["NCGUIDE_MANUAL_START_WAIT_SECONDS"] = str(args.manual_cycle_start_wait)
+    os.environ["PCAP_NETWORK_DEVICE"] = args.pcap_network_device
+    os.environ["FOCAS_PORT"] = str(args.focas_port)
 
 
 def next_run_output_dir(base_out: Path) -> Path:
@@ -490,7 +543,18 @@ def format_elapsed(seconds: float) -> str:
     return f"{minutes}m{remainder:04.1f}s"
 
 
-def build_run_metrics(state: WorkflowState, summary: dict) -> dict:
+def summarize_llm_usage(llm_client: LlmClient) -> dict[str, object]:
+    usage_rows = llm_client.usage_history
+    return {
+        "request_count": len(usage_rows),
+        "prompt_tokens": sum(int(row.get("prompt_tokens", 0) or 0) for row in usage_rows),
+        "completion_tokens": sum(int(row.get("completion_tokens", 0) or 0) for row in usage_rows),
+        "total_tokens": sum(int(row.get("total_tokens", 0) or 0) for row in usage_rows),
+        "requests": usage_rows,
+    }
+
+
+def build_run_metrics(state: WorkflowState, summary: dict, *, llm_client: LlmClient | None = None) -> dict:
     quality_metrics = {}
     if state.quality_assessment is not None:
         quality_metrics = state.quality_assessment.metrics
@@ -536,6 +600,7 @@ def build_run_metrics(state: WorkflowState, summary: dict) -> dict:
         "motion_active_count": quality_metrics.get("motion_active_count"),
         "plan_steps": len(state.plan.steps) if state.plan is not None else 0,
         "scenario_type": state.plan.scenario_type if state.plan is not None else None,
+        "llm_usage": summarize_llm_usage(llm_client) if llm_client is not None else {},
         "retrieved_chunks": len(state.retrieved_chunks),
         "long_term_memory_count": len(state.long_term_memories),
         "artifact_diagnostics_count": len(artifact_diagnostics),

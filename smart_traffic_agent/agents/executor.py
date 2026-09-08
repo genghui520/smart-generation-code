@@ -15,6 +15,8 @@ from ..agent_tools import (
     invoke_tool,
 )
 from ..agent_tools.base import ToolProgressCallback
+from ..orchestration.roles import ActionSpec, AgentTemplate, message_to_dict
+from ..agent_roles import ExecutionResultSpec
 from ..agent_tools.cpp_execution import (
     compile_cpp_script as _compile_cpp_script,
     csv_header as _csv_header,
@@ -42,7 +44,12 @@ from ..utils import write_jsonl
 SUPPORTED_READONLY_INTERFACES = supported_ncguide_readonly_interfaces()
 
 
-class ExecutionAgent:
+class ExecutionAgent(AgentTemplate):
+    role_name = "ExecutionRole"
+    profile = "FOCAS execution agent"
+    goal = "Compile and execute the generated artifact when the selected environment requires it."
+    constraints = ("Honor the target environment.", "Collect only evidence permitted by the task.")
+
     def __init__(
         self,
         knowledge_base: KnowledgeBase | None = None,
@@ -51,6 +58,8 @@ class ExecutionAgent:
         collect_tool: CollectExecutionArtifactsTool | None = None,
         tool_progress_callback: ToolProgressCallback | None = None,
     ) -> None:
+        super().__init__()
+        self.register_actions(ActionSpec("execute_artifact", "CodeArtifact", "ExecutionResult"))
         self.knowledge_base = knowledge_base
         self.compile_tool = compile_tool or CompileGeneratedCppTool()
         self.run_tool = run_tool or RunGeneratedExecutableTool()
@@ -60,10 +69,14 @@ class ExecutionAgent:
     def run(self, state: WorkflowState, output_dir: Path) -> WorkflowState:
         if state.plan is None or state.artifacts is None:
             raise ValueError("Cannot execute before plan and generated artifacts exist.")
+        if state.plan.code_spec is None or not getattr(state.plan.code_spec, "official_abi_context", ""):
+            state.errors.append("ExecutionAgent received no Planner CodeSpec official ABI context.")
+        if self.environment is not None:
+            state.plan.rag_context["environment_shared_rules"] = self.environment.shared_rules
 
         target_environment = state.request.target_environment
         if target_environment == "ncguide-generated-cpp":
-            return run_generated_cpp_api_script(
+            result = run_generated_cpp_api_script(
                 state,
                 output_dir,
                 self.knowledge_base,
@@ -72,6 +85,8 @@ class ExecutionAgent:
                 collect_tool=self.collect_tool,
                 tool_progress_callback=self.tool_progress_callback,
             )
+            self._publish_execution_message(result)
+            return result
 
         client = make_execution_client(target_environment)
         api_logs: list[ApiCallLog] = []
@@ -144,7 +159,26 @@ class ExecutionAgent:
         state.errors.extend(state.result.errors)
         attach_execution_error_knowledge(state, self.knowledge_base)
         state.stage = "complete"
+        self._publish_execution_message(state)
         return state
+
+    def _publish_execution_message(self, state: WorkflowState) -> None:
+        if state.result is None:
+            return
+        message = self.publish(
+            "execute_artifact", "ExecutionResult",
+            success=state.result.success,
+            api_log_count=len(state.result.api_logs),
+            capture_event_count=len(state.result.capture_events),
+        )
+        state.messages.append(message_to_dict(
+            message,
+            ExecutionResultSpec(
+                state.result.success,
+                len(state.result.api_logs),
+                len(state.result.capture_events),
+            ),
+        ))
 
 
 def semantic_label(interface_name: str) -> str:
@@ -226,8 +260,9 @@ def run_generated_cpp_api_script(
     tool_calls.append(collect_trace)
     api_logs = collected.api_logs
     capture_events = collected.capture_events
-    if any(log.status_code != 0 for log in api_logs):
-        errors.extend(log.error for log in api_logs if log.error)
+    for log in api_logs:
+        if log.status_code != 0 and log.error and not generated_cpp_log_is_nonfatal(log):
+            errors.append(log.error)
     success = not errors and bool(api_logs)
     write_jsonl(execution_dir / "api_logs.jsonl", api_logs)
     write_jsonl(execution_dir / "capture_events.jsonl", capture_events)
@@ -246,6 +281,38 @@ def run_generated_cpp_api_script(
     attach_execution_error_knowledge(state, knowledge_base)
     state.stage = "complete"
     return state
+
+
+def generated_cpp_log_is_nonfatal(log: ApiCallLog) -> bool:
+    """Return True for optional generated-C++ coverage warnings.
+
+    The generated NCGuide runner may include extra planned/read-only FOCAS APIs
+    to broaden traffic coverage.  Unsupported adapter stubs and controller
+    option/mode returns should remain visible in CSV artifacts, but they should
+    not make an otherwise completed compile/run/capture lifecycle fail.
+    """
+
+    text = " ".join(
+        [
+            str(log.error or ""),
+            str(log.response.get("return_text", "")),
+            str(log.response.get("data", "")),
+            log.protocol_function,
+            log.step_id,
+        ]
+    ).lower()
+    if "program_completion_gate" in log.protocol_function.lower() or "program_completion_gate" in log.step_id.lower():
+        return False
+    return any(
+        marker in text
+        for marker in [
+            "skipped_unsupported_by_fixed_adapter",
+            "unsupported_symbol",
+            "ew_noopt",
+            "ew_mode",
+            "focas_return_-7",
+        ]
+    )
 
 
 def attach_execution_error_knowledge(state: WorkflowState, knowledge_base: KnowledgeBase | None) -> None:

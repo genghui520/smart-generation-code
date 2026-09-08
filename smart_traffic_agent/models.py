@@ -28,6 +28,8 @@ class TaskRequest:
     protocol: str = "cnc"
     target_environment: str = "simulator"
     permissions: dict[str, bool] = field(default_factory=dict)
+    # Dynamic output-quality checks can be disabled for local simulator tests.
+    quality_gate_enabled: bool = True
     created_at: str = field(default_factory=utc_now)
 
 
@@ -55,6 +57,8 @@ class PlanStep:
     interval_seconds: float = 0.0
     expected_state: str = ""
     protocol_function: str = ""
+    operation_kind: Literal["focas_api", "focas_sequence", "host_helper", "ncguide_ui"] = "focas_api"
+    api_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -81,6 +85,7 @@ class ExecutionPlan:
     retrieved_chunk_ids: list[str] = field(default_factory=list)
     rag_context: dict[str, Any] = field(default_factory=dict)
     llm_notes: list[str] = field(default_factory=list)
+    code_spec: Any | None = None
 
 
 @dataclass(slots=True)
@@ -177,6 +182,7 @@ class WorkflowState:
     repair_attempts: int = 0
     repair_history: list[dict[str, Any]] = field(default_factory=list)
     long_term_memories: list[dict[str, Any]] = field(default_factory=list)
+    messages: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

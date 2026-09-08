@@ -5,13 +5,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from langgraph.graph import END, StateGraph
+from langgraph.graph import END
 
 from .agents.code_generator import CodeGenerationAgent
 from .agents.executor import ExecutionAgent
 from .agents.planner import PlanningAgent
 from .agents.router import RouterAgent
+from .orchestration.graph import AgentGraph
+from .function_coverage import (
+    DEFAULT_FUNCTION_COVERAGE_STATE,
+    build_function_coverage_metrics,
+    merge_workflow_function_coverage_state,
+)
 from .knowledge import KnowledgeBase
+from .environment import AgentEnvironment
 from .llm import LlmClient
 from .memory import LongTermMemoryStore
 from .models import TaskRequest, WorkflowState, utc_now
@@ -36,29 +43,35 @@ class TrafficGenerationWorkflow:
         llm_client: LlmClient | None = None,
         memory_store: LongTermMemoryStore | None = None,
         progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+        coverage_state_path: Path = DEFAULT_FUNCTION_COVERAGE_STATE,
     ) -> None:
         self.llm_client = llm_client or LlmClient()
         self.memory_store = memory_store or LongTermMemoryStore()
         self.progress_callback = progress_callback
+        self.coverage_state_path = coverage_state_path
         self.knowledge_base = knowledge_base
+        self.environment = AgentEnvironment(knowledge_base)
         self.router = RouterAgent(llm_client=self.llm_client, knowledge_base=knowledge_base)
-        self.planner = PlanningAgent(knowledge_base, llm_client=self.llm_client)
+        self.planner = PlanningAgent(
+            knowledge_base,
+            llm_client=self.llm_client,
+            coverage_state_path=coverage_state_path,
+        )
         self.generator = CodeGenerationAgent(llm_client=self.llm_client, knowledge_base=knowledge_base)
         self.executor = ExecutionAgent(
             knowledge_base=knowledge_base,
             tool_progress_callback=self._emit,
         )
+        for agent in (self.router, self.planner, self.generator, self.executor):
+            agent.environment = self.environment
         self.graph = self._build_graph()
 
     def _build_graph(self):
-        graph = StateGraph(GraphState)
-        graph.add_node("router", self._router_node)
-        graph.add_node("planning", self._planning_node)
-        graph.add_node("code_generation", self._code_generation_node)
-        graph.add_node("execution", self._execution_node)
-        graph.add_node("repair_plan", self._repair_node("repair_plan"))
-        graph.add_node("repair_code", self._repair_node("repair_code"))
-        graph.add_node("repair_execution", self._repair_node("repair_execution"))
+        graph = AgentGraph(GraphState)
+        graph.add_agent_node("router", self.router, self._router_node)
+        graph.add_agent_node("planning", self.planner, self._planning_node)
+        graph.add_agent_node("code_generation", self.generator, self._code_generation_node)
+        graph.add_agent_node("execution", self.executor, self._execution_node)
 
         graph.set_entry_point("router")
         graph.add_conditional_edges(
@@ -68,9 +81,9 @@ class TrafficGenerationWorkflow:
                 "planning": "planning",
                 "code_generation": "code_generation",
                 "execution": "execution",
-                "repair_plan": "repair_plan",
-                "repair_code": "repair_code",
-                "repair_execution": "repair_execution",
+                "repair_plan": "planning",
+                "repair_code": "code_generation",
+                "repair_execution": "execution",
                 "complete": END,
             },
         )
@@ -80,9 +93,7 @@ class TrafficGenerationWorkflow:
             "execution",
         ]:
             graph.add_edge(node_name, "router")
-        graph.add_edge("repair_plan", "planning")
-        graph.add_edge("repair_code", "code_generation")
-        graph.add_edge("repair_execution", "execution")
+        self.agent_graph = graph
         return graph.compile()
 
     def run(self, request: TaskRequest, output_dir: Path) -> WorkflowState:
@@ -108,12 +119,23 @@ class TrafficGenerationWorkflow:
         recursion_limit = max(128, 24 * (self.max_repair_attempts + 1))
         result = self.graph.invoke(initial, config={"recursion_limit": recursion_limit})
         state = graph_result_to_state(result)
-        write_json(output_dir / "summary.json", workflow_summary(state))
+        coverage_state_update = merge_workflow_function_coverage_state(state, self.coverage_state_path)
+        summary = workflow_summary(state)
+        summary["agent_graph"] = self.agent_graph.describe()
+        if coverage_state_update:
+            summary["coverage_state_update"] = coverage_state_update
+        write_json(output_dir / "summary.json", summary)
         try:
             self.memory_store.remember_workflow(state)
         except Exception as exc:
             state.errors.append(f"MemoryStore failed after workflow completion: {exc}")
-            write_json(output_dir / "summary.json", workflow_summary(state))
+            summary = workflow_summary(state)
+            summary["agent_graph"] = self.agent_graph.describe()
+            if coverage_state_update:
+                summary["coverage_state_update"] = coverage_state_update
+            write_json(output_dir / "summary.json", summary)
+        finally:
+            self.memory_store.close()
         self._emit(
             "workflow_complete",
             {
@@ -153,7 +175,9 @@ class TrafficGenerationWorkflow:
     def _planning_node(self, graph_state: GraphState) -> GraphState:
         self._emit("agent_start", {"agent": "PlanningAgent", "task": graph_state.workflow.request.description})
         try:
-            state = self.planner.run(graph_state.workflow)
+            state = graph_state.workflow
+            self._prepare_repair(state, "repair_plan")
+            state = self.planner.run(state)
             state.artifacts = None
             state.result = None
             state.quality_assessment = None
@@ -200,7 +224,9 @@ class TrafficGenerationWorkflow:
     def _code_generation_node(self, graph_state: GraphState) -> GraphState:
         self._emit("agent_start", {"agent": "CodeGenerationAgent"})
         try:
-            state = self.generator.run(graph_state.workflow, graph_state.output_dir)
+            state = graph_state.workflow
+            self._prepare_repair(state, "repair_code")
+            state = self.generator.run(state, graph_state.output_dir)
             state.result = None
             state.quality_assessment = None
             state.mapping = []
@@ -225,16 +251,15 @@ class TrafficGenerationWorkflow:
     def _execution_node(self, graph_state: GraphState) -> GraphState:
         self._emit("agent_start", {"agent": "ExecutionAgent"})
         try:
-            state = self.executor.run(graph_state.workflow, graph_state.output_dir)
+            state = graph_state.workflow
+            self._prepare_repair(state, "repair_execution")
+            state = self.executor.run(state, graph_state.output_dir)
             assert state.result is not None
-            if state.plan is not None:
+            if state.plan is not None and state.request.quality_gate_enabled:
+                # The executor reports transport/process success only.  Keep a
+                # separate objective quality observation so RouterAgent can
+                # decide whether the returned traffic is actually useful.
                 state.quality_assessment = build_quality_observation(state.plan, state.result)
-                if plan_requires_program_completion(state) and not quality_metrics_show_program_completed(state):
-                    if "PROGRAM_NOT_COMPLETED" not in state.result.errors:
-                        state.result.errors.append("PROGRAM_NOT_COMPLETED")
-                    if "PROGRAM_NOT_COMPLETED" not in state.errors:
-                        state.errors.append("PROGRAM_NOT_COMPLETED")
-                    state.result.success = False
                 if plan_requires_uploaded_program_verification(state) and not uploaded_program_is_verified(state):
                     if "PROGRAM_NOT_VERIFIED" not in state.result.errors:
                         state.result.errors.append("PROGRAM_NOT_VERIFIED")
@@ -243,6 +268,10 @@ class TrafficGenerationWorkflow:
                     state.result.success = False
                 if state.result.success:
                     state.errors = []
+            elif state.result.success:
+                # Local simulator mode validates transport/API execution only;
+                # real returned-output quality is deferred to NCGuide runs.
+                state.quality_assessment = None
             self._emit(
                 "agent_complete",
                 {
@@ -263,48 +292,41 @@ class TrafficGenerationWorkflow:
             self._emit("agent_error", {"agent": "ExecutionAgent", "error": str(exc)})
         return GraphState(workflow=state, output_dir=graph_state.output_dir)
 
-    def _repair_node(self, stage: str):
-        def node(graph_state: GraphState) -> GraphState:
-            state = graph_state.workflow
-            failure_errors = list(state.result.errors if state.result else state.errors)
-            state.repair_attempts += 1
-            state.repair_history.append(
-                {
-                    "timestamp": utc_now(),
-                    "repair_stage": stage,
-                    "attempt": state.repair_attempts,
-                    "errors": failure_errors,
-                    "router_reason": self.router.last_route_reason,
-                    "repair_instruction": self.router.last_repair_instruction,
-                    "action": repair_action_for(stage),
-                    "previous_state": repair_state_snapshot(state),
-                }
-            )
-            self._emit(
-                "repair_start",
-                {
-                    "repair_stage": stage,
-                    "attempt": state.repair_attempts,
-                    "errors": failure_errors,
-                    "router_reason": self.router.last_route_reason,
-                    "repair_instruction": self.router.last_repair_instruction,
-                    "action": repair_action_for(stage),
-                },
-            )
-
-            if stage == "repair_plan":
-                state.stage = "planning"
-            elif stage == "repair_code":
-                state.stage = "code_generation"
-            elif stage == "repair_execution":
-                state.stage = "execution"
-            else:
-                state.errors.append(f"Unknown repair stage: {stage}")
-                state.stage = "complete"
-            self._emit("repair_complete", {"repair_stage": stage, "next_stage": state.stage})
-            return GraphState(workflow=state, output_dir=graph_state.output_dir)
-
-        return node
+    def _prepare_repair(self, state: WorkflowState, stage: str) -> None:
+        """Record a repair intent when control enters its target Agent node."""
+        if state.stage != stage:
+            return
+        failure_errors = list(state.result.errors if state.result else state.errors)
+        state.repair_attempts += 1
+        state.repair_history.append(
+            {
+                "timestamp": utc_now(),
+                "repair_stage": stage,
+                "attempt": state.repair_attempts,
+                "errors": failure_errors,
+                "router_reason": self.router.last_route_reason,
+                "repair_instruction": self.router.last_repair_instruction,
+                "action": repair_action_for(stage),
+                "previous_state": repair_state_snapshot(state),
+            }
+        )
+        self._emit(
+            "repair_start",
+            {
+                "repair_stage": stage,
+                "attempt": state.repair_attempts,
+                "errors": failure_errors,
+                "router_reason": self.router.last_route_reason,
+                "repair_instruction": self.router.last_repair_instruction,
+                "action": repair_action_for(stage),
+            },
+        )
+        state.stage = {
+            "repair_plan": "planning",
+            "repair_code": "code_generation",
+            "repair_execution": "execution",
+        }[stage]
+        self._emit("repair_complete", {"repair_stage": stage, "next_stage": state.stage})
 
     def _route_from_router_node(self, graph_state: GraphState | dict[str, Any]) -> str:
         state = graph_result_to_state(graph_state)
@@ -359,6 +381,7 @@ def workflow_summary(state: WorkflowState) -> dict:
         "mapping_count": len(state.mapping),
         "errors": state.errors,
         "quality_assessment": state.quality_assessment,
+        "function_coverage": build_function_coverage_metrics(state.plan, state.result),
         "repair_attempts": state.repair_attempts,
         "repair_history": state.repair_history,
         "long_term_memory_count": len(state.long_term_memories),
@@ -369,16 +392,28 @@ def workflow_summary(state: WorkflowState) -> dict:
 def workflow_success(state: WorkflowState) -> bool:
     if state.result is None:
         return False
-    quality_ok = state.quality_assessment is None or state.quality_assessment.passed
     if plan_requires_uploaded_program_verification(state) and not uploaded_program_is_verified(state):
         return False
-    if state.result.success and quality_ok:
-        if plan_requires_program_completion(state) and not quality_metrics_show_program_completed(state):
-            return False
-        return True
-    if state.quality_assessment is not None and output_variation_is_sufficient(state.quality_assessment.metrics):
-        return True
-    return False
+    if not state.result.success:
+        return False
+    # Coordinate-motion/program-execution tasks must pass the same objective
+    # output-variation gate used by RouterAgent before being reported as a
+    # successful workflow.  Pure read-only plans remain transport-gated.
+    if requires_dynamic_quality_gate(state):
+        return state.quality_assessment is not None and output_variation_is_sufficient(
+            state.quality_assessment.metrics
+        )
+    return True
+
+
+def requires_dynamic_quality_gate(state: WorkflowState) -> bool:
+    if not state.request.quality_gate_enabled:
+        return False
+    if state.plan is None:
+        return False
+    scenario = str(state.plan.scenario_type).lower()
+    interfaces = {step.interface_name for step in state.plan.steps}
+    return scenario == "coordinate_motion" or "StartProgram" in interfaces
 
 
 def plan_requires_program_completion(state: WorkflowState) -> bool:

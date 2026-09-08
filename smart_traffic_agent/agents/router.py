@@ -2,10 +2,19 @@ from __future__ import annotations
 
 from ..knowledge import KnowledgeBase
 from ..llm import LlmClient
-from ..models import WorkflowStage, WorkflowState
+from ..models import ApiCallLog, WorkflowStage, WorkflowState
+from ..quality import output_variation_is_sufficient
+from ..orchestration.roles import ActionSpec, AgentTemplate
 
-class RouterAgent:
+class RouterAgent(AgentTemplate):
+    role_name = "RouterRole"
+    profile = "Workflow router"
+    goal = "Select one valid next stage and provide a concrete repair instruction when needed."
+    constraints = ("Only choose a stage from the workflow's valid transitions.",)
+
     def __init__(self, llm_client: LlmClient | None = None, knowledge_base: KnowledgeBase | None = None) -> None:
+        super().__init__()
+        self.register_actions(ActionSpec("route_stage", "WorkflowState", "WorkflowStage"))
         self.llm_client = llm_client or LlmClient()
         self.knowledge_base = knowledge_base
         self.last_route_source = "llm"
@@ -13,6 +22,16 @@ class RouterAgent:
         self.last_repair_instruction = ""
 
     def route(self, state: WorkflowState) -> WorkflowStage:
+        # Flow-style terminal guard.  Once execution has succeeded and the
+        # objective evidence is complete, do not let an LLM choose a repair
+        # branch again.  This prevents the historical "success -> repair_code"
+        # loop caused by exposing terminal and repair edges simultaneously.
+        if state.result is not None and state.result.success:
+            if valid_next_stages(state) == {"complete"}:
+                self.last_route_source = "deterministic_quality_gate"
+                self.last_route_reason = "execution_success_and_quality_gate_passed"
+                self.last_repair_instruction = ""
+                return "complete"
         llm_stage = self.route_with_llm(state)
         self.last_route_source = "llm"
         return llm_stage
@@ -39,6 +58,10 @@ class RouterAgent:
             "Use repair_plan for planning/spec/coverage problems, "
             "repair_code for generated C++/NC/code/schema problems, repair_execution for runtime, "
             "NCGuide, port, click, DLL, timeout, or toolchain problems. "
+            "A successful execution result only means the run completed without fatal execution errors; "
+            "it is not by itself sufficient for completion. Before choosing complete, verify high-quality "
+            "traffic evidence in the raw returned-output API logs: completed program execution, useful "
+            "position variation, feed variation, and run/motion state evidence. "
             "If UploadProgram fails with evidence of a target O-number collision, for example "
             "TARGET_PROGRAM_EXISTS_REPLAN_REQUIRED or cnc_dwnend3/cnc_download3 returning FOCAS_RET_5 after a "
             "non-destructive upload attempt, prefer repair_plan so PlanningAgent chooses a different O number. "
@@ -138,10 +161,19 @@ def valid_next_stages(state: WorkflowState) -> set[WorkflowStage]:
         return {"repair_code"}
     if failed_program_lifecycle_call_requires_code_repair(state):
         return {"repair_code"}
-    if result_has_sufficient_output_variation(state):
-        return {"complete", "repair_plan", "repair_code", "repair_execution"}
+    if state.result is not None and state.result.success:
+        # Flow-style guarded transition: transport success is not a terminal
+        # state for motion/program tasks.  The completion edge is enabled only
+        # after the objective returned-output quality gate has passed.
+        if requires_dynamic_quality_gate(state) and not result_has_sufficient_output_variation(state):
+            return {"repair_plan", "repair_code", "repair_execution"}
+        return {"complete"}
+    # A quality-looking log cannot override a failed transport/process
+    # result.  Flow-style completion is monotonic: only a successful execution
+    # may enter the terminal edge; failed executions must be classified and
+    # retried (or reported failed after the repair budget is exhausted).
     if state.result is not None and state.quality_assessment is not None and state.result.api_logs:
-        return {"complete", "repair_plan", "repair_code", "repair_execution"}
+        return {"repair_plan", "repair_code", "repair_execution"}
     if state.quality_assessment is not None and not state.quality_assessment.passed:
         return {"repair_plan", "repair_code", "repair_execution"}
     if state.errors:
@@ -163,7 +195,9 @@ def valid_next_stages(state: WorkflowState) -> set[WorkflowStage]:
     if not state.result.success:
         return {"repair_plan", "repair_code", "repair_execution"}
     if state.quality_assessment is not None:
-        return {"complete", "repair_plan", "repair_code", "repair_execution"}
+        if requires_dynamic_quality_gate(state) and not result_has_sufficient_output_variation(state):
+            return {"repair_plan", "repair_code", "repair_execution"}
+        return {"complete"}
     return {"complete"}
 
 
@@ -202,10 +236,32 @@ def failed_program_lifecycle_call_requires_code_repair(state: WorkflowState) -> 
     for log in state.result.api_logs:
         if log.status_code == 0 and not log.error:
             continue
+        if is_nonfatal_optional_api_warning(log):
+            continue
         identity = " ".join([log.interface_name, log.protocol_function, log.step_id]).lower()
         if any(token in identity for token in lifecycle_tokens):
             return True
     return False
+
+
+def is_nonfatal_optional_api_warning(log: ApiCallLog) -> bool:
+    text = " ".join(
+        [
+            str(log.error or ""),
+            str(log.response.get("return_text", "")),
+            str(log.response.get("data", "")),
+        ]
+    ).lower()
+    return any(
+        marker in text
+        for marker in [
+            "skipped_unsupported_by_fixed_adapter",
+            "unsupported_symbol",
+            "ew_noopt",
+            "ew_mode",
+            "focas_return_-7",
+        ]
+    )
 
 
 def target_program_selected_requires_replan(state: WorkflowState) -> bool:
@@ -255,6 +311,16 @@ def result_has_sufficient_output_variation(state: WorkflowState) -> bool:
             or int(metrics.get("motion_active_count") or 0) > 0
         )
     )
+
+
+def requires_dynamic_quality_gate(state: WorkflowState) -> bool:
+    """Return whether completion needs a returned-output quality gate."""
+    if not state.request.quality_gate_enabled:
+        return False
+    if state.plan is None:
+        return False
+    scenario = str(state.plan.scenario_type).lower()
+    return scenario == "coordinate_motion" or "StartProgram" in {step.interface_name for step in state.plan.steps}
 
 
 def summarize_failed_api_logs(state: WorkflowState) -> list[dict[str, object]]:

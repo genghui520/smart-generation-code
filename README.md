@@ -58,6 +58,28 @@ Build the FOCAS API reference chunks:
 python -m smart_traffic_agent build-focas-rag --out rag_indexes/focas/chunks.jsonl
 ```
 
+Build the global FOCAS function coverage manifest from the local function list
+workbook. This manifest is the source of truth for the default FOCAS goal:
+full, high-quality coverage of every listed function across batches.
+
+```powershell
+python -m smart_traffic_agent build-focas-function-manifest --workbook "e:\2025-06\codenew\focas_funcs.xlsx" --out rag_indexes/focas/function_manifest.jsonl
+```
+
+Coverage progresses cumulatively across scenario batches. Each run records target
+function outcomes in a local state file, while support APIs used to create or
+verify a scenario are tracked separately and do not count as target progress.
+One run may contain multiple ordered coverage segments, such as an NC motion
+segment, a program-lifecycle segment, and a tool-offset read/write-restore
+segment. The generated C++ executes those segments sequentially; segments that
+need NC motion may use bounded NC payloads, while probe/read/write-restore
+segments can run as direct FOCAS call blocks.
+Inspect the cumulative state with:
+
+```powershell
+python -m smart_traffic_agent show-focas-function-coverage --state rag_indexes/focas/function_coverage_state.json
+```
+
 Build FANUC manual source chunks from local PDFs:
 
 ```powershell
@@ -130,6 +152,12 @@ Override defaults only when needed:
 python -m smart_traffic_agent run "生成主轴转速变化流量，采集主轴速度和运行状态"
 python -m smart_traffic_agent run "生成坐标运动流量" --out runs/coordinate_demo
 python -m smart_traffic_agent run "生成坐标运动流量" --llm-provider openai_compatible --llm-model "gpt-5.6-sol" --llm-base-url "https://fast.smartaipro.cn/v1" --llm-api-key-env SMARTAIPRO_API_KEY
+
+For OpenAI-compatible gateways that block OpenAI SDK headers, use the direct HTTP transport:
+
+```powershell
+python -m smart_traffic_agent run "生成坐标运动流量" --llm-provider openai_compatible --llm-model "gpt-5.5" --llm-base-url "https://zzz.11223300.top/v1" --llm-api-key-env SMARTAIPRO_API_KEY --llm-transport http
+```
 ```
 
 ## FANUC NCGuide Probe

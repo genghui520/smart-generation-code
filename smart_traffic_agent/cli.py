@@ -13,11 +13,21 @@ from .integrations.ncguide import (
     default_focas_runtime_dir,
     probe_ncguide,
 )
+from .function_coverage import (
+    DEFAULT_FUNCTION_COVERAGE_STATE,
+    load_function_coverage_state,
+    summarize_function_coverage_state,
+)
 from .knowledge import KnowledgeBase, sample_knowledge
 from .llm import LlmClient, LlmConfig
 from .models import TaskRequest
 from .rag.candidate_filter import filter_candidate_chunks
 from .rag.fanuc_manual_loader import DEFAULT_MANUAL_DIR, build_fanuc_manual_chunks
+from .rag.focas_function_manifest import (
+    DEFAULT_FOCAS_FUNCTION_MANIFEST,
+    DEFAULT_FOCAS_FUNCTION_WORKBOOK,
+    build_focas_function_manifest,
+)
 from .rag.focas_loader import DEFAULT_FOCAS_BASE_URL, build_focas_chunks
 from .rag.protocol_document_loader import build_protocol_document_chunks
 from .rag.rule_extractor import (
@@ -65,22 +75,52 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--out", type=Path, default=Path("runs/latest"))
     run_parser.add_argument("--task-id", default="")
     run_parser.add_argument("--target", default="simulator")
+    run_parser.add_argument(
+        "--quality-gate",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable dynamic output-quality gating. Defaults off for simulator and on for real targets.",
+    )
+    run_parser.add_argument(
+        "--representative-scenario",
+        action="store_true",
+        help="Use scenario-focused planning for RQ1/RQ3 representative benchmarks instead of global function coverage.",
+    )
     run_parser.add_argument("--protocol", default="focas")
     run_parser.add_argument("--vector-db", type=Path, default=Path("rag_indexes/focas/vector_db"), help="optional Chroma vector DB for RAG retrieval")
     run_parser.add_argument("--llm-provider", default="openai_compatible", choices=["disabled", "openai_compatible", "openai", "tokenhub"])
     run_parser.add_argument("--llm-model", default="gpt-5.6-sol")
     run_parser.add_argument("--llm-base-url", default="https://fast.smartaipro.cn/v1")
     run_parser.add_argument("--llm-api-key-env", default="SMARTAIPRO_API_KEY")
+    run_parser.add_argument("--llm-transport", default="sdk", choices=["sdk", "http"], help="LLM transport; use http for gateways that block SDK headers")
+    run_parser.add_argument("--llm-wire-api", default="chat_completions", choices=["chat_completions", "responses"])
+    run_parser.add_argument("--llm-reasoning-effort", default=None, choices=["low", "medium", "high"])
+    run_parser.add_argument("--llm-max-output-tokens", type=int, default=None)
+    run_parser.add_argument("--llm-timeout-seconds", type=float, default=120.0)
     run_parser.add_argument(
         "--allow-delete-all-programs",
-        action="store_true",
-        help="Authorize PlannerAgent to consider cnc_delall for this run. Disabled by default.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Authorize generated C++ to use cnc_delall when runtime collision handling requires it. Enabled by default for isolated NCGuide experiments.",
     )
 
     focas_parser = subparsers.add_parser("build-focas-rag", help="build FOCAS RAG chunks from online reference")
     focas_parser.add_argument("--base-url", default=DEFAULT_FOCAS_BASE_URL)
     focas_parser.add_argument("--out", type=Path, default=Path("rag_indexes/focas/chunks.jsonl"))
     focas_parser.add_argument("--limit", type=int, default=0, help="limit function XML downloads for testing")
+
+    manifest_parser = subparsers.add_parser(
+        "build-focas-function-manifest",
+        help="build the global FOCAS function coverage manifest from focas_funcs.xlsx",
+    )
+    manifest_parser.add_argument("--workbook", type=Path, default=DEFAULT_FOCAS_FUNCTION_WORKBOOK)
+    manifest_parser.add_argument("--out", type=Path, default=DEFAULT_FOCAS_FUNCTION_MANIFEST)
+
+    coverage_state_parser = subparsers.add_parser(
+        "show-focas-function-coverage",
+        help="show cumulative FOCAS function coverage state",
+    )
+    coverage_state_parser.add_argument("--state", type=Path, default=DEFAULT_FUNCTION_COVERAGE_STATE)
 
     manual_parser = subparsers.add_parser("build-fanuc-manual-chunks", help="build manual source chunks from FANUC PDFs")
     manual_parser.add_argument("--manual-dir", type=Path, default=DEFAULT_MANUAL_DIR)
@@ -121,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
     extract_parser.add_argument("--llm-model", default="gpt-5.6-sol")
     extract_parser.add_argument("--llm-base-url", default="https://fast.smartaipro.cn/v1")
     extract_parser.add_argument("--llm-api-key-env", default="SMARTAIPRO_API_KEY")
+    extract_parser.add_argument("--llm-transport", default="sdk", choices=["sdk", "http"], help="LLM transport; use http for gateways that block SDK headers")
     extract_parser.add_argument("--taxonomy", type=Path, default=None, help="protocol taxonomy JSON; defaults to built-in FOCAS taxonomy")
 
     merge_parser = subparsers.add_parser("merge-rule-extraction-results", help="merge model JSON outputs into rule chunks")
@@ -212,7 +253,11 @@ def main(argv: list[str] | None = None) -> int:
             task_id=args.task_id or uuid.uuid4().hex[:12],
             protocol=args.protocol,
             target_environment=args.target,
-            permissions={"allow_delete_all_programs": args.allow_delete_all_programs},
+            permissions={
+                "allow_delete_all_programs": args.allow_delete_all_programs,
+                "representative_scenario": args.representative_scenario,
+            },
+            quality_gate_enabled=(args.quality_gate if args.quality_gate is not None else args.target != "simulator"),
         )
         llm_api_key_env = args.llm_api_key_env
         if args.llm_provider == "tokenhub" and llm_api_key_env == "LLM_API_KEY":
@@ -223,6 +268,11 @@ def main(argv: list[str] | None = None) -> int:
                 model=args.llm_model,
                 base_url=args.llm_base_url,
                 api_key_env=llm_api_key_env,
+                transport=args.llm_transport,
+                wire_api=args.llm_wire_api,
+                reasoning_effort=args.llm_reasoning_effort,
+                max_output_tokens=args.llm_max_output_tokens,
+                timeout_seconds=args.llm_timeout_seconds,
             )
         )
         state = TrafficGenerationWorkflow(kb, llm_client=llm_client).run(request, output_dir)
@@ -241,6 +291,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"FOCAS chunks: {len(chunks)}")
         print(f"Output: {args.out}")
+        return 0
+
+    if args.command == "build-focas-function-manifest":
+        summary = build_focas_function_manifest(args.workbook, args.out)
+        print(f"Manifest rows: {summary['row_count']}")
+        print(f"Unique functions: {summary['unique_function_count']}")
+        print(f"Categories: {summary['category_count']}")
+        print(f"Output: {args.out}")
+        return 0
+
+    if args.command == "show-focas-function-coverage":
+        state = load_function_coverage_state(args.state)
+        summary = summarize_function_coverage_state(state)
+        print(json.dumps(summary | {"state_path": str(args.state)}, ensure_ascii=False, indent=2))
         return 0
 
     if args.command == "build-fanuc-manual-chunks":
@@ -305,6 +369,7 @@ def main(argv: list[str] | None = None) -> int:
                 model=args.llm_model,
                 base_url=args.llm_base_url,
                 api_key_env=args.llm_api_key_env,
+                transport=args.llm_transport,
             )
         )
         paths = extract_rules_with_llm(

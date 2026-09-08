@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from smart_traffic_agent.llm import LlmClient, LlmConfig, load_dotenv_file, parse_json_object_response
 
@@ -41,6 +42,33 @@ class LlmClientTests(unittest.TestCase):
         )
 
         self.assertEqual(payload["next_stage"], "planning")
+
+    @patch("requests.post")
+    def test_http_transport_uses_openai_compatible_chat_endpoint(self, post: Mock) -> None:
+        env_name = "TEST_HTTP_LLM_API_KEY"
+        os.environ[env_name] = "test-key"
+        response = Mock(status_code=200, text="")
+        response.json.return_value = {
+            "choices": [{"message": {"content": '{"next_stage":"planning"}'}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        }
+        post.return_value = response
+        client = LlmClient.from_config(
+            LlmConfig(
+                provider="openai_compatible",
+                model="gpt-5.5",
+                base_url="https://gateway.example/v1/",
+                api_key_env=env_name,
+                transport="http",
+            )
+        )
+
+        payload = client.invoke_json("system", "user")
+
+        self.assertEqual(payload["next_stage"], "planning")
+        self.assertEqual(client.last_usage["total_tokens"], 12)
+        self.assertEqual(post.call_args.args[0], "https://gateway.example/v1/chat/completions")
+        self.assertNotIn("test-key", str(post.call_args.kwargs["json"]))
 
 
 if __name__ == "__main__":

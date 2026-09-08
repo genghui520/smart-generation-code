@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import random
+import re
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +12,16 @@ from ..llm import LlmClient
 from ..models import ExecutionPlan, NcProgramSpec, PlanStep, RetrievedChunk, WorkflowState
 from ..tools import focas_function_for, interface_to_focas_mapping
 from ..utils import tokenize
+from ..function_coverage import DEFAULT_FUNCTION_COVERAGE_STATE, load_terminal_covered_functions
+from ..orchestration.roles import ActionSpec, AgentTemplate, message_to_dict
+from ..agent_roles import PlanSpec
+from ..code_spec import build_code_spec, build_official_abi_context
+from ..rag.focas_function_manifest import (
+    DEFAULT_COVERAGE_BATCH_SIZE,
+    DEFAULT_COVERAGE_SEGMENT_COUNT,
+    DEFAULT_FOCAS_FUNCTION_MANIFEST,
+    build_function_coverage_context,
+)
 from ..rag.scenario_templates import DEFAULT_FINAL_SCENARIO_TEMPLATES_PATH
 from .prompts import PLANNING_REVIEW_JSON_SCHEMA, PLANNING_REVIEW_SYSTEM_PROMPT
 
@@ -25,16 +37,34 @@ SCENARIO_ALIASES = {
 INTERFACE_TO_FOCAS = interface_to_focas_mapping()
 
 
-class PlanningAgent:
+class PlanningAgent(AgentTemplate):
+    role_name = "PlanningRole"
+    profile = "RAG planning agent"
+    goal = "Retrieve authoritative knowledge and produce an executable structured plan."
+    constraints = ("Use RAG evidence and official ABI facts.", "Keep API calls atomic.")
+
     def __init__(
         self,
         knowledge_base: KnowledgeBase,
         llm_client: LlmClient | None = None,
         scenario_templates_path: Path = DEFAULT_FINAL_SCENARIO_TEMPLATES_PATH,
+        function_manifest_path: Path = DEFAULT_FOCAS_FUNCTION_MANIFEST,
+        coverage_state_path: Path = DEFAULT_FUNCTION_COVERAGE_STATE,
+        coverage_batch_size: int = DEFAULT_COVERAGE_BATCH_SIZE,
+        coverage_segment_count: int = DEFAULT_COVERAGE_SEGMENT_COUNT,
     ) -> None:
+        super().__init__()
+        self.register_actions(
+            ActionSpec("retrieve_focas_knowledge", "TaskRequest", "KnowledgeSpec"),
+            ActionSpec("write_execution_plan", "KnowledgeSpec", "PlanSpec"),
+        )
         self.knowledge_base = knowledge_base
         self.llm_client = llm_client or LlmClient()
         self.scenario_templates = load_scenario_templates(scenario_templates_path)
+        self.function_manifest_path = function_manifest_path
+        self.coverage_state_path = coverage_state_path
+        self.coverage_batch_size = coverage_batch_size
+        self.coverage_segment_count = coverage_segment_count
 
     def run(self, state: WorkflowState) -> WorkflowState:
         request = state.request
@@ -64,21 +94,70 @@ class PlanningAgent:
             plan.rag_context["repair_context"] = repair_context
         plan.rag_context["task_permissions"] = dict(request.permissions)
         plan.rag_context["coverage_intent"] = infer_coverage_intent(request.description, request.target_environment)
+        if (
+            plan.rag_context["coverage_intent"].get("full_function_coverage")
+            and not request.permissions.get("representative_scenario", False)
+        ):
+            terminal_covered_functions = load_terminal_covered_functions(self.coverage_state_path)
+            coverage_context = build_function_coverage_context(
+                self.function_manifest_path,
+                covered_functions=terminal_covered_functions,
+                batch_size=self.coverage_batch_size,
+                scenario_type=scenario,
+                max_segments=self.coverage_segment_count,
+            )
+            plan.rag_context["function_coverage_manifest"] = coverage_context
+            plan.rag_context["function_coverage_state"] = {
+                "state_path": str(self.coverage_state_path),
+                "terminal_covered_function_count": len(terminal_covered_functions),
+            }
+            if coverage_context.get("enabled"):
+                plan.llm_notes.append(
+                    "Loaded FOCAS function manifest multi-segment batch "
+                    f"segments={coverage_context.get('segment_count')} targets={coverage_context.get('target_batch_size')} "
+                    f"support={coverage_context.get('support_batch_size')} / "
+                    f"{coverage_context.get('target_function_count')} functions."
+                )
         plan.rag_context["api_candidate_pool"] = build_api_candidate_pool(plan)
+        candidate_functions = [
+            str(row.get("protocol_function", ""))
+            for row in plan.rag_context["api_candidate_pool"]
+            if isinstance(row, dict) and str(row.get("protocol_function", "")).strip()
+        ]
+        plan.rag_context["official_abi_context"] = build_official_abi_context(candidate_functions)
+        if self.environment is not None:
+            plan.rag_context["environment_shared_rules"] = self.environment.shared_rules
+            plan.rag_context["official_abi_context"] = self.environment.official_abi(candidate_functions)
         if not self.llm_client.enabled:
             raise RuntimeError("PlanningAgent requires an LLM planning decision in agent-only mode.")
         apply_llm_planning_decision(
             plan,
             self.llm_client,
             request.description,
+            representative_scenario=request.permissions.get("representative_scenario", False),
         )
-        enrich_plan_with_llm(
-            plan,
-            self.llm_client,
-            request.description,
-        )
+        if request.permissions.get("representative_scenario", False):
+            plan.llm_notes.append(
+                "Representative benchmark skipped the optional planning review request to reduce generation latency."
+            )
+        else:
+            enrich_plan_with_llm(
+                plan,
+                self.llm_client,
+                request.description,
+            )
         state.retrieved_chunks = flatten_retrieval(retrieval)
         state.plan = plan
+        plan.code_spec = build_code_spec(plan, state.retrieved_chunks)
+        handoff = self.publish(
+            "write_execution_plan", "PlanSpec",
+            plan_id=plan.plan_id, step_count=len(plan.steps), rag_chunk_count=len(state.retrieved_chunks),
+            code_spec=asdict(plan.code_spec),
+        )
+        state.messages.append(message_to_dict(
+            handoff,
+            PlanSpec(plan.plan_id, len(plan.steps), len(state.retrieved_chunks)),
+        ))
         state.stage = "code_generation"
         return state
 
@@ -222,7 +301,13 @@ def summarize_retrieval(context: dict[str, list[RetrievedChunk]]) -> dict:
     return summary
 
 
-def apply_llm_planning_decision(plan: ExecutionPlan, llm_client: LlmClient, task_description: str) -> None:
+def apply_llm_planning_decision(
+    plan: ExecutionPlan,
+    llm_client: LlmClient,
+    task_description: str,
+    *,
+    representative_scenario: bool = False,
+) -> None:
     system_prompt = (
         "# Identity\n"
         "You are PlanningAgent in a multi-agent FANUC FOCAS traffic-generation system.\n"
@@ -233,6 +318,8 @@ def apply_llm_planning_decision(plan: ExecutionPlan, llm_client: LlmClient, task
         "- Do not rely on a local tool/interface registry as the API universe. The knowledge base is the source of API facts; you may plan any relevant FOCAS protocol_function found or inferable from retrieved API knowledge.\n"
         "- Build an API coverage set from api_candidate_pool plus any additional relevant API facts in RAG: include APIs that can produce relevant returned outputs, state transitions, lifecycle evidence, control/synchronization evidence, or intentionally varied simulator-side mutation evidence for this NC program scenario. Exclude APIs only with a brief reason.\n"
         "- When coverage_intent.full_traffic_coverage=true, optimize for broad/full traffic coverage rather than a minimal safe API subset. For a simulator/NCGuide target, do not exclude a RAG-retrieved write or control API merely because it mutates simulator state, creates lifecycle side effects, is not the shortest path, or is outside the narrowest scene core. Include it when it can generate distinguishable traffic and can be bracketed by setup/read-back/cleanup or bounded simulator values.\n"
+        "- When coverage_intent.full_function_coverage=true and function_coverage_manifest.enabled=true, treat function_coverage_manifest as the global FOCAS API universe from focas_funcs.xlsx. The current run may contain multiple scenario segments, not one isolated scenario and not one isolated function list. For each segment in function_coverage_manifest.segments, target_batch functions are the coverage objectives for that segment; support_batch functions are allowed to repeat because they create, verify, synchronize, or restore that segment's state. Include executable steps for each target_batch function when ABI/prototype and bounded arguments can be established; otherwise record a concrete defer/exclude reason such as missing prototype/export, unsupported controller/simulator, or unsafe/unbounded argument construction. Use support_batch APIs where needed, but do not count support-only repetition as progress on target coverage.\n"
+        "- A single generated C++ script may execute multiple scenario segments sequentially. Segments that require NC programs may use distinct bounded O-number payloads; segments that do not require NC motion should be implemented as direct FOCAS probe/read/write-restore call blocks. Keep segment boundaries explicit in step_id, action, CSV data, and diagnostics.\n"
         "- For full-coverage simulator runs, treat semantically related APIs as complementary unless RAG evidence shows an exact incompatibility. For example, position families such as cnc_rdposition, cnc_absolute, cnc_machine, cnc_relative, and cnc_distance may all contribute different returned fields; lifecycle/program APIs such as cnc_rdmdiprgstat, cnc_wractpt, cnc_pdf_wractpt, cnc_setpglock, cnc_search, and cnc_rdprgnum may contribute different program-state traffic. Do not exclude one solely because another API already gives partial evidence.\n"
         "- Valid exclusion reasons in full-coverage simulator mode are narrow: absent official prototype/header evidence, DLL/export unavailable, unsupported by the simulator/controller per RAG, argument construction cannot be made bounded, API conflicts with a required lifecycle gate, or the user/permissions explicitly forbid it. 'write operation', 'unnecessary mutation', 'not MDI-focused', or 'covered by another API' are not sufficient by themselves.\n"
         "- For each selected API, create at least one executable step with protocol_function set to the exact FOCAS function name or function sequence. If no existing semantic interface name fits, create a concise interface_name such as ReadDistanceToGo or ReadAxisLoad while keeping protocol_function exact.\n"
@@ -245,9 +332,8 @@ def apply_llm_planning_decision(plan: ExecutionPlan, llm_client: LlmClient, task
         "- In the confirmed NCGuide Single Block behavior, every non-empty executable NC line consumes one Cycle Start, including the O program-number line, setup/modal-only lines, motion lines, and the final M30 line. Plan enough guarded Cycle Start operations to advance the entire uploaded NC payload, not merely its motion blocks.\n"
         "- Require the generated C++ to derive or embed the effective NC segment count from the exact generated payload, log expected_nc_segment_count and cycle_start_click_count, and execute through the M30 segment before the final completion gate. Non-motion segments are lifecycle/warmup evidence and must not be counted as motion samples.\n"
         "- Upload/select/program-number verification is a hard lifecycle gate. If cnc_dwnend3 or cnc_search fails, or cnc_rdprgnum does not match the uploaded O number, execution must stop before any Cycle Start and report PROGRAM_NOT_VERIFIED.\n"
-        "- Before UploadProgram, use the retrieved FOCAS knowledge to choose an appropriate documented program-directory/read API for an exact target-program existence check; do not select it from a locally hard-coded API rule. The default collision policy is non-destructive: if the generated O number already exists, do not plan cnc_delete. Emit TARGET_PROGRAM_EXISTS_REPLAN_REQUIRED so RouterAgent returns to planning and choose a different O number. Upload only after the selected number is confirmed absent.\n"
-        "- When repair context contains TARGET_PROGRAM_EXISTS_REPLAN_REQUIRED or a same-program-number conflict, change nc_program_spec.program_name to a different valid O number from the failed plan. Do not repeat the conflicting number and do not solve the collision by deleting the existing program unless the user explicitly requested deletion.\n"
-        "- A delete-all program operation is permission-gated, not universally forbidden. Consider it only when task_permissions.allow_delete_all_programs=true and only if RAG-supported reasoning shows it is appropriate for the isolated NCGuide experiment. Without that explicit permission, keep the non-destructive choose-an-unused-number flow.\n"
+        "- Before UploadProgram, require a documented program-directory/read API for exact target-program existence checks. PlannerAgent may provide a base nc_program_spec.program_name, but runtime collision handling belongs to CodeGenerationAgent/C++ after it reads the actual controller directory. Do not use repair planning merely to guess another O number.\n"
+        "- Single target-program deletion is allowed when the generated C++ has positively identified an exact conflicting O number and deletes only that O number before upload. Delete-all remains permission-gated: consider cnc_delall only when task_permissions.allow_delete_all_programs=true and only if RAG-supported reasoning shows it is appropriate for the isolated NCGuide experiment.\n"
         "- If prior execution quality failed, read the previous failed plan/artifacts/result and modify that design; do not ignore it and start from scratch.\n"
         "- Do not output concrete NC blocks such as G01 X...; output block_goals and constraints instead.\n"
         "- For every executable API step, plan input parameters with parameter_generation. "
@@ -266,6 +352,9 @@ def apply_llm_planning_decision(plan: ExecutionPlan, llm_client: LlmClient, task
         "\"coverage_role\":\"what traffic/evidence it contributes\",\"decision\":\"include\",\"parameter_strategy_summary\":\"fixed/enum/range plan\"}],"
         "\"quality_targets\":{\"min_feed_samples\":5,\"expect_feed_variation\":true,"
         "\"expect_position_variation\":true,\"preferred_motion_duration_seconds_per_block\":\"about 2-5 seconds\",\"preferred_feed\":\"moderate low feed, not extremely slow\"},"
+        "\"coverage_segments\":[{\"segment_id\":\"01_programmed_coordinate_motion\",\"main_state_driver\":\"driver\","
+        "\"nc_program_required\":true,\"target_functions\":[\"cnc_absolute\"],\"support_functions\":[\"cnc_statinfo\"],"
+        "\"quality_target\":\"what this segment proves\"}],"
         "\"nc_program_spec\":{\"program_name\":\"O1234\",\"purpose\":\"short purpose\","
         "\"block_goals\":[\"goal\"],\"constraints\":[\"constraint\"],\"generation_notes\":[\"note\"]},"
         "\"steps\":[{\"step_id\":\"S001\",\"phase\":\"before\",\"action\":\"read status\","
@@ -286,9 +375,69 @@ def apply_llm_planning_decision(plan: ExecutionPlan, llm_client: LlmClient, task
         f"Explicit task permissions={plan.rag_context.get('task_permissions', {})}\n"
         f"Current steps={[{'id': s.step_id, 'phase': s.phase, 'interface': s.interface_name, 'repeat': s.repeat, 'interval': s.interval_seconds, 'action': s.action} for s in plan.steps]}\n"
         f"RAG context={compact_rag_context(plan.rag_context)}\n"
+        f"Official ABI context for candidate APIs:\n{plan.rag_context.get('official_abi_context', '')}\n"
         f"Prior repair history and quality failures={plan.rag_context.get('repair_context', [])}\n"
     )
+    code_only = bool(plan.rag_context.get("task_permissions", {}).get("code_only_evaluation"))
+    if code_only:
+        # RQ1 uses a compact MetaGPT-style requirements/design artifact. The
+        # API set still comes from task requirements and RAG evidence, not a
+        # local scenario registry.
+        system_prompt = (
+            "You are the PlanningAgent for a code-only FANUC FOCAS benchmark. "
+            "Return JSON only. Produce a complete CodeSpec for one C++ source file. "
+            "Use task requirements and RAG evidence to select every required atomic FOCAS API; "
+            "never invent symbols or substitute a locally maintained API list. "
+            "Each step must contain exactly one protocol_function, documented parameters, "
+            "phase, and purpose. Include connection and cleanup when required by the task. "
+            "Do not include PCAP, CSV, traffic capture, simulator UI, or runtime logging. "
+            "Required JSON fields: scenario_goal, nc_program_spec, steps, notes."
+        )
+        user_prompt = (
+            f"Task:\n{task_description}\n\n"
+            f"Scenario:\n{plan.scenario_type}\n\n"
+            f"RAG evidence:\n{compact_rag_context(plan.rag_context)}\n\n"
+            f"Official ABI context for candidate APIs:\n{plan.rag_context.get('official_abi_context', '')}\n\n"
+            f"Initial plan context:\n{plan.steps}\n{plan.nc_program_spec}\n\n"
+            "Return a complete code-generation specification. Include all API calls explicitly required by the task, "
+            "and preserve their exact official names and argument semantics."
+        )
     payload = llm_client.invoke_json(system_prompt, user_prompt)
+    required_planning_keys = (
+        ("scenario_goal", "nc_program_spec", "steps")
+        if code_only
+        else ("scenario_goal", "quality_analysis", "quality_targets", "nc_program_spec", "steps")
+    )
+    missing_planning_keys = [key for key in required_planning_keys if not payload.get(key)]
+    nc_spec_payload = payload.get("nc_program_spec")
+    if isinstance(nc_spec_payload, dict):
+        for nested_key in ("program_name", "purpose", "block_goals", "constraints"):
+            if not nc_spec_payload.get(nested_key):
+                missing_planning_keys.append(f"nc_program_spec.{nested_key}")
+    if missing_planning_keys:
+        # Repair the structured artifact once, keeping the task/RAG response as
+        # context. Do not synthesize missing scenario or API facts locally.
+        repair_system_prompt = (
+            "You are repairing a PlanningAgent JSON artifact. Return JSON only. "
+            "Preserve all valid content from the previous response and add only "
+            "the missing required fields. Use the task and RAG context as evidence; "
+            "do not invent APIs or replace exact protocol names. Required fields: "
+            "scenario_goal, quality_analysis, quality_targets, nc_program_spec, steps."
+        )
+        repair_user_prompt = (
+            f"Task:\n{task_description}\n\n"
+            f"RAG context:\n{compact_rag_context(plan.rag_context)}\n\n"
+            f"Previous planning artifact:\n{payload}\n\n"
+            f"Missing or invalid required fields: {missing_planning_keys}\n"
+            "Return one complete planning JSON object."
+        )
+        repaired_payload = llm_client.invoke_json(repair_system_prompt, repair_user_prompt)
+        if isinstance(repaired_payload, dict):
+            original_spec = payload.get("nc_program_spec")
+            repaired_spec = repaired_payload.get("nc_program_spec")
+            payload = {**payload, **repaired_payload}
+            if isinstance(original_spec, dict) and isinstance(repaired_spec, dict):
+                payload["nc_program_spec"] = {**original_spec, **repaired_spec}
 
     scenario_goal = str(payload.get("scenario_goal", "")).strip()
     if not scenario_goal:
@@ -298,20 +447,20 @@ def apply_llm_planning_decision(plan: ExecutionPlan, llm_client: LlmClient, task
     spec_payload = payload.get("nc_program_spec", {})
     if not isinstance(spec_payload, dict):
         raise ValueError("PlanningAgent LLM response must include nc_program_spec.")
-    apply_llm_nc_spec(plan, spec_payload)
+    apply_llm_nc_spec(plan, spec_payload, code_only=code_only)
 
     quality_analysis = payload.get("quality_analysis", {})
     if isinstance(quality_analysis, dict) and quality_analysis:
         plan.rag_context["planning_quality_analysis"] = quality_analysis
         for item in quality_analysis_to_notes(quality_analysis):
             plan.llm_notes.append(f"quality_analysis: {item}")
-    else:
+    elif not code_only:
         raise ValueError("PlanningAgent LLM response must include quality_analysis.")
 
     quality_targets = payload.get("quality_targets", {})
     if isinstance(quality_targets, dict) and quality_targets:
         plan.rag_context["quality_targets"] = quality_targets
-    else:
+    elif not code_only:
         raise ValueError("PlanningAgent LLM response must include quality_targets.")
 
     api_coverage = payload.get("api_coverage_analysis", payload.get("api_coverage", []))
@@ -320,12 +469,53 @@ def apply_llm_planning_decision(plan: ExecutionPlan, llm_client: LlmClient, task
     else:
         plan.rag_context["api_coverage_analysis"] = []
 
+    coverage_segments = payload.get("coverage_segments", [])
+    if isinstance(coverage_segments, list):
+        plan.rag_context["coverage_segments"] = normalize_coverage_segments(coverage_segments)
+    if not plan.rag_context.get("coverage_segments") and "function_coverage_manifest" in plan.rag_context:
+        plan.rag_context["coverage_segments"] = coverage_segments_from_manifest_context(
+            plan.rag_context["function_coverage_manifest"]
+        )
+
     step_payload = payload.get("steps", [])
     if not isinstance(step_payload, list):
         raise ValueError("PlanningAgent LLM response must include steps.")
     plan.steps = plan_steps_from_llm_rows(step_payload)
     if not plan.steps:
-        raise ValueError("PlanningAgent LLM response did not include any valid steps.")
+        if code_only:
+            repaired_steps = llm_client.invoke_json(
+                "You repair invalid PlanningAgent steps. Return JSON only with a non-empty steps list. "
+                "Each step must have step_id, phase (before/during/after), action, interface_name, "
+                "and exactly one atomic protocol_function. Use only task and RAG evidence; do not invent APIs.",
+                f"Task: {task_description}\nRAG: {compact_rag_context(plan.rag_context)}\n"
+                f"Invalid steps: {step_payload}\nReturn corrected atomic steps.",
+            )
+            if isinstance(repaired_steps, dict):
+                candidate_steps = repaired_steps.get("steps", [])
+                if isinstance(candidate_steps, list):
+                    plan.steps = plan_steps_from_llm_rows(candidate_steps)
+        if not plan.steps:
+            raise ValueError("PlanningAgent LLM response did not include any valid steps.")
+    if code_only:
+        # Preserve the generic NC lifecycle after the LLM plan is parsed. The
+        # lifecycle helper expands UploadProgram into atomic FOCAS calls so
+        # CodeSpec can carry the actual cnc_download3 payload contract.
+        ensure_nc_program_lifecycle_steps(
+            plan.scenario_type,
+            plan.steps,
+            plan.nc_program_spec.program_name,
+        )
+        attach_protocol_functions(plan.steps)
+        plan.steps = audit_and_repair_task_api_coverage(
+            plan,
+            task_description,
+            llm_client,
+        )
+    if representative_scenario:
+        plan.steps = compact_representative_steps(plan.steps, max_steps=18)
+        plan.llm_notes.append(
+            "Representative benchmark retained RAG-selected interfaces without TOOL_REGISTRY admission filtering."
+        )
     attach_protocol_functions(plan.steps)
 
     notes = payload.get("notes", [])
@@ -334,23 +524,188 @@ def apply_llm_planning_decision(plan: ExecutionPlan, llm_client: LlmClient, task
     if isinstance(notes, list):
         for note in notes:
             text = str(note).strip()
+        if text:
+            plan.llm_notes.append(f"llm_planning_generation: {text}")
+
+
+def audit_and_repair_task_api_coverage(
+    plan: ExecutionPlan,
+    task_description: str,
+    llm_client: LlmClient,
+) -> list[PlanStep]:
+    """Keep explicit task operations from disappearing during plan compression."""
+    # Code-only C++ contracts contain controller APIs only. NC payload design
+    # remains in nc_program_spec; host/UI pseudo-actions must not become API
+    # calls that CodeEngineer tries to implement.
+    plan.steps = [step for step in plan.steps if is_code_only_protocol_step(step)]
+    current = [
+        {
+            "step_id": step.step_id,
+            "phase": step.phase,
+            "action": step.action,
+            "interface_name": step.interface_name,
+            "protocol_function": step.protocol_function,
+            "parameters": step.parameters,
+        }
+        for step in plan.steps
+    ]
+    prompt = (
+        "You are auditing a PlannerAgent plan for task/API coverage. Return JSON only with keys "
+        "required_protocol_functions, missing_steps, exclusions. required_protocol_functions must "
+        "list every exact API needed by an operation explicitly stated in the task, even when it is "
+        "already present in current steps. Use only APIs supported by the task "
+        "and the supplied RAG evidence; never use a local registry and never invent symbols. "
+        "A function explicitly required by the task must appear in required_protocol_functions. "
+        "For every missing function, provide one atomic missing_steps item with an exact single "
+        "protocol_function, interface_name, phase, action, and documented parameters. "
+        "Do not add PCAP, CSV, UI automation, or runtime logging for code-only evaluation."
+    )
+    user_prompt = (
+        f"Task:\n{task_description}\n\n"
+        f"RAG API evidence and candidates:\n{compact_rag_context(plan.rag_context)}\n\n"
+        f"Current parsed steps:\n{current}\n\n"
+        "Audit explicit task operations and return any omitted atomic API steps."
+    )
+    try:
+        payload = llm_client.invoke_json(prompt, user_prompt)
+    except Exception as exc:
+        plan.llm_notes.append(f"task API coverage audit failed: {exc}")
+        return plan.steps
+    if not isinstance(payload, dict):
+        return plan.steps
+    missing_rows = payload.get("missing_steps", [])
+    missing = plan_steps_from_llm_rows(missing_rows) if isinstance(missing_rows, list) else []
+    missing = [step for step in missing if is_code_only_protocol_step(step)]
+    existing_names = {
+        name
+        for step in plan.steps
+        for name in protocol_function_names_for_planner(step.protocol_function)
+    }
+    candidate_names = {
+        str(row.get("protocol_function", "")).strip()
+        for row in plan.rag_context.get("api_candidate_pool", [])
+        if isinstance(row, dict) and str(row.get("protocol_function", "")).strip()
+    }
+    raw_required_names = payload.get("required_protocol_functions", [])
+    if isinstance(raw_required_names, str):
+        raw_required_names = [raw_required_names]
+    required_names = {
+        str(value).strip()
+        for value in raw_required_names
+        if str(value).strip() and str(value).strip().startswith(("cnc_", "pmc_"))
+    } if isinstance(raw_required_names, list) else set()
+    evidence_names = {
+        str(row.get("function", "")).strip()
+        for row in plan.rag_context.get("api", [])
+        if isinstance(row, dict) and str(row.get("function", "")).strip()
+    }
+    abi_context = str(plan.rag_context.get("official_abi_context", ""))
+    abi_supported_names = set(re.findall(r"\b(cnc_[A-Za-z0-9_]+|pmc_[A-Za-z0-9_]+)\s*\(", abi_context))
+    missing = [
+        step for step in missing
+        if all(
+            name in abi_supported_names and (name in candidate_names or name in evidence_names)
+            for name in protocol_function_names_for_planner(step.protocol_function)
+        )
+    ]
+    # The audit may identify a required API without returning a complete row.
+    # Materialize that decision as an atomic step only when the API is backed by
+    # the current RAG candidate/evidence set; parameters remain for CodeSpec ABI
+    # resolution and are never invented here.
+    for name in sorted(required_names - existing_names):
+        if name not in abi_supported_names or (name not in candidate_names and name not in evidence_names):
+            continue
+        missing.append(
+            PlanStep(
+                step_id=f"AUDIT-{len(missing) + 1:03d}",
+                phase="during",
+                action=f"Execute required documented API {name}.",
+                interface_name=f"FOCAS_{name}",
+                protocol_function=name,
+                operation_kind="focas_api",
+                api_calls=[{"call_id": f"audit-call-{len(missing) + 1:02d}", "protocol_function": name, "parameters": {}}],
+            )
+        )
+    # Deterministic evidence fallback: recover candidates whose RAG description
+    # shares multiple meaningful terms with the task when the audit model omits
+    # the required_protocol_functions field. This is evidence-driven, not an
+    # API registry or scenario-specific function list.
+    evidence_rows = list(plan.rag_context.get("api", []))
+    candidate_rows = list(plan.rag_context.get("api_candidate_pool", []))
+    task_terms = {
+        term for term in re.findall(r"[a-z][a-z0-9_]{3,}", task_description.lower())
+        if term not in {"generate", "complete", "client", "must", "include", "using", "documented", "return", "with"}
+    }
+    evidence_by_name: dict[str, str] = {}
+    for row in evidence_rows:
+        if isinstance(row, dict):
+            name = str(row.get("function", "")).strip()
+            if name:
+                evidence_by_name[name] = " ".join(str(row.get(key, "")) for key in ("preview", "text_preview"))
+    for row in candidate_rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("protocol_function", "")).strip()
+        if not name.startswith(("cnc_", "pmc_")) or name not in abi_supported_names:
+            continue
+        if not name or name in existing_names or name in {step.protocol_function for step in missing}:
+            continue
+        description = " ".join([
+            " ".join(str(value) for value in row.get("relationships", [])),
+            evidence_by_name.get(name, ""),
+        ]).lower()
+        matched_terms = {term for term in task_terms if term in description}
+        if len(matched_terms) < 1:
+            continue
+        missing.append(
+            PlanStep(
+                step_id=f"EVIDENCE-{len(missing) + 1:03d}",
+                phase="during",
+                action=f"Execute RAG-supported API {name} for the requested operation.",
+                interface_name=f"FOCAS_{name}",
+                protocol_function=name,
+                operation_kind="focas_api",
+                api_calls=[{"call_id": f"evidence-call-{len(missing) + 1:02d}", "protocol_function": name, "parameters": {}}],
+            )
+        )
+    added = 0
+    for step in missing:
+        names = protocol_function_names_for_planner(step.protocol_function)
+        if not names or any(name in existing_names for name in names):
+            continue
+        plan.steps.append(step)
+        existing_names.update(names)
+        added += 1
+    if added:
+        plan.llm_notes.append(f"Task/API coverage audit restored {added} omitted atomic step(s).")
+    exclusions = payload.get("exclusions", [])
+    if isinstance(exclusions, list):
+        for exclusion in exclusions[:12]:
+            text = str(exclusion).strip()
             if text:
-                plan.llm_notes.append(f"llm_planning_generation: {text}")
+                plan.llm_notes.append(f"task API coverage exclusion: {text}")
+    return plan.steps
 
 
-def apply_llm_nc_spec(plan: ExecutionPlan, payload: dict[str, Any]) -> None:
+def is_code_only_protocol_step(step: PlanStep) -> bool:
+    """Accept only atomic controller symbols in the RQ1 C++ contract."""
+    names = protocol_function_names_for_planner(step.protocol_function)
+    return bool(names) and all(name.startswith(("cnc_", "pmc_")) for name in names)
+
+
+def apply_llm_nc_spec(plan: ExecutionPlan, payload: dict[str, Any], *, code_only: bool = False) -> None:
     program_name = str(payload.get("program_name", "")).strip()
     if not valid_program_name(program_name):
         raise ValueError(f"PlanningAgent LLM returned invalid NC program name: {program_name!r}")
     block_goals = string_list(payload.get("block_goals"))
-    if not block_goals:
+    if not block_goals and not code_only:
         raise ValueError("PlanningAgent LLM response must include nc_program_spec.block_goals.")
     constraints = string_list(payload.get("constraints"))
-    if not constraints:
+    if not constraints and not code_only:
         raise ValueError("PlanningAgent LLM response must include nc_program_spec.constraints.")
     generation_notes = string_list(payload.get("generation_notes"))
     purpose = str(payload.get("purpose", "")).strip()
-    if not purpose:
+    if not purpose and not code_only:
         raise ValueError("PlanningAgent LLM response must include nc_program_spec.purpose.")
     plan.nc_program_spec = NcProgramSpec(
         program_name=program_name,
@@ -380,6 +735,11 @@ def plan_steps_from_llm_rows(rows: list[Any]) -> list[PlanStep]:
         if isinstance(parameter_generation, list):
             parameters["parameter_generation"] = normalize_parameter_generation(parameter_generation)
         phase = phase_or_default(row.get("phase"))
+        protocol_function = str(row.get("protocol_function", "")).strip()
+        raw_calls = row.get("api_calls", [])
+        api_calls = normalize_api_calls(raw_calls, protocol_function, parameters)
+        if api_calls and not protocol_function:
+            protocol_function = str(api_calls[0]["protocol_function"])
         steps.append(
             PlanStep(
                 step_id=str(row.get("step_id", f"LLM-{index:03d}")).strip() or f"LLM-{index:03d}",
@@ -390,10 +750,54 @@ def plan_steps_from_llm_rows(rows: list[Any]) -> list[PlanStep]:
                 repeat=max(1, min(safe_int(row.get("repeat"), 1), 50)),
                 interval_seconds=max(0.0, min(safe_float(row.get("interval_seconds"), 0.0), 10.0)),
                 expected_state=str(row.get("expected_state", "")).strip(),
-                protocol_function=str(row.get("protocol_function", "")).strip(),
+                protocol_function=protocol_function,
+                operation_kind=str(row.get("operation_kind", "focas_api")).strip() or "focas_api",
+                api_calls=api_calls,
             )
         )
     return steps
+
+
+def normalize_api_calls(raw_calls: Any, protocol_function: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize Planner output into one exact FOCAS function per call object."""
+    calls: list[dict[str, Any]] = []
+    if isinstance(raw_calls, list):
+        for index, item in enumerate(raw_calls, 1):
+            if not isinstance(item, dict):
+                continue
+            function = str(item.get("protocol_function", item.get("function", ""))).strip()
+            if not function:
+                continue
+            call_parameters = item.get("parameters", {})
+            if not isinstance(call_parameters, dict):
+                call_parameters = {}
+            calls.append({
+                "call_id": str(item.get("call_id", f"call-{index:02d}")),
+                "protocol_function": function,
+                "parameters": dict(call_parameters),
+            })
+    if calls:
+        return calls
+    functions = [part.strip() for part in re.split(r"\s*(?:/|\\+|;|->)\s*", protocol_function) if part.strip()]
+    return [
+        {"call_id": f"call-{index:02d}", "protocol_function": function, "parameters": dict(parameters)}
+        for index, function in enumerate(functions, 1)
+    ]
+
+
+def compact_representative_steps(steps: list[PlanStep], *, max_steps: int) -> list[PlanStep]:
+    """Keep a bounded, executable subset for code-generation benchmarks."""
+    selected: list[PlanStep] = []
+    seen: set[tuple[str, str]] = set()
+    for step in steps:
+        key = (step.interface_name, step.phase)
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(step)
+        if len(selected) >= max_steps:
+            break
+    return selected
 
 
 def safe_int(value: Any, default: int) -> int:
@@ -456,6 +860,53 @@ def normalize_api_coverage_analysis(rows: list[Any]) -> list[dict[str, Any]]:
             }
         )
     return coverage
+
+
+def normalize_coverage_segments(rows: list[Any]) -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]] = []
+    for index, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            continue
+        segment_id = str(row.get("segment_id", f"segment_{index:02d}")).strip() or f"segment_{index:02d}"
+        segments.append(
+            {
+                "segment_id": segment_id,
+                "main_state_driver": str(row.get("main_state_driver", "")).strip(),
+                "nc_program_required": bool(row.get("nc_program_required", False)),
+                "target_functions": string_list(row.get("target_functions")),
+                "support_functions": string_list(row.get("support_functions")),
+                "quality_target": str(row.get("quality_target", "")).strip(),
+            }
+        )
+    return segments
+
+
+def coverage_segments_from_manifest_context(context: Any) -> list[dict[str, Any]]:
+    if not isinstance(context, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    for segment in context.get("segments", []) or []:
+        if not isinstance(segment, dict):
+            continue
+        rows.append(
+            {
+                "segment_id": segment.get("segment_id", ""),
+                "main_state_driver": segment.get("main_state_driver", ""),
+                "nc_program_required": bool(segment.get("nc_program_required", False)),
+                "target_functions": [
+                    row.get("function")
+                    for row in segment.get("target_batch", [])
+                    if isinstance(row, dict) and row.get("function")
+                ],
+                "support_functions": [
+                    row.get("function")
+                    for row in segment.get("support_batch", [])
+                    if isinstance(row, dict) and row.get("function")
+                ],
+                "quality_target": segment.get("quality_target", ""),
+            }
+        )
+    return rows
 
 
 def valid_program_name(value: str) -> bool:
@@ -522,6 +973,59 @@ def enrich_plan_with_llm(plan: ExecutionPlan, llm_client: LlmClient, task_descri
 def compact_rag_context(rag_context: dict) -> dict:
     compact = {}
     for key, rows in rag_context.items():
+        if key == "function_coverage_manifest" and isinstance(rows, dict):
+            compact[key] = {
+                "enabled": rows.get("enabled"),
+                "source_manifest": rows.get("source_manifest"),
+                "target_function_count": rows.get("target_function_count"),
+                "covered_function_count": rows.get("covered_function_count"),
+                "remaining_function_count": rows.get("remaining_function_count"),
+                "selected_batch_size": rows.get("selected_batch_size"),
+                "target_batch_size": rows.get("target_batch_size"),
+                "support_batch_size": rows.get("support_batch_size"),
+                "scenario_batch_id": rows.get("scenario_batch_id"),
+                "main_state_driver": rows.get("main_state_driver"),
+                "quality_target": rows.get("quality_target"),
+                "selection_strategy": rows.get("selection_strategy"),
+                "segment_count": rows.get("segment_count"),
+                "function_family_counts": rows.get("function_family_counts"),
+                "remaining_family_counts": rows.get("remaining_family_counts"),
+                "segments": [
+                    {
+                        "segment_id": segment.get("segment_id"),
+                        "scenario_batch_id": segment.get("scenario_batch_id"),
+                        "main_state_driver": segment.get("main_state_driver"),
+                        "quality_target": segment.get("quality_target"),
+                        "nc_program_required": segment.get("nc_program_required"),
+                        "target_functions": [
+                            row.get("function")
+                            for row in segment.get("target_batch", [])[:40]
+                            if isinstance(row, dict)
+                        ],
+                        "support_functions": [
+                            row.get("function")
+                            for row in segment.get("support_batch", [])[:24]
+                            if isinstance(row, dict)
+                        ],
+                    }
+                    for segment in rows.get("segments", [])[:6]
+                    if isinstance(segment, dict)
+                ],
+                "selected_batch": [
+                    {
+                        "function": row.get("function"),
+                        "raw_function": row.get("raw_function"),
+                        "coverage_role": row.get("coverage_role"),
+                        "category": row.get("category"),
+                        "description": str(row.get("description", ""))[:160],
+                        "symbol_candidates": row.get("symbol_candidates", [])[:3],
+                        "selection_reason": row.get("selection_reason"),
+                    }
+                    for row in rows.get("selected_batch", [])[:60]
+                    if isinstance(row, dict)
+                ],
+            }
+            continue
         if isinstance(rows, dict):
             compact[key] = rows
             continue
@@ -559,23 +1063,53 @@ def infer_coverage_intent(task_description: str, target_environment: str) -> dic
         "comprehensive",
         "high coverage",
         "maximum coverage",
+        "full coverage",
+        "cover all",
+        "全覆盖",
+        "全量",
+        "全部",
+        "所有",
+        "每个",
+    ]
+    full_function_markers = [
+        "full function coverage",
+        "cover every function",
+        "cover all functions",
+        "all functions",
+        "function manifest",
+        "focas_funcs",
+        "函数全覆盖",
+        "全覆盖",
+        "全量函数",
+        "全部函数",
+        "所有函数",
+        "每个函数",
+        "里面的函数",
     ]
     simulator_markers = ["simulator", "simulation", "ncguide", "仿真", "仿真器"]
     target_text = target_environment.lower()
     simulator_target = any(marker in target_text for marker in simulator_markers)
     explicit_simulator_context = simulator_target or any(marker in text for marker in simulator_markers)
-    full_coverage = any(marker in text for marker in full_markers)
+    explicit_full_coverage = any(marker in text for marker in full_markers)
+    explicit_full_function_coverage = any(marker in text for marker in full_function_markers)
+    full_coverage = True
+    full_function_coverage = True
     return {
         "full_traffic_coverage": full_coverage,
+        "full_function_coverage": full_function_coverage,
+        "coverage_default": "focas_system_default_full_high_quality_coverage",
+        "explicit_full_coverage_request": explicit_full_coverage,
+        "explicit_full_function_coverage_request": explicit_full_function_coverage,
         "target_environment": target_environment,
         "simulator_target": explicit_simulator_context,
         "planner_policy": (
-            "When full_traffic_coverage is true on a simulator target, PlannerAgent should analyze and include "
-            "all semantically related RAG-retrieved APIs that can generate distinguishable traffic. Simulator write/control "
-            "side effects are acceptable when bounded and logged; exclude only with concrete incompatibility, unsupported "
-            "ABI/export/controller evidence, explicit user prohibition, or a separate hard permission gate."
-            if full_coverage and explicit_simulator_context
-            else "Plan a scenario-relevant API coverage set from RAG evidence and justify include/exclude decisions."
+            "FOCAS system default is full, high-quality function coverage. PlannerAgent should analyze and include "
+            "manifest-batch functions plus semantically related RAG-retrieved APIs that can generate distinguishable traffic. "
+            "Simulator write/control side effects are acceptable when bounded and logged; exclude only with concrete "
+            "incompatibility, unsupported ABI/export/controller evidence, explicit user prohibition, or a separate hard "
+            "permission gate."
+            if (full_coverage or full_function_coverage) and explicit_simulator_context
+            else "FOCAS system default is full, high-quality function coverage. Plan from the global function manifest plus RAG evidence and justify include/exclude/defer decisions."
         ),
     }
 
@@ -615,6 +1149,19 @@ def build_api_candidate_pool(plan: ExecutionPlan) -> list[dict[str, Any]]:
         template_id = str(template.get("template_id") or template.get("scenario_id") or "scenario_template")
         for function_name in template.get("main_apis", []) or []:
             add(function_name, f"selected_template:{template_id}", str(template.get("scenario_name", "")))
+
+    manifest_context = plan.rag_context.get("function_coverage_manifest", {})
+    if isinstance(manifest_context, dict):
+        for row in manifest_context.get("selected_batch", []) or []:
+            if not isinstance(row, dict):
+                continue
+            add(
+                row.get("function"),
+                "function_manifest_target_batch"
+                if row.get("coverage_role", "target") == "target"
+                else "function_manifest_support_batch",
+                f"{row.get('coverage_role', 'target')} | {row.get('category', '')}: {row.get('description', '')}",
+            )
 
     return sorted(
         candidates.values(),
@@ -1020,8 +1567,11 @@ def summarize_selected_templates(templates: list[dict[str, Any]]) -> list[dict[s
 def attach_protocol_functions(steps: list[PlanStep]) -> None:
     for step in steps:
         if step.protocol_function.strip():
+            if not step.api_calls:
+                step.api_calls = normalize_api_calls([], step.protocol_function, step.parameters)
             continue
         step.protocol_function = focas_function_for(step.interface_name)
+        step.api_calls = normalize_api_calls([], step.protocol_function, step.parameters)
 
 
 def merge_requirements(defaults: list[str], nc_rules: list[RetrievedChunk]) -> list[str]:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import Mock
 
 from smart_traffic_agent.agents.router import (
+    RouterAgent,
     retrieve_router_knowledge_context,
     summarize_api_log_quality_evidence,
     summarize_quality_for_router,
@@ -41,6 +43,37 @@ def state_with_plan_without_artifacts() -> WorkflowState:
 
 
 class RouterAgentTests(unittest.TestCase):
+    def test_router_deterministically_completes_after_quality_gate_passes(self) -> None:
+        state = state_with_plan_without_artifacts()
+        state.artifacts = GeneratedArtifacts(api_script="int main(){}", nc_program="O1234\nM30\n")
+        state.result = ExecutionResult(
+            task_id="router001",
+            success=True,
+            api_logs=[],
+            capture_events=[],
+            output_dir=Path("."),
+        )
+        state.quality_assessment = QualityAssessment(
+            passed=True,
+            metrics={
+                "changed_output_parameter_count": 6,
+                "feed_sample_count": 20,
+                "feed_unique_count": 3,
+                "position_sample_count": 20,
+                "position_unique_count": 5,
+                "run_active_count": 10,
+                "motion_active_count": 10,
+                "program_completed": True,
+            },
+        )
+        llm = Mock()
+        llm.enabled = True
+        router = RouterAgent(llm_client=llm)
+
+        self.assertEqual(router.route(state), "complete")
+        llm.invoke_json.assert_not_called()
+        self.assertEqual(router.last_route_source, "deterministic_quality_gate")
+
     def test_valid_next_stage_requires_planning_when_plan_missing(self) -> None:
         state = WorkflowState(request=TaskRequest(description="generate traffic", task_id="router001"))
 
@@ -60,7 +93,7 @@ class RouterAgentTests(unittest.TestCase):
 
         self.assertEqual(valid_next_stages(state), {"repair_plan", "repair_code", "repair_execution"})
 
-    def test_successful_execution_with_quality_metrics_is_evaluated_by_router(self) -> None:
+    def test_successful_execution_still_allows_router_quality_judgment(self) -> None:
         state = state_with_plan_without_artifacts()
         state.artifacts = GeneratedArtifacts(api_script="int main(){}", nc_program="O1234\nM30\n")
         state.result = ExecutionResult(
@@ -76,17 +109,43 @@ class RouterAgentTests(unittest.TestCase):
             recommendations=["RouterAgent must evaluate metrics."],
         )
 
-        self.assertEqual(
-            valid_next_stages(state),
-            {"complete", "repair_plan", "repair_code", "repair_execution"},
-        )
+        self.assertEqual(valid_next_stages(state), {"repair_plan", "repair_code", "repair_execution"})
 
         summary = summarize_quality_for_router(state)
 
         self.assertEqual(summary["feed_sample_count"], 3)
         self.assertIn("feed_unique_count", summary)
 
-    def test_failed_result_with_sufficient_output_variation_can_complete(self) -> None:
+    def test_successful_execution_optional_lifecycle_skip_does_not_force_repair(self) -> None:
+        state = state_with_plan_without_artifacts()
+        state.artifacts = GeneratedArtifacts(api_script="int main(){}", nc_program="O1234\nM30\n")
+        state.result = ExecutionResult(
+            task_id="router001",
+            success=True,
+            api_logs=[
+                ApiCallLog(
+                    timestamp="2026-07-17T00:00:00Z",
+                    task_id="router001",
+                    step_id="S003_PLANNED_BEFORE_API_cnc_delete_or_equivalent_exact_program_delete",
+                    phase="before",
+                    interface_name="cnc_delete_or_equivalent_exact_program_delete",
+                    protocol_function="cnc_delete_or_equivalent_exact_program_delete",
+                    input_parameters={},
+                    status_code=1,
+                    response={
+                        "return_text": "SKIPPED_UNSUPPORTED_BY_FIXED_ADAPTER",
+                        "data": "",
+                    },
+                    error="SKIPPED_UNSUPPORTED_BY_FIXED_ADAPTER",
+                )
+            ],
+            capture_events=[],
+            output_dir=Path("."),
+        )
+
+        self.assertEqual(valid_next_stages(state), {"repair_plan", "repair_code", "repair_execution"})
+
+    def test_failed_result_with_sufficient_output_variation_cannot_complete(self) -> None:
         state = state_with_plan_without_artifacts()
         state.artifacts = GeneratedArtifacts(api_script="int main(){}", nc_program="O1234\nM30\n")
         state.result = ExecutionResult(
@@ -112,7 +171,7 @@ class RouterAgentTests(unittest.TestCase):
             recommendations=["RouterAgent must evaluate metrics."],
         )
 
-        self.assertIn("complete", valid_next_stages(state))
+        self.assertNotIn("complete", valid_next_stages(state))
 
     def test_router_can_retrieve_error_knowledge(self) -> None:
         state = state_with_plan_without_artifacts()
@@ -218,7 +277,7 @@ class RouterAgentTests(unittest.TestCase):
 
         self.assertEqual(valid_next_stages(state), {"repair_plan"})
 
-    def test_router_can_complete_from_raw_api_log_evidence_when_metrics_miss_position(self) -> None:
+    def test_router_requires_success_even_when_raw_api_log_evidence_is_good(self) -> None:
         state = state_with_plan_without_artifacts()
         state.artifacts = GeneratedArtifacts(api_script="int main(){}", nc_program="O3266\nM30\n")
         state.result = ExecutionResult(
@@ -308,7 +367,7 @@ class RouterAgentTests(unittest.TestCase):
             },
         )
 
-        self.assertIn("complete", valid_next_stages(state))
+        self.assertNotIn("complete", valid_next_stages(state))
 
         evidence = summarize_api_log_quality_evidence(state)
         self.assertTrue(evidence["program_verified"])

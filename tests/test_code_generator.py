@@ -9,14 +9,19 @@ from smart_traffic_agent.agents.code_generator import (
     CodeGenerationAgent,
     blocking_codegen_diagnostics,
     hard_blocking_codegen_diagnostics,
+    normalize_focas_header_include,
+    normalize_nc_download_payload,
     normalize_llm_nc_program,
     official_focas_abi_context,
     preflight_compile_generated_cpp,
+    validate_real_packet_capture_usage,
     repair_cpp_api_script_after_compile_error,
     retrieve_codegen_knowledge_context,
     select_codegen_executable_steps,
     steps_for_prompt,
     validate_generated,
+    validate_focas_position_abi,
+    validate_official_output_usage,
 )
 from smart_traffic_agent.agent_tools import CompileCppOutput
 from smart_traffic_agent.knowledge import sample_knowledge
@@ -26,17 +31,77 @@ from smart_traffic_agent.models import ExecutionPlan, NcProgramSpec, PlanStep, T
 class FakeCodegenLlm:
     enabled = True
 
-    def __init__(self) -> None:
+    def __init__(self, repair_cpp: str = "int main(){return 0;}") -> None:
         self.prompts: list[str] = []
+        self.repair_cpp = repair_cpp
 
     def invoke_json(self, system_prompt: str, user_prompt: str) -> dict:
         self.prompts.append(user_prompt)
-        if "MSVC preflight compiler diagnostics" in user_prompt:
-            return {"cpp_code": "int main(){return 0;}"}
+        if "MSVC preflight compiler diagnostics" in user_prompt or "Contract violation:" in user_prompt:
+            return {"cpp_code": self.repair_cpp}
         return {"ok": True, "diagnostics": []}
 
 
+def hard_pcap_valid_cpp(extra: str = "") -> str:
+    return (
+        "#include <Fwlib32.h>\n"
+        "FOCAS_DLL_DIR GetEnvironmentVariableW SetDllDirectoryW LoadLibraryW "
+        "auto fn1 = reinterpret_cast<decltype(&::cnc_allclibhndl3)>(GetProcAddress(dll, \"cnc_allclibhndl3\")); "
+        "auto fn2 = reinterpret_cast<decltype(&::cnc_freelibhndl)>(GetProcAddress(dll, \"cnc_freelibhndl\")); "
+        "class PacketSniffer { public: "
+        "bool Start(){ pcap_open_live; pcap_dump_open; return true; } "
+        "void CapturePackets(){ pcap_dispatch; pcap_dump; pcap_dump_flush; } "
+        "void Stop(){} }; "
+        "int main(){ const char* envDevice = getenv(\"PCAP_NETWORK_DEVICE\"); std::string networkDevice; std::string pcapFile; "
+        "PacketSniffer sniffer(networkDevice, pcapFile); "
+        "if (!sniffer.Start()) { return 1; } "
+        "sniffer.CapturePackets(); sniffer.Stop(); const char* status=\"pcap_capture_enabled=true\"; "
+        f"{extra} return 0; }}"
+    )
+
+
 class CodeGenerationAgentTests(unittest.TestCase):
+    def test_normalize_focas_header_include_strips_generated_controller_path(self) -> None:
+        variants = [
+            '#include "Fwlib/0iD/Fwlib32.h"',
+            "#include <Fwlib/0iD/Fwlib32.h>",
+            '#include "Fwlib\\\\0iD\\\\Fwlib32.h"',
+            '# include "C:/Lib/FOCAS2 Library/Fwlib/0iD/Fwlib32.h"',
+        ]
+
+        for include_line in variants:
+            with self.subTest(include_line=include_line):
+                normalized = normalize_focas_header_include(
+                    f"#include <windows.h>\n{include_line}\nint main(){{return 0;}}\n"
+                )
+
+                self.assertIn("#include <Fwlib32.h>", normalized)
+                self.assertNotIn("0iD/Fwlib32.h", normalized)
+                self.assertNotIn("0iD\\\\Fwlib32.h", normalized)
+
+    def test_normalize_nc_download_payload_removes_leading_percent_line(self) -> None:
+        source = r'''std::string program = "%\n"
+            "O3114\n"
+            "G90 G54\n"
+            "M30\n"
+            "%\n";'''
+
+        normalized = normalize_nc_download_payload(source)
+
+        self.assertNotIn(r'"%\n"', normalized)
+        self.assertIn(r'"\n"', normalized)
+        self.assertIn(r'"%"', normalized)
+
+    def test_validate_official_output_accepts_dynamic_rdposition_wrapper(self) -> None:
+        source = "ODBPOS pos{}; ret = api.cnc_rdposition_fn(handle, 0, &axis_count, &pos);"
+        code_spec = type(
+            "CodeSpecStub",
+            (),
+            {"api_contracts": [type("ContractStub", (), {"tool_name": "cnc_rdposition"})()]},
+        )()
+
+        self.assertEqual(validate_official_output_usage(source, code_spec), [])
+
     def test_official_focas_abi_context_extracts_selected_prototypes_and_types(self) -> None:
         context = official_focas_abi_context(["cnc_absolute", "cnc_actf", "cnc_rdprogdir"])
 
@@ -135,7 +200,8 @@ class CodeGenerationAgentTests(unittest.TestCase):
         self.assertIn("error C2362", llm.prompts[-1])
 
     def test_codegen_repairs_once_after_preflight_compile_failure(self) -> None:
-        llm = FakeCodegenLlm()
+        repaired_cpp = hard_pcap_valid_cpp()
+        llm = FakeCodegenLlm(repair_cpp=repaired_cpp)
         state = WorkflowState(
             request=TaskRequest(
                 description="generate FOCAS traffic",
@@ -159,7 +225,10 @@ class CodeGenerationAgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
                 patch("smart_traffic_agent.agents.code_generator.generate_nc_program", return_value=("O1234\nM30\n", [])),
-                patch("smart_traffic_agent.agents.code_generator.generate_cpp_api_script", return_value=("bad cpp", [])),
+                patch(
+                    "smart_traffic_agent.agents.code_generator.generate_cpp_api_script",
+                    return_value=(hard_pcap_valid_cpp("int compile_error_marker = ;"), []),
+                ),
                 patch(
                     "smart_traffic_agent.agents.code_generator.preflight_compile_generated_cpp",
                     side_effect=["api_script.cpp(10): error C2362", ""],
@@ -168,7 +237,7 @@ class CodeGenerationAgentTests(unittest.TestCase):
                 result = CodeGenerationAgent(llm_client=llm).run(state, Path(temp_dir))
 
         self.assertEqual(result.stage, "execution")
-        self.assertEqual(result.artifacts.api_script, "int main(){return 0;}")
+        self.assertEqual(result.artifacts.api_script, repaired_cpp)
         self.assertEqual(compile_mock.call_count, 2)
 
     def test_only_delete_permission_diagnostics_hard_block_codegen(self) -> None:
@@ -181,6 +250,104 @@ class CodeGenerationAgentTests(unittest.TestCase):
             hard_blocking_codegen_diagnostics(diagnostics),
             ["BLOCKING: generated C++ uses cnc_delall without explicit allow_delete_all_programs permission."],
         )
+
+    def test_hard_blocking_codegen_includes_pcap_and_fake_coverage_guards(self) -> None:
+        diagnostics = [
+            "BLOCKING: generated C++ creates fake/minimal pcap marker files instead of attempting real packet capture.",
+            "BLOCKING: generated C++ must not emit fake manifest coverage rows without real API calls; found ManifestCoverage.",
+        ]
+
+        self.assertEqual(hard_blocking_codegen_diagnostics(diagnostics), diagnostics)
+
+    def test_validate_generated_rejects_minimal_pcap_marker_writer(self) -> None:
+        diagnostics = validate_generated(
+            (
+                "FOCAS_DLL_DIR GetEnvironmentVariableW SetDllDirectoryW LoadLibraryW GetProcAddress "
+                "cnc_allclibhndl3 cnc_freelibhndl "
+                "void WriteMinimalPcap(const string& path){} "
+                "void CaptureMarker(){}"
+            ),
+            "O1234\nM30\n",
+            [],
+            require_real_pcap_capture=True,
+        )
+
+        self.assertTrue(any("fake/minimal pcap" in item for item in blocking_codegen_diagnostics(diagnostics)))
+
+    def test_real_capture_comments_do_not_trigger_fake_capture_diagnostic(self) -> None:
+        source = """
+        // minimal pcap dynamic declarations
+        /* pcap marker is not a runtime marker */
+        void Capture() {
+            auto handle = pcap_open_live(device, 65536, 1, 1000, errbuf);
+            auto dumper = pcap_dump_open(handle, file.c_str());
+            pcap_dispatch(handle, 1, callback, nullptr);
+            pcap_dump(dumper, header, packet);
+            pcap_dump_flush(dumper);
+        }
+        PacketSniffer sniffer(networkDevice, pcapFile);
+        auto envDevice = getenv("PCAP_NETWORK_DEVICE");
+        output << "pcap_capture_enabled=true";
+        """
+        self.assertEqual(validate_real_packet_capture_usage(source), [])
+
+    def test_real_capture_must_abort_when_start_fails(self) -> None:
+        source = """
+        void Run() {
+            PacketSniffer sniffer(networkDevice, pcapFile);
+            bool pcapReady = sniffer.Start();
+            cnc_statinfo(handle, &status);
+        }
+        pcap_open_live pcap_dump_open pcap_dispatch pcap_dump pcap_dump_flush
+        getenv("PCAP_NETWORK_DEVICE")
+        output << "pcap_capture_enabled=true";
+        """
+        diagnostics = validate_real_packet_capture_usage(source)
+        self.assertTrue(any("abort before any FOCAS call" in item for item in diagnostics))
+
+    def test_validate_generated_requires_packetsniffer_real_capture_api(self) -> None:
+        diagnostics = validate_generated(
+            (
+                "FOCAS_DLL_DIR GetEnvironmentVariableW SetDllDirectoryW LoadLibraryW GetProcAddress "
+                "cnc_allclibhndl3 cnc_freelibhndl "
+                "class PacketCapture{}; int main(){ PacketCapture capture; }"
+            ),
+            "O1234\nM30\n",
+            [],
+            require_real_pcap_capture=True,
+        )
+
+        blocking = blocking_codegen_diagnostics(diagnostics)
+        self.assertTrue(any("PacketSniffer sniffer" in item for item in blocking))
+        self.assertTrue(any("pcap_open_live" in item for item in blocking))
+
+    def test_validate_generated_rejects_aggregate_api_manifest_coverage_rows(self) -> None:
+        diagnostics = validate_generated(
+            (
+                hard_pcap_valid_cpp(
+                    'LogCall(inputCsv, outputCsv, idx, "S016", "after", "LifecycleManifestCoverage", '
+                    '"cnc_dwnstart;cnc_download;cnc_cdownload", "bounded_lifecycle_artifact=true", '
+                    '0, "coverage_role=target;best_effort_lifecycle_segment_recorded");'
+                )
+            ),
+            "O1234\nM30\n",
+            [],
+        )
+
+        blocking = blocking_codegen_diagnostics(diagnostics)
+        self.assertTrue(any("aggregate API literal" in item for item in blocking))
+        self.assertTrue(any("fake manifest coverage" in item for item in blocking))
+
+    def test_validate_generated_accepts_packetsniffer_capture_shape(self) -> None:
+        diagnostics = validate_generated(
+            hard_pcap_valid_cpp(),
+            "O1234\nM30\n",
+            [],
+            require_official_focas_header=True,
+            require_real_pcap_capture=True,
+        )
+
+        self.assertFalse(any("fake/minimal pcap" in item for item in blocking_codegen_diagnostics(diagnostics)))
 
     def test_validate_generated_blocks_skip_markers_for_supported_steps(self) -> None:
         diagnostics = validate_generated(
@@ -231,6 +398,7 @@ class CodeGenerationAgentTests(unittest.TestCase):
             (
                 "FOCAS_DLL_DIR GetEnvironmentVariableW SetDllDirectoryW "
                 "LoadLibraryW GetProcAddress cnc_allclibhndl3 cnc_freelibhndl "
+                "NCGUIDE_CYCLE_START_X NCGUIDE_CYCLE_START_Y NCGUIDE_CLICK_MODE NCGUIDE_WINDOW_TITLE "
                 "cnc_statinfo SetCursorPos mouse_event cycle_start_ready_gate "
                 "cnc_rdposition pos[i].dist distance_to_go program_completion_gate "
                 "completed timeout waited_ms last_run last_motion run==0 motion==0 "
@@ -248,7 +416,7 @@ class CodeGenerationAgentTests(unittest.TestCase):
 
         self.assertFalse(blocking_codegen_diagnostics(diagnostics))
 
-    def test_validate_generated_rejects_reduced_rdposition_buffer(self) -> None:
+    def test_validate_generated_rejects_non_official_rdposition_buffer(self) -> None:
         diagnostics = validate_generated(
             (
                 "FOCAS_DLL_DIR GetEnvironmentVariableW SetDllDirectoryW LoadLibraryW GetProcAddress "
@@ -258,15 +426,17 @@ class CodeGenerationAgentTests(unittest.TestCase):
             ),
             "O1234\nM30\n",
             [PlanStep("S001", "during", "position", "ReadPosition", {}, protocol_function="cnc_rdposition")],
+            require_official_focas_header=False,
         )
 
-        self.assertTrue(any("overwrite stack memory" in item for item in blocking_codegen_diagnostics(diagnostics)))
+        self.assertTrue(any("ODBPOS abs/mach/rel/dist fields" in item for item in diagnostics))
 
     def test_validate_generated_requires_program_completion_gate(self) -> None:
         diagnostics = validate_generated(
             (
                 "FOCAS_DLL_DIR GetEnvironmentVariableW SetDllDirectoryW "
                 "LoadLibraryW GetProcAddress cnc_allclibhndl3 cnc_freelibhndl "
+                "NCGUIDE_CYCLE_START_X NCGUIDE_CYCLE_START_Y NCGUIDE_CLICK_MODE NCGUIDE_WINDOW_TITLE "
                 "cnc_statinfo SetCursorPos mouse_event cycle_start_ready_gate "
                 "cnc_rdposition pos[i].dist distance_to_go"
             ),
@@ -294,6 +464,7 @@ class CodeGenerationAgentTests(unittest.TestCase):
             (
                 "FOCAS_DLL_DIR GetEnvironmentVariableW SetDllDirectoryW "
                 "LoadLibraryW GetProcAddress cnc_allclibhndl3 cnc_freelibhndl "
+                "NCGUIDE_CYCLE_START_X NCGUIDE_CYCLE_START_Y NCGUIDE_CLICK_MODE NCGUIDE_WINDOW_TITLE "
                 "cnc_statinfo SetCursorPos mouse_event cycle_start_ready_gate "
                 "program_completion_gate completed timeout waited_ms last_run last_motion run==0 motion==0 "
                 "cnc_distance distance_to_go RunUploadedProgramToCompletion effective_nc_segment_count "
@@ -433,16 +604,17 @@ class CodeGenerationAgentTests(unittest.TestCase):
         )
 
         self.assertTrue(
-            any("program_number_available" in item for item in blocking_codegen_diagnostics(diagnostics))
+            any("selected_program_number" in item or "program directory" in item for item in blocking_codegen_diagnostics(diagnostics))
         )
 
-    def test_validate_generated_accepts_non_destructive_availability_flow(self) -> None:
+    def test_validate_generated_accepts_runtime_choose_unused_program_flow(self) -> None:
         diagnostics = validate_generated(
             (
                 "FOCAS_DLL_DIR GetEnvironmentVariableW SetDllDirectoryW LoadLibraryW GetProcAddress "
                 "cnc_allclibhndl3 cnc_freelibhndl cnc_dwnstart3 cnc_download3 cnc_dwnend3 "
                 "cnc_rdprogdir3 target_program_exists program_number_available "
-                "expected_program_number exact_match TARGET_PROGRAM_EXISTS_REPLAN_REQUIRED"
+                "expected_program_number exact_match preferred_program_number selected_program_number "
+                "collision_strategy=choose_unused"
             ),
             "O1234\nM30\n",
             [PlanStep("S001", "before", "upload", "UploadProgram", {})],
@@ -450,19 +622,35 @@ class CodeGenerationAgentTests(unittest.TestCase):
 
         self.assertFalse(blocking_codegen_diagnostics(diagnostics))
 
-    def test_validate_generated_rejects_default_single_program_delete(self) -> None:
+    def test_validate_generated_rejects_unsafe_single_program_delete(self) -> None:
         diagnostics = validate_generated(
             (
                 "FOCAS_DLL_DIR GetEnvironmentVariableW SetDllDirectoryW LoadLibraryW GetProcAddress "
                 "cnc_allclibhndl3 cnc_freelibhndl cnc_dwnstart3 cnc_download3 cnc_dwnend3 "
                 "cnc_rdprogdir3 cnc_delete target_program_exists program_number_available "
-                "expected_program_number exact_match TARGET_PROGRAM_EXISTS_REPLAN_REQUIRED"
+                "expected_program_number preferred_program_number selected_program_number"
             ),
             "O1234\nM30\n",
             [PlanStep("S001", "before", "upload", "UploadProgram", {})],
         )
 
-        self.assertTrue(any("preserve existing programs" in item for item in blocking_codegen_diagnostics(diagnostics)))
+        self.assertTrue(any("exact confirmed single-program collision" in item for item in blocking_codegen_diagnostics(diagnostics)))
+
+    def test_validate_generated_accepts_exact_single_program_delete_flow(self) -> None:
+        diagnostics = validate_generated(
+            (
+                "FOCAS_DLL_DIR GetEnvironmentVariableW SetDllDirectoryW LoadLibraryW GetProcAddress "
+                "cnc_allclibhndl3 cnc_freelibhndl cnc_dwnstart3 cnc_download3 cnc_dwnend3 "
+                "cnc_rdprogdir3 cnc_delete target_program_exists program_number_available "
+                "expected_program_number exact_match preferred_program_number selected_program_number "
+                "collision_strategy=delete_exact_conflict delete_called=true delete_target_program=O1234 "
+                "delete_ret PROGRAM_REPLACEMENT_FAILED return 3"
+            ),
+            "O1234\nM30\n",
+            [PlanStep("S001", "before", "upload", "UploadProgram", {})],
+        )
+
+        self.assertFalse(blocking_codegen_diagnostics(diagnostics))
 
     def test_validate_generated_rejects_unapproved_delete_all(self) -> None:
         diagnostics = validate_generated(
@@ -481,7 +669,8 @@ class CodeGenerationAgentTests(unittest.TestCase):
             (
                 "FOCAS_DLL_DIR GetEnvironmentVariableW SetDllDirectoryW LoadLibraryW GetProcAddress "
                 "cnc_allclibhndl3 cnc_freelibhndl cnc_dwnstart3 cnc_download3 cnc_dwnend3 "
-                "cnc_delall delete_all_authorized=true PROGRAM_REPLACEMENT_FAILED return 3"
+                "cnc_delall delete_all_authorized=true collision_strategy=delete_all_authorized "
+                "PROGRAM_REPLACEMENT_FAILED return 3"
             ),
             "O1234\nM30\n",
             [PlanStep("S001", "before", "upload", "UploadProgram", {})],

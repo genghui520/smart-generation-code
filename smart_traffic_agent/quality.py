@@ -66,17 +66,20 @@ def collect_quality_metrics(api_logs: list[ApiCallLog]) -> dict[str, Any]:
         output_pairs = parse_semicolon_pairs(data)
         record_parameter_names(return_parameter_names, log.interface_name, output_pairs)
         record_output_values(output_values, log.interface_name, output_pairs)
-        if log.interface_name == "ReadFeedSpeed":
+        if is_feed_log(log):
             value = first_feed_value(input_text, data)
             if value is not None:
                 feeds.append(value)
-        if log.interface_name == "ReadPosition":
+        if is_position_log(log):
             xyz = first_position_tuple(input_text, data)
             if xyz is not None:
                 positions.append(xyz)
-        if log.interface_name == "ReadRunStatus":
+        if is_run_status_log(log):
             run = numeric_field(fields, "run")
             motion = numeric_field(fields, "motion")
+            if run is None:
+                status = fields.get("run_status", "").lower()
+                run = 1.0 if status in {"running", "active", "run"} else (0.0 if status in {"idle", "completed", "complete", "stopped"} else None)
             if run is not None:
                 run_values.append(run)
             if motion is not None:
@@ -85,6 +88,8 @@ def collect_quality_metrics(api_logs: list[ApiCallLog]) -> dict[str, Any]:
             program_completion_gate_count += 1
             if program_completion_log_completed(fields, data):
                 program_completed = True
+        elif "run_status=completed" in data.lower() or "program_completed=true" in data.lower():
+            program_completed = True
 
     return {
         "api_log_count": len(api_logs),
@@ -105,6 +110,28 @@ def collect_quality_metrics(api_logs: list[ApiCallLog]) -> dict[str, Any]:
     }
 
 
+def is_feed_log(log: ApiCallLog) -> bool:
+    """Recognize feed reads by semantic interface *or* FOCAS function name.
+
+    Generated runners may expose ``cnc_actf`` as ``ReadFeedSpeed`` or as the
+    raw protocol name.  Quality evaluation must not depend on the display
+    label chosen by the generator.
+    """
+
+    return log.interface_name.lower() in {"readfeedspeed", "cnc_actf"} or log.protocol_function.lower() == "cnc_actf"
+
+
+def is_position_log(log: ApiCallLog) -> bool:
+    """Recognize absolute/machine/relative position API output."""
+
+    names = {"readposition", "cnc_absolute", "cnc_absolute2", "cnc_machine", "cnc_relative", "cnc_relative2"}
+    return log.interface_name.lower() in names or log.protocol_function.lower() in names
+
+
+def is_run_status_log(log: ApiCallLog) -> bool:
+    return log.interface_name.lower() in {"readrunstatus", "cnc_statinfo"} or log.protocol_function.lower() == "cnc_statinfo"
+
+
 def input_data_text(log: ApiCallLog) -> str:
     raw = log.input_parameters.get("raw", "")
     if raw:
@@ -116,7 +143,26 @@ def response_data_text(log: ApiCallLog) -> str:
     data = log.response.get("data", "")
     if isinstance(data, str):
         return data
+    if isinstance(data, dict):
+        return flatten_structured_fields(data)
+    if isinstance(data, (list, tuple)):
+        return ";".join(f"value_{index}={value}" for index, value in enumerate(data))
     return str(data)
+
+
+def flatten_structured_fields(value: dict[str, Any], prefix: str = "") -> str:
+    fields: list[str] = []
+    for key, item in value.items():
+        name = f"{prefix}_{key}" if prefix else str(key)
+        if isinstance(item, dict):
+            nested = flatten_structured_fields(item, name)
+            if nested:
+                fields.append(nested)
+        elif isinstance(item, (list, tuple)):
+            fields.extend(f"{name}_{index}={part}" for index, part in enumerate(item))
+        else:
+            fields.append(f"{name}={item}")
+    return ";".join(fields)
 
 
 def is_program_completion_gate_log(log: ApiCallLog, data: str) -> bool:
