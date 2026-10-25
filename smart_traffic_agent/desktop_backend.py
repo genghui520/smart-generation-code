@@ -1633,6 +1633,18 @@ def run_full_api_capture(config, out, knowledge_base, emit):
             progress = json.loads(progress_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             progress = {}
+        progress["last_batch_status"] = (
+            "partial"
+            if any(scheduler_metrics[key] for key in ("failure", "blocked", "partial", "unprocessed"))
+            else "completed"
+        )
+        progress["last_batch_targets"] = list(scheduler_state.get("selected_api_functions", []))
+        progress["last_batch_errors"] = [
+            error
+            for record in scheduler_state.get("targets", {}).values()
+            for error in record.get("errors", [])
+            if isinstance(record, dict)
+        ]
         progress["scheduler_summary"] = scheduler_metrics
         progress["scheduler_state_path"] = str(scheduler_path)
         write_capture_progress(progress_path, progress)

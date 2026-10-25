@@ -1,0 +1,16 @@
+version: 1
+tools:
+  - search_knowledge
+  - search_memory
+  - get_api_info
+  - get_traffic_chain
+  - get_parameter_rules
+  - filter_parameter_candidates
+  - generate_parameter_combinations
+  - render_focas_cpp
+  - validate_focas_cpp
+rules:
+  - use the SDK type index and documented prototype as ABI authority
+  - bind generated values to Planner constraints and discovery evidence
+  - keep start/data/end sessions independent and return-code guarded
+  - preserve raw logging and PCAP capture for every real call

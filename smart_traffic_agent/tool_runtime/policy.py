@@ -14,8 +14,14 @@ AGENT_TOOL_POLICY: dict[str, set[str]] = {
         "render_focas_cpp",
         "compile_generated_cpp",
     },
-    "RouterRole": {"search_knowledge", "search_memory"},
-    "PlanningRole": {"search_knowledge", "search_memory"},
+    "RouterRole": {
+        "search_knowledge", "search_memory", "get_traffic_chain", "get_api_dependencies", "get_agent_experience",
+    },
+    "PlanningRole": {
+        "search_knowledge", "search_memory", "get_api_info", "get_traffic_chain", "get_api_dependencies",
+        "get_parameter_rules", "discover_parameter_values", "filter_parameter_candidates",
+        "generate_parameter_combinations", "propose_traffic_relation", "get_agent_experience",
+    },
     "CodeEngineerRole": {
         "search_knowledge",
         "search_memory",
@@ -23,13 +29,12 @@ AGENT_TOOL_POLICY: dict[str, set[str]] = {
         "render_focas_cpp",
         "validate_focas_cpp",
         "compile_generated_cpp",
-    },
-    "SingleAgentRole": {
-        "search_knowledge",
-        "search_focas_sdk",
-        "write_generated_artifact",
-        "render_focas_cpp",
-        "compile_generated_cpp",
+        "get_api_info",
+        "get_traffic_chain",
+        "get_parameter_rules",
+        "filter_parameter_candidates",
+        "generate_parameter_combinations",
+        "get_agent_experience",
     },
     "ExecutionRole": {
         "compile_generated_cpp",
@@ -37,8 +42,11 @@ AGENT_TOOL_POLICY: dict[str, set[str]] = {
         "collect_execution_artifacts",
         "search_knowledge",
         "search_memory",
+        "get_agent_experience",
+        "propose_traffic_relation",
+        "verify_traffic_relation",
     },
-    "TrafficGenerationWorkflow": {"search_memory", "remember_workflow"},
+    "TrafficGenerationWorkflow": {"search_memory", "remember_workflow", "submit_agent_experience"},
 }
 
 

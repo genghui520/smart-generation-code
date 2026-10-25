@@ -1,0 +1,13 @@
+version: 1
+tools:
+  - compile_generated_cpp
+  - run_generated_executable
+  - collect_execution_artifacts
+  - get_agent_experience
+  - propose_traffic_relation
+  - verify_traffic_relation
+rules:
+  - preserve raw API logs and PCAP even when a target fails
+  - mark session completion from observed start/data/end evidence
+  - only runtime evidence with complete, matched calls can verify a relation
+  - environment limits remain evidence, not inferred success

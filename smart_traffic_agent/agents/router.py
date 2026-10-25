@@ -10,6 +10,7 @@ from ..quality import output_variation_is_sufficient, plan_requires_motion_quali
 from ..api_prerequisites import classify_prerequisite_failure
 from ..orchestration.roles import ActionSpec, AgentTemplate
 from ..tool_runtime import ToolRuntime
+from ..agent_tools.traffic_graph import ApiNameInput
 
 class RouterAgent(AgentTemplate):
     role_name = "RouterRole"
@@ -132,6 +133,25 @@ class RouterAgent(AgentTemplate):
         router_knowledge_context = retrieve_router_knowledge_context(
             self.knowledge_base, state, tool_runtime=self.tool_runtime, agent_name=self.role_name
         )
+        router_graph_context: dict[str, object] = {}
+        target_names = []
+        if state.plan is not None:
+            target_names = list(state.plan.rag_context.get("explicit_target_functions", []) or [])
+            if not target_names:
+                target_names = list(state.request.permissions.get("required_api_functions", []) or [])
+        if self.tool_runtime is not None:
+            for api_name in dict.fromkeys(str(item).strip() for item in target_names if str(item).strip()):
+                try:
+                    dependencies, _ = self.tool_runtime.call(
+                        self.role_name, "get_api_dependencies", ApiNameInput(api_name)
+                    )
+                    router_graph_context[api_name] = dependencies
+                except Exception as exc:
+                    router_graph_context[api_name] = {
+                        "available": False,
+                        "knowledge_status": "unknown",
+                        "error": str(exc),
+                    }
         system_prompt = (
             "# Identity\n"
             "You are RouterAgent in a multi-agent CNC FOCAS traffic-generation workflow.\n\n"
@@ -190,6 +210,24 @@ class RouterAgent(AgentTemplate):
             "# Output Schema\n"
             "{\"next_stage\":\"planning\",\"reason\":\"short reason\",\"repair_instruction\":\"concrete instruction for next agent, empty if no repair\"}"
         )
+        soul_context = ""
+        soul_store = getattr(self, "soul_store", None)
+        if soul_store is not None:
+            try:
+                soul_context = soul_store.prompt_context(
+                    self.role_name,
+                    task_context=f"{state.request.description}; stage={state.stage}",
+                    error_type="; ".join(str(item) for item in state.errors[-4:]),
+                    memory_store=getattr(self, "memory_store", None),
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                soul_context = f"Agent Soul unavailable: {exc}"
+        if soul_context:
+            system_prompt += (
+                "\n\n# Dynamic Agent Soul\n"
+                + soul_context
+                + "\nTreat proposed or unknown traffic relationships as hypotheses; route only from concrete evidence.\n"
+            )
         user_prompt = (
             f"Current state:\n"
             f"stage={state.stage}\n"
@@ -206,6 +244,9 @@ class RouterAgent(AgentTemplate):
             f"retrieved_error_experience_memories={state.long_term_memories}\n"
             f"plan_review={summarize_plan_for_router(state)}\n"
             f"router_knowledge_context={router_knowledge_context}\n"
+            f"router_agent_soul={soul_context}\n"
+            f"traffic_relationships={state.plan.rag_context.get('traffic_relationships', {}) if state.plan else {}}\n"
+            f"router_graph_context={router_graph_context}\n"
             f"repair_attempts={state.repair_attempts}\n"
             f"All stages: {sorted(all_stages)}\n"
             f"Valid next stages for this state: {sorted(allowed)}"

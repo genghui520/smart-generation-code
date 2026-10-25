@@ -32,6 +32,30 @@ Cycle Start 坐标不再使用不可靠的固定默认值。在场景页点击�
 This repository contains a runnable first version of the CNC protocol traffic
 generation workflow described in the design documents.
 
+## Agent Soul and Traffic Relationship Graph
+
+The four existing agents load scoped, versioned role guidance from
+`agent_souls/{router,planner,code_generator,executor}/`. Runtime experiences
+remain in the existing long-term memory store and are retrieved only for the
+agent and task that need them. Missing soul files or experience records do not
+silently become execution rules.
+
+The Planner queries the shared Traffic Relationship Graph and parameter tools
+before asking the model to plan. API nodes and evidence-scoped relations are
+stored through `TrafficRelationshipService`; set `SMP_TRG_NEO4J_URI` (and the
+matching user/password variables) to use Neo4j. Without a configured backend,
+the service reports `unknown` and the original RAG/SDK planning path remains
+available. Relations marked `proposed` are hypotheses and cannot add mandatory
+dependencies. Complete successful execution evidence is written to
+`execution/traffic_relationship_feedback.json` and may promote only relations
+that pass explicit verification.
+
+Parameter discovery and filtering are separate from the graph: observed
+values, operation-specific exclusions, documented ranges, and bounded
+combinations are returned as structured tool results. Upload-existing and
+download-new program selection use separate filtering contexts, and empty or
+unverified discovery never invents a device value.
+
 It implements:
 
 - task routing across planning, code generation, execution, repair, and quality assessment

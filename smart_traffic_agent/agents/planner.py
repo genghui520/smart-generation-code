@@ -30,6 +30,15 @@ from ..rag.scenario_templates import DEFAULT_FINAL_SCENARIO_TEMPLATES_PATH
 from ..fast_path import eligible_read_fast_path, build_fast_path_steps
 from ..scenario_capabilities import analyze_output_dependencies, build_scene_capability_plan, load_scenario_capabilities
 from ..integrations.ncguide import default_focas_header_dir
+from ..agent_tools.traffic_graph import (
+    ApiNameInput,
+    ChainInput,
+    DiscoverParameterInput,
+    FilterParameterInput,
+    GenerateCombinationsInput,
+    ParameterRulesInput,
+)
+from ..traffic_relationship_mining import seed_documented_relations
 from .prompts import PLANNING_REVIEW_JSON_SCHEMA, PLANNING_REVIEW_SYSTEM_PROMPT
 
 
@@ -73,6 +82,110 @@ class PlanningAgent(AgentTemplate):
         self.coverage_batch_size = coverage_batch_size
         self.coverage_segment_count = coverage_segment_count
         self.tool_runtime: ToolRuntime | None = None
+
+    def _query_trcm(self, state: WorkflowState, api_names: list[str]) -> dict[str, Any]:
+        """Load verified graph facts and parameter rules before LLM planning."""
+        if not api_names or self.tool_runtime is None:
+            return {"available": False, "knowledge_status": "unknown", "apis": {}}
+        # Only documented SDK/session rules are migrated automatically. Runtime
+        # relations enter the graph through evidence verification later.
+        service = getattr(self, "traffic_relationships", None)
+        if service is not None and service.available:
+            seed_documented_relations(service, api_names)
+        result: dict[str, Any] = {
+            "available": False,
+            "backend_configured": bool(service and service.available),
+            "knowledge_status": "unknown",
+            "apis": {},
+        }
+        for api_name in dict.fromkeys(api_names):
+            try:
+                api_info, _ = self.tool_runtime.call(
+                    self.role_name, "get_api_info", ApiNameInput(api_name)
+                )
+                chain, _ = self.tool_runtime.call(
+                    self.role_name, "get_traffic_chain", ChainInput(api_name, max_depth=3)
+                )
+                dependencies, _ = self.tool_runtime.call(
+                    self.role_name, "get_api_dependencies", ApiNameInput(api_name)
+                )
+                rules, _ = self.tool_runtime.call(
+                    self.role_name, "get_parameter_rules", ParameterRulesInput(api_name)
+                )
+            except Exception as exc:
+                result["apis"][api_name] = {"available": False, "knowledge_status": "unknown", "error": str(exc)}
+                continue
+            result["apis"][api_name] = {
+                "api_info": api_info,
+                "chain": chain,
+                "dependencies": dependencies,
+                "parameter_rules": rules,
+            }
+            if any(bool(item.get("available")) for item in (chain, dependencies, rules) if isinstance(item, dict)):
+                result["available"] = True
+                result["knowledge_status"] = "known" if any(
+                    item.get("knowledge_status") == "known"
+                    for item in (chain, dependencies, rules)
+                    if isinstance(item, dict)
+                ) else "unknown"
+            # Apply deterministic filtering only when the caller supplied
+            # observed values/domains. The Planner describes constraints; it
+            # never invents device values from an empty context.
+            parameter_contexts = state.request.permissions.get("parameter_contexts", {})
+            if isinstance(parameter_contexts, dict):
+                selections: dict[str, Any] = {}
+                api_parameter_context = parameter_contexts.get(api_name, {})
+                if not isinstance(api_parameter_context, dict):
+                    api_parameter_context = {}
+                parameter_entries = api_parameter_context.get("parameters")
+                if not isinstance(parameter_entries, dict):
+                    parameter_entries = {
+                        key: value for key, value in api_parameter_context.items()
+                        if key not in {"parameter_domains", "budget", "constraints"}
+                    }
+                for parameter_name, context in parameter_entries.items():
+                    if not isinstance(context, dict):
+                        continue
+                    observations = tuple(context.get("observations", ()) or ())
+                    if observations:
+                        discovered, _ = self.tool_runtime.call(
+                            self.role_name,
+                            "discover_parameter_values",
+                            DiscoverParameterInput(
+                                api_name,
+                                str(parameter_name),
+                                observations=observations,
+                                source_api=str(context.get("source_api", "")),
+                            ),
+                        )
+                        context = {**context, "candidates": discovered.get("candidates", [])}
+                    filtered, _ = self.tool_runtime.call(
+                        self.role_name,
+                        "filter_parameter_candidates",
+                        FilterParameterInput(
+                            api_name,
+                            str(parameter_name),
+                            context=context,
+                            rules=tuple(rules.get("rules", []) if isinstance(rules, dict) else ()),
+                        ),
+                    )
+                    selections[str(parameter_name)] = filtered
+                domains = api_parameter_context.get("parameter_domains")
+                if isinstance(domains, dict) and domains:
+                    combinations, _ = self.tool_runtime.call(
+                        self.role_name,
+                        "generate_parameter_combinations",
+                        GenerateCombinationsInput(
+                            api_name,
+                            {str(key): tuple(value or ()) for key, value in domains.items() if isinstance(value, (list, tuple))},
+                            budget=int(api_parameter_context.get("budget", 3)),
+                            constraint_descriptions=tuple(str(item) for item in api_parameter_context.get("constraints", ()) or ()),
+                        ),
+                    )
+                    selections["_combinations"] = combinations
+                if selections:
+                    result["apis"][api_name]["parameter_selections"] = selections
+        return result
 
     def run(self, state: WorkflowState) -> WorkflowState:
         # Planning is the slowest LLM phase because it carries RAG and ABI
@@ -147,6 +260,7 @@ class PlanningAgent(AgentTemplate):
             request.permissions.get("coverage_current_batch_functions")
             or request.permissions.get("required_api_functions") or ()
         ) if str(item).strip()]
+        trcm_context = self._query_trcm(state, requested_targets)
         # Retrieve exact API evidence for every explicitly selected target.
         # Broad scenario similarity is not reliable enough to supply argument
         # domains or output dependencies for a specific function.
@@ -174,6 +288,18 @@ class PlanningAgent(AgentTemplate):
         if state.long_term_memories:
             plan.rag_context["long_term_memories"] = summarize_long_term_memories(state.long_term_memories)
             plan.llm_notes.append(f"Loaded {len(state.long_term_memories)} long-term repair memories.")
+        plan.rag_context["traffic_relationships"] = trcm_context
+        soul_store = getattr(self, "soul_store", None)
+        planner_soul = soul_store.prompt_context(
+            self.role_name,
+            task_context=f"{request.description}; targets={requested_targets}",
+            memory_store=getattr(self, "memory_store", None),
+        ) if soul_store is not None else ""
+        # ``agent_soul`` is retained for saved-plan compatibility; the
+        # explicit owner key prevents downstream agents from treating it as
+        # their own role guidance.
+        plan.rag_context["planner_soul"] = planner_soul
+        plan.rag_context["agent_soul"] = planner_soul
         repair_context = summarize_repair_context(state)
         if repair_context:
             plan.rag_context["repair_context"] = repair_context
@@ -1026,6 +1152,13 @@ def apply_llm_planning_decision(
         "# API Coverage Analysis, # Coverage Segments, and # Notes; put each object in the first two "
         "as '- item: {compact JSON object}' and each note as '- note: text'."
     )
+    soul_context = str(plan.rag_context.get("agent_soul", "")).strip()
+    if soul_context:
+        system_prompt += "\n\n# Dynamic Agent Soul\n" + soul_context
+        user_prompt += "\n\nTRCM context (verified facts only):\n" + json.dumps(
+            plan.rag_context.get("traffic_relationships", {}), ensure_ascii=False, separators=(",", ":")
+        )
+        user_prompt += "\n\nDynamic Agent Soul has been loaded above; follow its boundaries."
     body_bytes_est = len(json.dumps({"model": "", "messages": [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},

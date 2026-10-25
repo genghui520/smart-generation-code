@@ -170,6 +170,89 @@ class LongTermMemoryStore:
         scored.sort(key=lambda item: (item[0], item[1].get("timestamp", "")), reverse=True)
         return [record for _, record in scored[:top_k]]
 
+    def search_agent_experiences(
+        self, agent_name: str, query: str, *, top_k: int = 5
+    ) -> list[dict[str, Any]]:
+        """Return only experiences scoped to one Agent and task context."""
+        agent = str(agent_name or "").strip().lower()
+        rows = []
+        for record in self.read_experiences():
+            owner = str(record.get("agent_name", "")).strip().lower()
+            if owner not in {"", agent}:
+                continue
+            rows.append(record)
+        query_terms = set(tokenize(query))
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for record in rows:
+            score = len(query_terms.intersection(tokenize(memory_search_text(record))))
+            if score or not query_terms:
+                enriched = dict(record)
+                enriched["score"] = score
+                enriched["retrieval_method"] = "term_fallback"
+                scored.append((score, enriched))
+        scored.sort(key=lambda item: (item[0], item[1].get("timestamp", "")), reverse=True)
+        return [record for _, record in scored[: max(1, min(top_k, 50))]]
+
+    def submit_agent_experience(
+        self,
+        agent_name: str,
+        evidence: dict[str, Any],
+        *,
+        verified: bool = False,
+    ) -> dict[str, Any]:
+        """Persist a versioned experience without silently making it trusted."""
+        import hashlib
+
+        canonical = json.dumps(
+            {"agent_name": agent_name, "evidence": evidence},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        experience_id = str(evidence.get("experience_id") or "exp-" + hashlib.sha256(canonical.encode()).hexdigest()[:16])
+        existing = next(
+            (row for row in self.read_experiences() if str(row.get("experience_id")) == experience_id),
+            None,
+        )
+        version = int(existing.get("version", 0)) + 1 if existing else 1
+        status = "runtime_verified" if verified else "proposed"
+        # A later hypothesis must never downgrade an experience that already
+        # has runtime evidence. Promotion is monotonic until an explicit
+        # superseding record is created under a new experience id.
+        if existing and existing.get("status") == "runtime_verified":
+            status = "runtime_verified"
+        record = {
+            "experience_id": experience_id,
+            "memory_id": f"experience:{experience_id}",
+            "record_type": "agent_experience",
+            "agent_name": str(agent_name),
+            "status": status,
+            "version": version,
+            "timestamp": utc_now(),
+            "evidence": evidence,
+        }
+        self.upsert_experience(record)
+        return record
+
+    def upsert_experience(self, record: dict[str, Any]) -> None:
+        ensure_dir(self.experience_path.parent)
+        rows = self.read_experiences()
+        experience_id = str(record.get("experience_id", ""))
+        updated = False
+        for index, row in enumerate(rows):
+            if str(row.get("experience_id", "")) == experience_id:
+                rows[index] = dict(record)
+                updated = True
+                break
+        if not updated:
+            rows.append(dict(record))
+        self.experience_path.write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        if self._ensure_vector_store():
+            self._sync_vector_store()
+
     def read_experiences(self) -> list[dict[str, Any]]:
         """Read curated, evidence-backed troubleshooting experiences."""
         if not self.experience_path.exists():

@@ -1,0 +1,18 @@
+version: 1
+tools:
+  - search_knowledge
+  - search_memory
+  - get_api_info
+  - get_traffic_chain
+  - get_api_dependencies
+  - get_parameter_rules
+  - discover_parameter_values
+  - filter_parameter_candidates
+  - generate_parameter_combinations
+  - propose_traffic_relation
+  - get_agent_experience
+rules:
+  - verified graph edges may guide execution; proposed edges require a validation plan
+  - output constraints and discovery sources, never guessed concrete values
+  - upload-existing and download-new program-number filtering are different operations
+  - missing graph data must degrade to RAG and SDK evidence without blocking the target

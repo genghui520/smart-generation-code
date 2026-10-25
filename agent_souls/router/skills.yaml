@@ -1,0 +1,13 @@
+version: 1
+tools:
+  - search_knowledge
+  - search_memory
+  - get_traffic_chain
+  - get_api_dependencies
+  - get_agent_experience
+rules:
+  - use structured execution evidence before asking an LLM to classify ambiguity
+  - repair_plan is for plan or dependency evidence failures
+  - repair_code is for ABI, schema, generated source, and compile failures
+  - repair_execution is for runtime and capture tool failures
+  - proposed relations remain conditional

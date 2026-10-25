@@ -11,6 +11,7 @@ dependencies = [
   "numpy>=1.26",
   "langgraph>=0.2",
   "sentence-transformers>=5.0",
+  "neo4j>=5.0",
 ]
 
 [tool.pytest.ini_options]

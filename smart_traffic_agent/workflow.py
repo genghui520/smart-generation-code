@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -32,12 +33,15 @@ from .agent_tools import (
     WriteGeneratedArtifactTool,
     RenderFocasCppTool,
     ValidateFocasCppTool,
+    register_traffic_tools,
 )
 from .tool_runtime import ToolRuntime, ToolRegistry
 from .models import TaskRequest, WorkflowState, utc_now
 from .quality import build_quality_observation, output_variation_is_sufficient
 from .rag.focas_function_manifest import DEFAULT_COVERAGE_BATCH_SIZE, DEFAULT_COVERAGE_SEGMENT_COUNT
 from .utils import ensure_dir, write_json
+from .agent_soul import AgentSoulStore
+from .traffic_graph import TrafficRelationshipService, build_default_relationship_service
 
 
 @dataclass
@@ -60,6 +64,8 @@ class TrafficGenerationWorkflow:
         coverage_state_path: Path = DEFAULT_FUNCTION_COVERAGE_STATE,
         coverage_batch_size: int = DEFAULT_COVERAGE_BATCH_SIZE,
         coverage_segment_count: int = DEFAULT_COVERAGE_SEGMENT_COUNT,
+        traffic_relationships: TrafficRelationshipService | None = None,
+        soul_store: AgentSoulStore | None = None,
         max_repair_attempts: int = 3,
     ) -> None:
         self.max_repair_attempts = max(0, int(max_repair_attempts))
@@ -68,6 +74,8 @@ class TrafficGenerationWorkflow:
         self.progress_callback = progress_callback
         self.coverage_state_path = coverage_state_path
         self.knowledge_base = knowledge_base
+        self.traffic_relationships = traffic_relationships or build_default_relationship_service()
+        self.soul_store = soul_store or AgentSoulStore(Path(os.getenv("SMPAGENT_SOUL_ROOT", "agent_souls")))
         self.environment = AgentEnvironment(knowledge_base)
         self.tool_registry = ToolRegistry()
         compile_tool = CompileGeneratedCppTool()
@@ -85,6 +93,7 @@ class TrafficGenerationWorkflow:
             ValidateFocasCppTool(),
         ):
             self.tool_registry.register(tool)
+        register_traffic_tools(self.tool_registry, self.traffic_relationships, self.memory_store)
         self.tool_runtime = ToolRuntime(self.tool_registry, progress_callback=self._emit)
         self.router = RouterAgent(llm_client=self.llm_client, knowledge_base=knowledge_base)
         self.planner = PlanningAgent(
@@ -107,6 +116,9 @@ class TrafficGenerationWorkflow:
         for agent in (self.router, self.planner, self.generator, self.executor):
             agent.environment = self.environment
             agent.tool_runtime = self.tool_runtime
+            agent.traffic_relationships = self.traffic_relationships
+            agent.soul_store = self.soul_store
+            agent.memory_store = self.memory_store
         self.graph = self._build_graph()
 
     def _build_graph(self):

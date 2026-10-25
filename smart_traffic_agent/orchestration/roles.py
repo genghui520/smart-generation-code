@@ -55,6 +55,9 @@ class AgentTemplate(Role):
             self.constraints = tuple(constraints)
         self.environment: Any | None = None
         self.tool_runtime: Any | None = None
+        self.traffic_relationships: Any | None = None
+        self.soul_store: Any | None = None
+        self.memory_store: Any | None = None
 
     def tool_loop(self, *, max_turns: int = 6):
         """Create an independent bounded tool loop for this Agent."""

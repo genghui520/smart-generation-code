@@ -46,6 +46,18 @@ def sdk_type_context_for_abi(abi: str) -> str:
     return sdk_index_prompt_context(
         load_or_build_sdk_type_index(header, Path("rag_indexes/focas/sdk_type_index_0iD.json")), names
     )
+
+
+def code_generator_soul_context(rag_context: dict[str, Any]) -> str:
+    """Return only CodeGenerationAgent's scoped Soul context.
+
+    The fallback keeps direct helper tests and older saved plans compatible;
+    production workflows populate ``code_generator_soul`` explicitly.
+    """
+    return str(
+        rag_context.get("code_generator_soul")
+        or rag_context.get("agent_soul", "")
+    ).strip()
 from .prompts import CODE_REVIEW_JSON_SCHEMA, CODE_REVIEW_SYSTEM_PROMPT, FOCAS_CPP_GENERATION_SYSTEM_PROMPT
 
 
@@ -69,6 +81,15 @@ class CodeGenerationAgent(AgentTemplate):
     def run(self, state: WorkflowState, output_dir: Path) -> WorkflowState:
         if state.plan is None:
             raise ValueError("Cannot generate code before a plan exists.")
+
+        soul_store = getattr(self, "soul_store", None)
+        if soul_store is not None:
+            state.plan.rag_context["code_generator_soul"] = soul_store.prompt_context(
+                self.role_name,
+                task_context=f"{state.request.description}; scenario={state.plan.scenario_type}",
+                error_type="; ".join(str(item) for item in state.errors[-4:]),
+                memory_store=getattr(self, "memory_store", None),
+            )
 
         repair_context = summarize_codegen_repair_context(state)
         if repair_context:
@@ -98,6 +119,7 @@ class CodeGenerationAgent(AgentTemplate):
             state.request.description,
             state.plan.scenario_type,
             code_spec,
+            state.plan.rag_context,
         )
         if code_generation_tool_search:
             state.plan.rag_context["code_generation_tool_search"] = code_generation_tool_search
@@ -385,6 +407,7 @@ class CodeGenerationAgent(AgentTemplate):
         task_description: str,
         scenario: str,
         code_spec: CodeSpec,
+        rag_context: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Use the CodeGenerationAgent-owned loop for authoritative evidence."""
         if self.tool_runtime is None or not self.llm_client.enabled:
@@ -402,8 +425,17 @@ class CodeGenerationAgent(AgentTemplate):
         user_prompt = (
             f"Task: {task_description}\nScenario: {scenario}\n"
             f"Authoritative API set: {api_names}\n"
+            f"Agent Soul:\n{code_generator_soul_context(rag_context or {})}\n"
+            f"Traffic Relationship Graph context:\n{(rag_context or {}).get('traffic_relationships', {})}\n"
             "Search the RAG knowledge base for exact declarations and ABI evidence for these APIs."
         )
+        soul_context = code_generator_soul_context(rag_context or {})
+        if soul_context:
+            system_prompt += (
+                "\nScoped Agent Soul:\n"
+                + soul_context
+                + "\nUse graph relationships only as evidence; proposed relations are not mandatory."
+            )
         loop.run(
             self.role_name,
             system_prompt,
@@ -785,7 +817,17 @@ def generate_nc_program_with_llm(
         f"repair_context={rag_context.get('repair_context', [])}\n"
         f"code_generation_repair_context={rag_context.get('code_generation_repair_context', [])}\n"
         f"code_generation_knowledge={rag_context.get('code_generation_knowledge', [])}\n"
+        f"agent_soul={code_generator_soul_context(rag_context)}\n"
+        f"traffic_relationships={rag_context.get('traffic_relationships', {})}\n"
     )
+    soul_context = code_generator_soul_context(rag_context)
+    if soul_context:
+        system_prompt += (
+            "\n\n# Dynamic Agent Soul\n"
+            + soul_context
+            + "\nUse only documented or runtime_verified relationships as mandatory dependencies; "
+            "proposed and unknown relationships are hypotheses only.\n"
+        )
     payload = llm_client.invoke_json(system_prompt, user_prompt)
     nc_program = str(payload.get("nc_program", "")).strip()
     if not nc_program:
@@ -1260,6 +1302,8 @@ def generate_scenario_core_with_llm(
         f"Official ABI excerpts:\n{abi}\n"
         f"SDK type definitions from the active header:\n{sdk_types}\n"
         f"Required semantic operations (must be implemented): {required_semantics}\n"
+        f"Agent Soul:\n{code_generator_soul_context(state.plan.rag_context)}\n"
+        f"Traffic Relationship Graph context:\n{state.plan.rag_context.get('traffic_relationships', {})}\n"
         f"NC program is already embedded by the shell:\n{nc_program}\n"
         "Initialize nc_payload/nc_buffer/nc_length inside the fragment when an upload API needs them, using the supplied NC program. "
         "Return the smallest complete core fragment that implements the Planner steps."
@@ -3270,6 +3314,9 @@ def generate_cpp_api_script_with_llm(
         f"CodeGenerationAgent direct RAG knowledge: {state.plan.rag_context.get('code_generation_knowledge', [])}\n"
         f"Retrieved error-experience memories (historical evidence, not binding API documentation; apply only when trigger and environment match): {state.plan.rag_context.get('long_term_memories', [])}\n"
         f"Retrieved API/rule examples for these interfaces: {summarize_codegen_rag_examples(state.plan.rag_context, executable_steps)}\n"
+        f"Dynamic Agent Soul and scoped experience:\n{code_generator_soul_context(state.plan.rag_context)}\n"
+        f"Traffic Relationship Graph context (verified facts and proposed hypotheses):\n"
+        f"{state.plan.rag_context.get('traffic_relationships', {})}\n"
         f"Executable API steps:\n{steps_for_prompt(executable_steps)}\n\n"
         "Parameter generation policy:\n"
         "- fixed: use the provided constant value in every generated call.\n"
@@ -3333,7 +3380,18 @@ def generate_cpp_api_script_with_llm(
             f"Structured CodeSpec (authoritative contract):\n{asdict(state.plan.code_spec) if state.plan.code_spec is not None else {}}\n\n"
             f"RAG API/rule evidence:\n{state.plan.rag_context.get('code_generation_knowledge', [])}\n"
             f"Retrieved examples:\n{summarize_codegen_rag_examples(state.plan.rag_context, executable_steps)}\n\n"
+            f"Agent Soul:\n{code_generator_soul_context(state.plan.rag_context)}\n"
+            f"Traffic Relationship Graph context:\n{state.plan.rag_context.get('traffic_relationships', {})}\n\n"
             f"Generate the complete source now. Preserve the exact {contract_owner} API names and documented parameters."
+        )
+    soul_context = code_generator_soul_context(state.plan.rag_context)
+    if soul_context:
+        system_prompt += (
+            "\n\n# Dynamic Agent Soul\n"
+            + soul_context
+            + "\n\n# Relationship evidence boundary\n"
+            "Use documented or runtime_verified relationships as mandatory constraints. "
+            "Treat proposed and unknown relationships as hypotheses only; do not invent dependencies.\n"
         )
     payload = llm_client.invoke_json(system_prompt, user_prompt)
     cpp_code = str(payload.get("cpp_code", "")).strip()

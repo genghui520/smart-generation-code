@@ -39,6 +39,7 @@ from ..integrations.simulator_client import SimulatedCncClient
 from ..knowledge import KnowledgeBase
 from ..api_prerequisites import classify_prerequisite_failure
 from ..scenario_capabilities import assess_scene_execution
+from ..traffic_relationship_mining import mine_runtime_relations
 from ..models import ApiCallLog, CaptureEvent, ExecutionResult, GeneratedArtifacts, WorkflowState, utc_now
 from ..tool_runtime import ToolRuntime, ToolRegistry
 from ..tool_runtime import ToolCallLoop
@@ -113,6 +114,14 @@ class ExecutionAgent(AgentTemplate):
             state.errors.append("ExecutionAgent received no Planner CodeSpec official ABI context.")
         if self.environment is not None:
             state.plan.rag_context["environment_shared_rules"] = self.environment.shared_rules
+        soul_store = getattr(self, "soul_store", None)
+        if soul_store is not None:
+            state.plan.rag_context["executor_soul"] = soul_store.prompt_context(
+                self.role_name,
+                task_context=f"{state.request.description}; target_environment={state.request.target_environment}",
+                error_type="; ".join(str(item) for item in state.errors[-4:]),
+                memory_store=getattr(self, "memory_store", None),
+            )
 
         target_environment = state.request.target_environment
         if target_environment == "ncguide-generated-cpp":
@@ -128,6 +137,7 @@ class ExecutionAgent(AgentTemplate):
                 llm_client=self.llm_client,
                 use_model_tool_loop=bool(state.request.permissions.get("execution_tool_loop")),
             )
+            self._record_relationship_feedback(result)
             self._publish_execution_message(result)
             return result
 
@@ -212,11 +222,52 @@ class ExecutionAgent(AgentTemplate):
             errors=[error for error in errors if error],
         )
         record_scene_evidence(state)
+        self._record_relationship_feedback(state)
         state.errors.extend(state.result.errors)
         attach_execution_error_knowledge(state, self.knowledge_base)
         state.stage = "complete"
         self._publish_execution_message(state)
         return state
+
+    def _record_relationship_feedback(self, state: WorkflowState) -> None:
+        """Feed complete execution evidence back to TRCM without affecting collection.
+
+        Relationship mining is a knowledge update, not an execution gate. A
+        missing graph backend or malformed evidence is persisted as a
+        diagnostic and never changes ``ExecutionResult.success``.
+        """
+        if state.plan is None or state.result is None:
+            return
+        service = getattr(self, "traffic_relationships", None)
+        if service is None:
+            return
+        feedback: dict[str, object]
+        if not state.result.success:
+            feedback = {
+                "status": "skipped",
+                "reason": "runtime evidence is incomplete or execution failed",
+                "relation_count": 0,
+            }
+        else:
+            try:
+                relations = mine_runtime_relations(service, state.plan, state.result)
+                feedback = {
+                    "status": "recorded" if service.available else "unavailable",
+                    "relation_count": len(relations),
+                    "relations": relations,
+                }
+            except Exception as exc:  # pragma: no cover - defensive backend isolation
+                feedback = {
+                    "status": "failed",
+                    "relation_count": 0,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+        state.plan.rag_context["traffic_relationship_feedback"] = feedback
+        try:
+            write_json(state.result.output_dir / "traffic_relationship_feedback.json", feedback)
+        except OSError:
+            # Artifact persistence is best effort; primary API logs remain intact.
+            pass
 
     def _publish_execution_message(self, state: WorkflowState) -> None:
         if state.result is None:
@@ -494,6 +545,8 @@ def run_generated_cpp_api_script_with_tool_loop(
             "Pass no invented paths or environment values; the harness supplies typed inputs. "
             "If compilation fails, stop and return final JSON with success=false. "
             "Return final JSON only after the required tool calls."
+            f"\n\nDynamic Agent Soul:\n{state.plan.rag_context.get('executor_soul', '')}\n"
+            "Treat graph proposals as diagnostics only; preserve the typed tool order and raw evidence."
         ),
         f"Execute generated artifact for task {state.request.task_id}. Required ordered tools: "
         "compile_generated_cpp -> run_generated_executable -> collect_execution_artifacts.",
