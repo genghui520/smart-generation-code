@@ -87,14 +87,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Use scenario-focused planning for RQ1/RQ3 representative benchmarks instead of global function coverage.",
     )
     run_parser.add_argument("--protocol", default="focas")
-    run_parser.add_argument("--vector-db", type=Path, default=Path("rag_indexes/focas/vector_db"), help="optional Chroma vector DB for RAG retrieval")
+    run_parser.add_argument("--vector-db", type=Path, default=Path("rag_indexes/focas/vector_db_pdf_rebuilt"), help="optional Chroma vector DB for RAG retrieval")
     run_parser.add_argument("--llm-provider", default="openai_compatible", choices=["disabled", "openai_compatible", "openai", "tokenhub"])
-    run_parser.add_argument("--llm-model", default="gpt-5.6-sol")
-    run_parser.add_argument("--llm-base-url", default="https://fast.smartaipro.cn/v1")
-    run_parser.add_argument("--llm-api-key-env", default="SMARTAIPRO_API_KEY")
-    run_parser.add_argument("--llm-transport", default="sdk", choices=["sdk", "http"], help="LLM transport; use http for gateways that block SDK headers")
+    run_parser.add_argument("--llm-model", default="deepseek-flash")
+    run_parser.add_argument("--llm-base-url", default="https://api.deepseek.com")
+    run_parser.add_argument("--llm-api-key-env", default="DEEPSEEK_API_KEY")
+    run_parser.add_argument("--llm-transport", default="http", choices=["sdk", "http"], help="LLM transport; direct HTTP is the default for DeepSeek")
     run_parser.add_argument("--llm-wire-api", default="chat_completions", choices=["chat_completions", "responses"])
-    run_parser.add_argument("--llm-reasoning-effort", default=None, choices=["low", "medium", "high"])
+    run_parser.add_argument("--llm-reasoning-effort", default="high", choices=["low", "medium", "high"])
     run_parser.add_argument("--llm-max-output-tokens", type=int, default=None)
     run_parser.add_argument("--llm-timeout-seconds", type=float, default=120.0)
     run_parser.add_argument(
@@ -158,10 +158,11 @@ def main(argv: list[str] | None = None) -> int:
     extract_parser.add_argument("--max-chars-per-chunk", type=int, default=4500)
     extract_parser.add_argument("--limit-batches", type=int, default=0, help="limit batches for a small test run")
     extract_parser.add_argument("--llm-provider", default="openai_compatible", choices=["openai_compatible", "openai", "tokenhub"])
-    extract_parser.add_argument("--llm-model", default="gpt-5.6-sol")
-    extract_parser.add_argument("--llm-base-url", default="https://fast.smartaipro.cn/v1")
-    extract_parser.add_argument("--llm-api-key-env", default="SMARTAIPRO_API_KEY")
-    extract_parser.add_argument("--llm-transport", default="sdk", choices=["sdk", "http"], help="LLM transport; use http for gateways that block SDK headers")
+    extract_parser.add_argument("--llm-model", default="deepseek-flash")
+    extract_parser.add_argument("--llm-base-url", default="https://api.deepseek.com")
+    extract_parser.add_argument("--llm-api-key-env", default="DEEPSEEK_API_KEY")
+    extract_parser.add_argument("--llm-transport", default="http", choices=["sdk", "http"], help="LLM transport; direct HTTP is the default for DeepSeek")
+    extract_parser.add_argument("--llm-reasoning-effort", default="high", choices=["low", "medium", "high"])
     extract_parser.add_argument("--taxonomy", type=Path, default=None, help="protocol taxonomy JSON; defaults to built-in FOCAS taxonomy")
 
     merge_parser = subparsers.add_parser("merge-rule-extraction-results", help="merge model JSON outputs into rule chunks")
@@ -175,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
     vector_parser.add_argument("--api-chunks", type=Path, default=Path("rag_indexes/focas/chunks.jsonl"))
     vector_parser.add_argument("--rule-chunks", type=Path, default=Path("rag_indexes/focas/rule_chunks.jsonl"))
     vector_parser.add_argument("--scenario-chunks", type=Path, default=DEFAULT_SCENARIO_CHUNKS_PATH)
-    vector_parser.add_argument("--out-dir", type=Path, default=Path("rag_indexes/focas/vector_db"))
+    vector_parser.add_argument("--out-dir", type=Path, default=Path("rag_indexes/focas/vector_db_pdf"))
     vector_parser.add_argument("--no-reset", action="store_true", help="do not delete the existing vector DB first")
 
     organize_parser = subparsers.add_parser("organize-focas-scenarios", help="build scenario-centered FOCAS knowledge")
@@ -370,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
                 base_url=args.llm_base_url,
                 api_key_env=args.llm_api_key_env,
                 transport=args.llm_transport,
+                reasoning_effort=args.llm_reasoning_effort,
             )
         )
         paths = extract_rules_with_llm(

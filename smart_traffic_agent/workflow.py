@@ -19,10 +19,24 @@ from .function_coverage import (
 )
 from .knowledge import KnowledgeBase
 from .environment import AgentEnvironment
-from .llm import LlmClient
+from .llm import LlmClient, TransientLlmError
 from .memory import LongTermMemoryStore
+from .agent_tools import (
+    CollectExecutionArtifactsTool,
+    CompileGeneratedCppTool,
+    KnowledgeSearchTool,
+    MemorySearchInput,
+    MemorySearchTool,
+    RememberWorkflowTool,
+    RunGeneratedExecutableTool,
+    WriteGeneratedArtifactTool,
+    RenderFocasCppTool,
+    ValidateFocasCppTool,
+)
+from .tool_runtime import ToolRuntime, ToolRegistry
 from .models import TaskRequest, WorkflowState, utc_now
 from .quality import build_quality_observation, output_variation_is_sufficient
+from .rag.focas_function_manifest import DEFAULT_COVERAGE_BATCH_SIZE, DEFAULT_COVERAGE_SEGMENT_COUNT
 from .utils import ensure_dir, write_json
 
 
@@ -44,26 +58,55 @@ class TrafficGenerationWorkflow:
         memory_store: LongTermMemoryStore | None = None,
         progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
         coverage_state_path: Path = DEFAULT_FUNCTION_COVERAGE_STATE,
+        coverage_batch_size: int = DEFAULT_COVERAGE_BATCH_SIZE,
+        coverage_segment_count: int = DEFAULT_COVERAGE_SEGMENT_COUNT,
+        max_repair_attempts: int = 3,
     ) -> None:
+        self.max_repair_attempts = max(0, int(max_repair_attempts))
         self.llm_client = llm_client or LlmClient()
         self.memory_store = memory_store or LongTermMemoryStore()
         self.progress_callback = progress_callback
         self.coverage_state_path = coverage_state_path
         self.knowledge_base = knowledge_base
         self.environment = AgentEnvironment(knowledge_base)
+        self.tool_registry = ToolRegistry()
+        compile_tool = CompileGeneratedCppTool()
+        run_tool = RunGeneratedExecutableTool()
+        collect_tool = CollectExecutionArtifactsTool()
+        for tool in (
+            compile_tool,
+            run_tool,
+            collect_tool,
+            KnowledgeSearchTool(knowledge_base),
+            MemorySearchTool(self.memory_store),
+            RememberWorkflowTool(self.memory_store),
+            WriteGeneratedArtifactTool(),
+            RenderFocasCppTool(),
+            ValidateFocasCppTool(),
+        ):
+            self.tool_registry.register(tool)
+        self.tool_runtime = ToolRuntime(self.tool_registry, progress_callback=self._emit)
         self.router = RouterAgent(llm_client=self.llm_client, knowledge_base=knowledge_base)
         self.planner = PlanningAgent(
             knowledge_base,
             llm_client=self.llm_client,
             coverage_state_path=coverage_state_path,
+            coverage_batch_size=coverage_batch_size,
+            coverage_segment_count=coverage_segment_count,
         )
         self.generator = CodeGenerationAgent(llm_client=self.llm_client, knowledge_base=knowledge_base)
         self.executor = ExecutionAgent(
             knowledge_base=knowledge_base,
+            compile_tool=compile_tool,
+            run_tool=run_tool,
+            collect_tool=collect_tool,
+            tool_runtime=self.tool_runtime,
             tool_progress_callback=self._emit,
+            llm_client=self.llm_client,
         )
         for agent in (self.router, self.planner, self.generator, self.executor):
             agent.environment = self.environment
+            agent.tool_runtime = self.tool_runtime
         self.graph = self._build_graph()
 
     def _build_graph(self):
@@ -107,7 +150,15 @@ class TrafficGenerationWorkflow:
             },
         )
         workflow_state = WorkflowState(request=request)
-        workflow_state.long_term_memories = self.memory_store.search(request.description)
+        self.tool_runtime.history = workflow_state.tool_call_history
+        historical_memory_enabled = bool(request.permissions.get("historical_memory_enabled", True))
+        if historical_memory_enabled:
+            memories, _ = self.tool_runtime.call(
+                "TrafficGenerationWorkflow", "search_memory", MemorySearchInput(request.description)
+            )
+            workflow_state.long_term_memories = memories
+        else:
+            workflow_state.long_term_memories = []
         self._emit(
             "memory_loaded",
             {
@@ -119,6 +170,10 @@ class TrafficGenerationWorkflow:
         recursion_limit = max(128, 24 * (self.max_repair_attempts + 1))
         result = self.graph.invoke(initial, config={"recursion_limit": recursion_limit})
         state = graph_result_to_state(result)
+        # LangGraph may materialize a new WorkflowState instance while the
+        # shared ToolRuntime keeps the authoritative process-level audit list.
+        # Reattach that history before summaries and persistence are produced.
+        state.tool_call_history = list(self.tool_runtime.history)
         coverage_state_update = merge_workflow_function_coverage_state(state, self.coverage_state_path)
         summary = workflow_summary(state)
         summary["agent_graph"] = self.agent_graph.describe()
@@ -126,7 +181,22 @@ class TrafficGenerationWorkflow:
             summary["coverage_state_update"] = coverage_state_update
         write_json(output_dir / "summary.json", summary)
         try:
-            self.memory_store.remember_workflow(state)
+            if historical_memory_enabled:
+                if state.error_memory_id:
+                    record = next(
+                        (item for item in self.memory_store.read_all() if item.get("memory_id") == state.error_memory_id),
+                        {},
+                    )
+                    record.update({
+                        "status": "resolved" if workflow_success(state) else "unresolved",
+                        "final_success": workflow_success(state),
+                        "repair_history": list(state.repair_history),
+                        "repair_attempts": state.repair_attempts,
+                        "final_errors": list(state.errors or (state.result.errors if state.result else [])),
+                        "timestamp_updated": utc_now(),
+                    })
+                    self.memory_store.upsert(record)
+                self.tool_runtime.call("TrafficGenerationWorkflow", "remember_workflow", state)
         except Exception as exc:
             state.errors.append(f"MemoryStore failed after workflow completion: {exc}")
             summary = workflow_summary(state)
@@ -149,12 +219,21 @@ class TrafficGenerationWorkflow:
 
     def _router_node(self, graph_state: GraphState) -> GraphState:
         state = graph_state.workflow
-        if state.errors:
-            query = f"{state.request.description}\n" + "\n".join(state.errors[-5:])
-            state.long_term_memories = self.memory_store.search(query)
+        historical_memory_enabled = bool(state.request.permissions.get("historical_memory_enabled", True))
+        observed_errors = list(dict.fromkeys([*state.errors, *(state.result.errors if state.result else [])]))
+        if observed_errors and historical_memory_enabled:
+            query = f"{state.request.description}\n" + "\n".join(observed_errors[-5:])
+            memories, _ = self.tool_runtime.call(
+                "TrafficGenerationWorkflow", "search_memory", MemorySearchInput(query)
+            )
+            state.long_term_memories = [
+                memory for memory in memories
+                if memory.get("memory_id") != state.error_memory_id
+            ]
+            self.memory_store.remember_error(state)
             self._emit(
                 "memory_reloaded_for_error",
-                {"count": len(state.long_term_memories), "errors": state.errors[-5:]},
+                {"count": len(state.long_term_memories), "errors": observed_errors[-5:]},
             )
         state.stage = self.router.route(state)
         self._emit(
@@ -168,6 +247,7 @@ class TrafficGenerationWorkflow:
                 "errors": state.errors[-5:],
                 "route_source": self.router.last_route_source,
                 "route_reason": self.router.last_route_reason,
+                "repair_instruction": self.router.last_repair_instruction,
             },
         )
         return GraphState(workflow=state, output_dir=graph_state.output_dir)
@@ -216,9 +296,22 @@ class TrafficGenerationWorkflow:
             )
         except Exception as exc:
             state = graph_state.workflow
-            state.errors.append(f"PlanningAgent failed: {exc}")
-            state.stage = "repair_plan"
-            self._emit("agent_error", {"agent": "PlanningAgent", "error": str(exc)})
+            if isinstance(exc, TransientLlmError):
+                state.errors.append(f"transient_llm_error: {exc}")
+                state.stage = "complete"
+                self._emit(
+                    "agent_error",
+                    {
+                        "agent": "PlanningAgent",
+                        "error": str(exc),
+                        "failure_category": "transient_llm_error",
+                        "terminal": True,
+                    },
+                )
+            else:
+                state.errors.append(f"PlanningAgent failed: {exc}")
+                state.stage = "repair_plan"
+                self._emit("agent_error", {"agent": "PlanningAgent", "error": str(exc)})
         return GraphState(workflow=state, output_dir=graph_state.output_dir)
 
     def _code_generation_node(self, graph_state: GraphState) -> GraphState:
@@ -335,6 +428,7 @@ class TrafficGenerationWorkflow:
             state.errors.append(
                 f"Stopped repair loop after {state.repair_attempts} attempts; last routed stage was {stage}."
             )
+            state.stage = "complete"
             self._emit(
                 "repair_stopped",
                 {"repair_attempts": state.repair_attempts, "last_stage": stage, "errors": state.errors[-5:]},
@@ -376,11 +470,17 @@ def workflow_summary(state: WorkflowState) -> dict:
         "rag_context_counts": {key: len(value) for key, value in rag_context.items()},
         "api_log_count": len(state.result.api_logs) if state.result else 0,
         "capture_event_count": len(state.result.capture_events) if state.result else 0,
+        "collection_status": state.result.collection_status if state.result else "not_run",
+        "collection_evidence": state.result.collection_evidence if state.result else {},
+        "offline_audit_status": state.result.offline_audit_status if state.result else "not_run",
         "execution_tool_calls": [call.to_dict() for call in state.result.tool_calls] if state.result else [],
+        "tool_call_history": [call.to_dict() for call in state.tool_call_history],
         "artifacts": artifacts_summary,
         "mapping_count": len(state.mapping),
         "errors": state.errors,
         "quality_assessment": state.quality_assessment,
+        "scene_plan": rag_context.get("scene_plan", {}),
+        "scene_execution_evidence": rag_context.get("scene_execution_evidence", {}),
         "function_coverage": build_function_coverage_metrics(state.plan, state.result),
         "repair_attempts": state.repair_attempts,
         "repair_history": state.repair_history,
@@ -396,13 +496,8 @@ def workflow_success(state: WorkflowState) -> bool:
         return False
     if not state.result.success:
         return False
-    # Coordinate-motion/program-execution tasks must pass the same objective
-    # output-variation gate used by RouterAgent before being reported as a
-    # successful workflow.  Pure read-only plans remain transport-gated.
-    if requires_dynamic_quality_gate(state):
-        return state.quality_assessment is not None and output_variation_is_sufficient(
-            state.quality_assessment.metrics
-        )
+    # Output variation and transaction quality are persisted for offline audit.
+    # They do not decide whether the compile/run/capture workflow executed.
     return True
 
 
@@ -411,9 +506,8 @@ def requires_dynamic_quality_gate(state: WorkflowState) -> bool:
         return False
     if state.plan is None:
         return False
-    scenario = str(state.plan.scenario_type).lower()
-    interfaces = {step.interface_name for step in state.plan.steps}
-    return scenario == "coordinate_motion" or "StartProgram" in interfaces
+    from .quality import plan_requires_motion_quality
+    return plan_requires_motion_quality(state.plan)
 
 
 def plan_requires_program_completion(state: WorkflowState) -> bool:
@@ -431,6 +525,9 @@ def quality_metrics_show_program_completed(state: WorkflowState) -> bool:
 def plan_requires_uploaded_program_verification(state: WorkflowState) -> bool:
     if state.plan is None or state.request.target_environment != "ncguide-generated-cpp":
         return False
+    contract = state.plan.rag_context.get("execution_contract", {})
+    if contract.get("motion"):
+        return True
     interfaces = {step.interface_name for step in state.plan.steps}
     return {"UploadProgram", "SelectProgram", "ReadProgramNumber", "StartProgram"}.issubset(interfaces)
 
@@ -438,34 +535,48 @@ def plan_requires_uploaded_program_verification(state: WorkflowState) -> bool:
 def uploaded_program_is_verified(state: WorkflowState) -> bool:
     if state.plan is None or state.result is None:
         return False
-    match = re.search(r"\d+", state.plan.nc_program_spec.program_name)
-    if match is None:
-        return False
-    expected = int(match.group(0))
-    observed_expected_program = False
+    # The O number in the plan is only a preferred starting point. Runtime
+    # collision handling may safely select another unused number, so verify
+    # the program that was actually uploaded/selected instead of comparing it
+    # with the planner's original value.
+    observed_runtime_verification = False
+    verified_runtime_numbers: set[int] = set()
+    read_program_numbers: set[int] = set()
     for log in state.result.api_logs:
         identity = " ".join([log.interface_name, log.protocol_function, log.step_id]).lower()
         data = str(log.response.get("data", ""))
         lowered_data = data.lower()
         if any(token in identity for token in ["uploadprogram", "cnc_dwn", "selectprogram", "cnc_search"]):
-            if log.status_code != 0 or log.error:
+            # Buffer backpressure is recoverable when the fixed transfer loop
+            # subsequently closes and verifies the same upload successfully.
+            buffer_retry = log.protocol_function == "cnc_download3" and log.status_code == 10
+            if not buffer_retry and (log.status_code != 0 or log.error):
                 return False
         if "program_not_verified" in lowered_data:
             return False
         if "program_verified=true" in lowered_data:
-            observed_expected_program = True
+            observed_runtime_verification = True
+            verified_runtime_numbers.update(
+                int(value)
+                for value in re.findall(
+                    r"(?:expected_program_number|uploaded_program_number|selected_program_number)\s*=\s*(\d+)",
+                    lowered_data,
+                )
+                if int(value) > 0
+            )
         if any(token in identity for token in ["readprogramnumber", "cnc_rdprgnum"]):
             if log.status_code != 0 or log.error:
                 return False
-            numbers = {
+            read_program_numbers.update(
                 int(value)
                 for value in re.findall(r"(?:current_program|running_program|main_program)\s*=\s*(\d+)", lowered_data)
-            }
-            if expected in numbers:
-                observed_expected_program = True
-            elif numbers:
-                return False
-    return observed_expected_program
+                if int(value) > 0
+            )
+    if not observed_runtime_verification:
+        return False
+    if verified_runtime_numbers and read_program_numbers:
+        return bool(verified_runtime_numbers & read_program_numbers)
+    return True
 
 
 def repair_state_snapshot(state: WorkflowState) -> dict[str, Any]:
@@ -496,6 +607,8 @@ def repair_state_snapshot(state: WorkflowState) -> dict[str, Any]:
             ],
             "quality_analysis": state.plan.rag_context.get("planning_quality_analysis", {}),
             "quality_targets": state.plan.rag_context.get("quality_targets", {}),
+            "scene_plan": state.plan.rag_context.get("scene_plan", {}),
+            "scene_execution_evidence": state.plan.rag_context.get("scene_execution_evidence", {}),
         }
 
     artifacts_summary: dict[str, Any] | None = None
@@ -547,7 +660,7 @@ def repair_state_snapshot(state: WorkflowState) -> dict[str, Any]:
 def repair_action_for(stage: str) -> str:
     actions = {
         "repair_plan": "Preserve the previous failed state as repair context, then send the task back to PlanningAgent to modify the plan.",
-        "repair_code": "Preserve the previous failed artifacts as repair context, then send the task back to CodeGenerationAgent to modify generated NC/C++.",
+        "repair_code": "Preserve the previous failed artifacts as repair context, then send the task back to CodeGenerationAgent to modify only scenario_fragment.inc and re-run Render/Validate/Compile.",
         "repair_execution": "Preserve the previous failed execution as repair context, then send the task back to ExecutionAgent to retry or adjust execution.",
     }
     return actions.get(stage, "No repair action is registered for this stage.")

@@ -7,6 +7,7 @@ from smart_traffic_agent.agents.router import (
     RouterAgent,
     retrieve_router_knowledge_context,
     summarize_api_log_quality_evidence,
+    summarize_plan_for_router,
     summarize_quality_for_router,
     valid_next_stages,
 )
@@ -19,6 +20,7 @@ from smart_traffic_agent.models import (
     ExecutionResult,
     GeneratedArtifacts,
     NcProgramSpec,
+    PlanStep,
     QualityAssessment,
     TaskRequest,
     WorkflowState,
@@ -43,6 +45,67 @@ def state_with_plan_without_artifacts() -> WorkflowState:
 
 
 class RouterAgentTests(unittest.TestCase):
+    def test_code_generation_compile_failure_deterministically_routes_to_repair_code(self) -> None:
+        state = state_with_plan_without_artifacts()
+        state.stage = "repair_code"
+        state.errors.append("CodeGenerationAgent failed: generated C++ compilation failed")
+        client = Mock()
+
+        router = RouterAgent(llm_client=client)
+
+        self.assertEqual(router.route(state), "repair_code")
+        self.assertEqual(router.last_route_source, "deterministic_code_generation_failure")
+        client.invoke_json.assert_not_called()
+
+    def test_planner_markdown_schema_failure_is_not_retried_as_plan_repair(self) -> None:
+        state = WorkflowState(request=TaskRequest(description="read operation history", task_id="planner-schema"))
+        state.errors.append(
+            "PlanningAgent failed: PlanningAgent Markdown is missing required fields: nc_program_spec.block_goals"
+        )
+        self.assertEqual(valid_next_stages(state), {"complete"})
+
+    def test_sdk_type_mismatch_routes_to_code_repair(self) -> None:
+        state = state_with_plan_without_artifacts()
+        state.errors.append(
+            "BLOCKING: SDK_TYPE_MISMATCH: struct=ODBST field=manual location=scenario_fragment.inc:2"
+        )
+        router = RouterAgent(llm_client=Mock())
+        self.assertEqual(router.route(state), "repair_code")
+        self.assertEqual(router.last_route_source, "deterministic_sdk_type_mismatch")
+        self.assertIn("SDK-derived", router.last_repair_instruction)
+
+    def test_missing_target_invocation_routes_to_local_code_repair(self) -> None:
+        state = state_with_plan_without_artifacts()
+        state.errors.append(
+            "BLOCKING: target API cnc_skip has no logged invocation in the scenario fragment."
+        )
+        client = Mock()
+        router = RouterAgent(llm_client=client)
+        self.assertEqual(router.route(state), "repair_code")
+        self.assertEqual(router.last_route_source, "deterministic_missing_target_invocation")
+        self.assertIn("exact api.<target> call", router.last_repair_instruction)
+        client.invoke_json.assert_not_called()
+
+    def test_ui_failure_stops_without_llm_or_unchanged_execution_retry(self):
+        for reason in ("CYCLE_START_CURSOR_FAILED;win32_error=5", "CYCLE_START_CLICK_FAILED;sent=1",
+                       "CYCLE_START_TARGET_OBSCURED", "NCGUIDE_WINDOW_NOT_FOREGROUND"):
+            with self.subTest(reason=reason):
+                state = state_with_plan_without_artifacts()
+                state.result = ExecutionResult(
+                    task_id="router001", success=False, capture_events=[], output_dir=Path("."),
+                    api_logs=[ApiCallLog(
+                        timestamp="2026-10-15T09:08:08Z", task_id="router001", step_id="UI",
+                        phase="during", interface_name="host_runtime_exception",
+                        protocol_function="host_runtime_exception", input_parameters={},
+                        status_code=-1, response={"data": reason}, error="RUNTIME_EXCEPTION")])
+                client = Mock()
+                router = RouterAgent(llm_client=client)
+                self.assertEqual(valid_next_stages(state), {"complete"})
+                self.assertEqual(router.route(state), "complete")
+                self.assertFalse(state.result.success)
+                self.assertIn(reason, router.last_route_reason)
+                client.invoke_json.assert_not_called()
+
     def test_router_deterministically_completes_after_quality_gate_passes(self) -> None:
         state = state_with_plan_without_artifacts()
         state.artifacts = GeneratedArtifacts(api_script="int main(){}", nc_program="O1234\nM30\n")
@@ -79,10 +142,109 @@ class RouterAgentTests(unittest.TestCase):
 
         self.assertEqual(valid_next_stages(state), {"planning"})
 
-    def test_valid_next_stage_requires_code_generation_when_artifacts_missing(self) -> None:
-        self.assertEqual(valid_next_stages(state_with_plan_without_artifacts()), {"code_generation"})
+    def test_planning_transient_llm_error_terminates_without_repair(self) -> None:
+        state = WorkflowState(request=TaskRequest(description="generate traffic", task_id="router-transient"))
+        state.errors.append("transient_llm_error: provider timeout")
 
-    def test_failed_quality_allows_repair_stages(self) -> None:
+        self.assertEqual(valid_next_stages(state), {"complete"})
+        llm = Mock()
+        llm.enabled = True
+        router = RouterAgent(llm_client=llm)
+        self.assertEqual(router.route(state), "complete")
+        llm.invoke_json.assert_not_called()
+
+    def test_valid_next_stage_requires_code_generation_when_artifacts_missing(self) -> None:
+        self.assertEqual(
+            valid_next_stages(state_with_plan_without_artifacts()),
+            {"code_generation"},
+        )
+
+    def test_new_plan_proceeds_without_llm_review_even_with_review_warnings(self) -> None:
+        state = state_with_plan_without_artifacts()
+        state.request.target_environment = "ncguide-generated-cpp"
+        self.assertTrue(summarize_plan_for_router(state)["blocking_plan_issues"])
+        llm = Mock()
+        llm.enabled = True
+        llm.invoke_json.return_value = {"next_stage": "repair_plan"}
+        router = RouterAgent(llm_client=llm)
+        self.assertEqual(router.route(state), "code_generation")
+        llm.invoke_json.assert_not_called()
+        self.assertEqual(router.last_repair_instruction, "")
+        self.assertEqual(state.repair_attempts, 0)
+
+    def test_downstream_failure_can_replan_with_concrete_evidence(self) -> None:
+        state = state_with_plan_without_artifacts()
+        state.request.target_environment = "ncguide-generated-cpp"
+        state.errors = ["CodeGenerationAgent failed: target operation requires an absent prerequisite"]
+        llm = Mock()
+        llm.enabled = True
+        llm.invoke_json.return_value = {
+            "next_stage": "repair_plan",
+            "reason": "Generation failed because a required operation dependency is missing.",
+            "repair_instruction": "Add the documented prerequisite before the target operation.",
+        }
+        router = RouterAgent(llm_client=llm)
+        self.assertEqual(router.route(state), "repair_plan")
+        self.assertIn("plan_review=", llm.invoke_json.call_args.args[1])
+        self.assertIn("prerequisite", router.last_repair_instruction)
+
+    def test_plan_review_reports_missing_lifecycle_for_ncguide_motion(self) -> None:
+        state = state_with_plan_without_artifacts()
+        state.request.target_environment = "ncguide-generated-cpp"
+
+        review = summarize_plan_for_router(state)
+
+        self.assertEqual(
+            review["missing_required_program_lifecycle"],
+            ["ReadProgramNumber", "SelectProgram", "StartProgram", "UploadProgram"],
+        )
+        self.assertTrue(review["blocking_plan_issues"])
+
+    def test_plan_review_accepts_normalized_atomic_lifecycle(self) -> None:
+        from smart_traffic_agent.execution_contracts import normalize_lifecycle_steps
+        state = state_with_plan_without_artifacts()
+        state.request.target_environment = "ncguide-generated-cpp"
+        functions = ["cnc_dwnstart3", "cnc_download3", "cnc_dwnend3", "cnc_search", "cnc_rdprgnum"]
+        state.plan.steps = [PlanStep(str(i), "before", "setup", "FOCAS2 Ethernet", {},
+                                    protocol_function=name) for i, name in enumerate(functions)]
+        state.plan.steps += [PlanStep(name, "before", "setup", name, {})
+                            for name in ("UploadProgram", "SelectProgram", "ReadProgramNumber")]
+        state.plan.steps.append(PlanStep("start", "during", "start", "StartProgram", {}))
+        state.plan.code_spec = Mock(api_contracts=[Mock(tool_name=name, prototype="official declaration")
+                                                  for name in functions])
+        normalize_lifecycle_steps(state.plan.steps)
+        self.assertNotIn("UploadProgram", [step.interface_name for step in state.plan.steps])
+        review = summarize_plan_for_router(state)
+        self.assertEqual(review["missing_required_program_lifecycle"], [])
+        self.assertEqual(review["blocking_plan_issues"], [])
+        # An incomplete transfer must still block; recognizing aliases is not a bypass.
+        state.plan.steps = [step for step in state.plan.steps if step.protocol_function != "cnc_dwnend3"]
+        review = summarize_plan_for_router(state)
+        self.assertEqual(review["missing_required_program_lifecycle"], ["UploadProgram"])
+        self.assertTrue(review["blocking_plan_issues"])
+
+    def test_incomplete_parameter_coverage_is_nonblocking_for_first_dataset(self) -> None:
+        state = state_with_plan_without_artifacts()
+        state.plan.steps = [
+            PlanStep(
+                step_id="S001",
+                phase="during",
+                action="Read one documented parameter.",
+                interface_name="ReadParameter",
+                protocol_function="cnc_rdparam",
+                parameters={"parameter_no": 1005, "parameter_generation": []},
+            )
+        ]
+        state.plan.code_spec = Mock(
+            api_contracts=[Mock(tool_name="cnc_rdparam", prototype="FWLIBAPI short cnc_rdparam(...);")]
+        )
+
+        review = summarize_plan_for_router(state)
+
+        self.assertEqual(review["blocking_plan_issues"], [])
+        self.assertTrue(review["nonblocking_plan_warnings"])
+
+    def test_quality_assessment_does_not_repair_before_execution(self) -> None:
         state = state_with_plan_without_artifacts()
         state.quality_assessment = QualityAssessment(
             passed=False,
@@ -91,9 +253,9 @@ class RouterAgentTests(unittest.TestCase):
             recommendations=["replan slower feed and denser sampling"],
         )
 
-        self.assertEqual(valid_next_stages(state), {"repair_plan", "repair_code", "repair_execution"})
+        self.assertEqual(valid_next_stages(state), {"code_generation"})
 
-    def test_successful_execution_still_allows_router_quality_judgment(self) -> None:
+    def test_successful_execution_does_not_reenter_online_quality_repairs(self) -> None:
         state = state_with_plan_without_artifacts()
         state.artifacts = GeneratedArtifacts(api_script="int main(){}", nc_program="O1234\nM30\n")
         state.result = ExecutionResult(
@@ -109,7 +271,7 @@ class RouterAgentTests(unittest.TestCase):
             recommendations=["RouterAgent must evaluate metrics."],
         )
 
-        self.assertEqual(valid_next_stages(state), {"repair_plan", "repair_code", "repair_execution"})
+        self.assertEqual(valid_next_stages(state), {"complete"})
 
         summary = summarize_quality_for_router(state)
 
@@ -143,7 +305,7 @@ class RouterAgentTests(unittest.TestCase):
             output_dir=Path("."),
         )
 
-        self.assertEqual(valid_next_stages(state), {"repair_plan", "repair_code", "repair_execution"})
+        self.assertEqual(valid_next_stages(state), {"complete"})
 
     def test_failed_result_with_sufficient_output_variation_cannot_complete(self) -> None:
         state = state_with_plan_without_artifacts()
@@ -250,7 +412,7 @@ class RouterAgentTests(unittest.TestCase):
 
         self.assertEqual(valid_next_stages(state), {"repair_plan"})
 
-    def test_upload_end_program_number_conflict_requires_replan(self) -> None:
+    def test_upload_end_ew_data_does_not_prove_program_number_collision(self) -> None:
         state = state_with_plan_without_artifacts()
         state.artifacts = GeneratedArtifacts(api_script="int main(){}", nc_program="O3586\nM30\n")
         state.result = ExecutionResult(
@@ -275,7 +437,7 @@ class RouterAgentTests(unittest.TestCase):
             output_dir=Path("."),
         )
 
-        self.assertEqual(valid_next_stages(state), {"repair_plan"})
+        self.assertEqual(valid_next_stages(state), {"repair_code"})
 
     def test_router_requires_success_even_when_raw_api_log_evidence_is_good(self) -> None:
         state = state_with_plan_without_artifacts()

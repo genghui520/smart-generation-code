@@ -27,13 +27,20 @@ class ToolResult:
 
 def tool_calls_from_step(step: Any) -> list[ToolCall]:
     """Convert a PlanStep into atomic tool calls without registry lookup."""
+    # Packet capture is owned by the deterministic runner, not exposed as a
+    # Planner-invokable FOCAS API. Plans sometimes spell this as "N/A"; do not
+    # split that marker into bogus tools named "N" and "A (...)".
+    interface_name = str(getattr(step, "interface_name", "")).lower()
+    protocol_function = str(getattr(step, "protocol_function", "")).strip().upper()
+    if "npcap" in interface_name or protocol_function == "N/A" or protocol_function.startswith("N/A "):
+        return []
     rows = getattr(step, "api_calls", []) or []
     calls: list[ToolCall] = []
     for index, row in enumerate(rows, 1):
         if not isinstance(row, dict):
             continue
         tool_name = str(row.get("protocol_function", row.get("tool_name", ""))).strip()
-        if not tool_name:
+        if not tool_name or tool_name.upper() == "N/A" or tool_name.upper().startswith("N/A "):
             continue
         call_id = str(row.get("call_id", f"{step.step_id}-call-{index:02d}"))
         arguments = dict(row.get("parameters", row.get("arguments", {})) or {})

@@ -39,6 +39,8 @@ def invoke_tool(
     tool: AgentTool[ToolInput, ToolOutput],
     tool_input: ToolInput,
     progress_callback: ToolProgressCallback | None = None,
+    *,
+    agent_name: str = "",
 ) -> tuple[ToolOutput, ToolCallRecord]:
     """Invoke one tool and return both its typed output and an audit trace."""
 
@@ -64,6 +66,7 @@ def invoke_tool(
             input_summary=input_summary,
             output_summary={},
             error=str(exc),
+            agent_name=agent_name,
         )
         if progress_callback is not None:
             progress_callback("tool_complete", record.to_dict())
@@ -79,6 +82,7 @@ def invoke_tool(
         input_summary=input_summary,
         output_summary=output_summary,
         error=error,
+        agent_name=agent_name,
     )
     if progress_callback is not None:
         progress_callback("tool_complete", record.to_dict())

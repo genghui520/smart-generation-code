@@ -5,6 +5,10 @@ import re
 from typing import Any
 
 from .agent_roles import ApiContract, CodeSpec
+from .focas_contracts import (
+    documented_parameter_names, named_contract_context, named_prototype,
+    undocumented_argument_names,
+)
 from .integrations.ncguide import default_focas_header_dir
 from .tool_protocol import tool_calls_from_step
 
@@ -30,21 +34,35 @@ def build_code_spec(plan: Any, retrieved_chunks: list[Any] | None = None) -> Cod
             operation_id=call.operation_id,
             arguments=dict(call.arguments),
             prototype=prototype,
+            documented_prototype=named_prototype(call.tool_name),
             return_type=return_type,
             parameter_types=parameter_types,
             output_fields=output_fields,
             required_calls=[item.tool_name for item in calls[index + 1:index + 4]],
             evidence_chunk_ids=evidence,
         ))
+    source_requirements = [
+        "Implement every api_contract from the Planner contract.",
+        "Use each contract's official prototype and parameter types.",
+        "Check every return code and release resources on every exit path.",
+        "For argument order and meaning use documented_prototype, not positional guesses from an unnamed header declaration.",
+    ]
+    for contract in contracts:
+        formal_names = documented_parameter_names(contract.tool_name)
+        if not formal_names:
+            continue
+        unmatched = undocumented_argument_names(contract.tool_name, contract.arguments)
+        if unmatched:
+            source_requirements.append(
+                f"{contract.tool_name}: Planner labels {unmatched} are not documented formal arguments; "
+                f"use the documented order {formal_names}, derive byte lengths from the actual buffer, "
+                "and do not forward unmatched labels positionally."
+            )
     return CodeSpec(
         scenario=plan.scenario_type,
         api_contracts=contracts,
         nc_program_name=plan.nc_program_spec.program_name,
-        source_requirements=[
-            "Implement every api_contract from the Planner contract.",
-            "Use each contract's official prototype and parameter types.",
-            "Check every return code and release resources on every exit path.",
-        ],
+        source_requirements=source_requirements,
         official_abi_context=build_official_abi_context(
             [contract.tool_name for contract in contracts], header_path, header
         ),
@@ -78,6 +96,12 @@ def build_official_abi_context(
     sections = ["header=" + str(header_path), "[official function declarations]", "\n".join(declarations)]
     if structures:
         sections.extend(["[official referenced type definitions]", "\n\n".join(structures)])
+    named_context = named_contract_context(function_names)
+    if named_context:
+        sections.extend([
+            "[documented named arguments and return-code meanings; ABI types above remain authoritative]",
+            named_context,
+        ])
     return "\n".join(sections)
 
 

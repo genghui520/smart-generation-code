@@ -11,9 +11,16 @@ import csv
 import json
 import re
 import statistics
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from smart_traffic_agent.evaluation_metrics import generation_time_with_source, load_token_usage
 
 
 FOCAS_NAME = re.compile(r"\bcnc_[A-Za-z0-9_]+\b")
@@ -212,6 +219,8 @@ def evaluate(runs_root: Path) -> dict[str, Any]:
     for run_dir in sorted(path for path in runs_root.glob("run_*") if path.is_dir()):
         plan = load_json(run_dir / "plan.json")
         metrics = load_json(run_dir / "run_metrics.json")
+        summary = load_json(run_dir / "summary.json")
+        metadata = load_json(run_dir / "rq1_run_metadata.json")
         rows = load_csv(run_dir / "execution" / "data" / "focas_api_output.csv")
         planned = planned_functions(plan)
         successful = successful_functions(rows)
@@ -231,12 +240,10 @@ def evaluate(runs_root: Path) -> dict[str, Any]:
             ]
         )
         workflow_success = metrics.get("success") if metrics is not None else None
-        durations = (metrics or {}).get("agent_total_durations_seconds", {})
         generation_time = None
+        generation_time_source = None
         if metrics is not None:
-            generation_time = float(durations.get("PlanningAgent", 0)) + float(
-                durations.get("CodeGenerationAgent", 0)
-            )
+            generation_time, generation_time_source = generation_time_with_source(metrics, metadata)
         pcap = run_dir / "execution" / "data" / "focas_capture.pcap"
 
         for field_id, values in dynamic["dynamic_field_values"].items():
@@ -264,8 +271,12 @@ def evaluate(runs_root: Path) -> dict[str, Any]:
                 "successful_api_count": len(successful),
                 "api_log_count": len(rows),
                 "generation_time_seconds": generation_time,
+                "generation_time_source": generation_time_source,
                 "total_elapsed_seconds": (metrics or {}).get("total_elapsed_seconds"),
-                "token_usage": None,
+                "token_usage": load_token_usage(
+                    (summary, "summary.llm_usage"),
+                    (metrics, "run_metrics.llm_usage"),
+                ),
                 "pcap_exists": pcap.exists(),
                 "pcap_bytes": pcap.stat().st_size if pcap.exists() else 0,
                 "semantic_annotation_completeness": semantic,
@@ -304,6 +315,11 @@ def evaluate(runs_root: Path) -> dict[str, Any]:
         for row in run_results
         if row["workflow_strict_success"] is not None
     ]
+    token_rows = [row["token_usage"] for row in run_results if row["token_usage"]]
+    token_prompt = [row["prompt_tokens"] for row in token_rows if row.get("prompt_tokens") is not None]
+    token_completion = [row["completion_tokens"] for row in token_rows if row.get("completion_tokens") is not None]
+    token_total = [row["total_tokens"] for row in token_rows if row.get("total_tokens") is not None]
+    token_requests = [row["request_count"] for row in token_rows if row.get("request_count") is not None]
 
     return {
         "scope": {
@@ -321,6 +337,7 @@ def evaluate(runs_root: Path) -> dict[str, Any]:
             "discriminability_proxy": "Observed state/position/feed response fields with at least two distinct values divided by such fields with at least two samples.",
             "semantic_annotation_completeness_proxy": "FOCAS API log rows containing step, phase, input object, return code, response function/data, and api_call semantic label divided by FOCAS API log rows.",
             "generation_time": "PlanningAgent plus CodeGenerationAgent durations; excludes ExecutionAgent time.",
+            "token_usage": "Persisted prompt, completion, and total token counts; total is prompt plus completion when absent. Missing usage is null and usage_source is retained.",
         },
         "aggregate": {
             "scenario_task_success": {
@@ -369,7 +386,15 @@ def evaluate(runs_root: Path) -> dict[str, Any]:
                 "total": semantic_total,
                 "rate": semantic_complete / semantic_total if semantic_total else None,
             },
-            "token_usage": None,
+            "token_usage": {
+                "runs_with_usage": len(token_rows),
+                "runs_without_usage": len(run_results) - len(token_rows),
+                "request_count": mean_sd([float(value) for value in token_requests]),
+                "prompt_tokens": mean_sd([float(value) for value in token_prompt]),
+                "completion_tokens": mean_sd([float(value) for value in token_completion]),
+                "total_tokens": mean_sd([float(value) for value in token_total]),
+                "usage_sources": sorted({row["usage_source"] for row in token_rows}),
+            },
         },
         "runs": run_results,
         "unmeasured": {
@@ -394,7 +419,12 @@ def write_csv_report(path: Path, result: dict[str, Any]) -> None:
         "api_log_count",
         "generation_time_seconds",
         "total_elapsed_seconds",
+        "generation_time_source",
         "token_usage",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "token_usage_source",
         "position_unique_count",
         "feed_unique_count",
         "state_has_idle",
@@ -412,6 +442,7 @@ def write_csv_report(path: Path, result: dict[str, Any]) -> None:
             writer.writerow(
                 {
                     **{key: row.get(key) for key in columns},
+                    "token_usage": (row["token_usage"] or {}).get("total_tokens"),
                     "position_unique_count": dynamic["position_unique_count"],
                     "feed_unique_count": dynamic["feed_unique_count"],
                     "state_has_idle": dynamic["state_has_idle"],
@@ -421,6 +452,10 @@ def write_csv_report(path: Path, result: dict[str, Any]) -> None:
                     "semantic_annotation_completeness_proxy": row[
                         "semantic_annotation_completeness"
                     ]["ratio"],
+                    "prompt_tokens": (row["token_usage"] or {}).get("prompt_tokens"),
+                    "completion_tokens": (row["token_usage"] or {}).get("completion_tokens"),
+                    "total_tokens": (row["token_usage"] or {}).get("total_tokens"),
+                    "token_usage_source": (row["token_usage"] or {}).get("usage_source"),
                 }
             )
 
@@ -435,6 +470,7 @@ def write_markdown_report(path: Path, result: dict[str, Any]) -> None:
     discriminability = aggregate["discriminability_proxy"]
     semantic = aggregate["semantic_annotation_completeness_proxy"]
     generation_time = aggregate["generation_time_seconds"]
+    token_summary = aggregate["token_usage"]
 
     lines = [
         "# SMPAgent Offline Experiment Results",
@@ -451,6 +487,7 @@ def write_markdown_report(path: Path, result: dict[str, Any]) -> None:
         "- Discriminability: offline response-field proxy over status, coordinate, and feed fields; it is not packet-byte discriminability.",
         "- Semantic Consistency: annotation-completeness proxy; it is not packet-to-operation alignment accuracy.",
         "- Time: PlanningAgent + CodeGenerationAgent time, excluding ExecutionAgent, because RQ1 specifies code-generation-level comparison.",
+        f"- Tokens: prompt/completion/total tokens persisted by each run; {token_summary['runs_with_usage']}/{result['scope']['run_count']} runs have usage. Total-token mean is {seconds_summary(token_summary['total_tokens'])} when available; usage is not part of the quality score.",
         "- Each `run_*` directory is one repeated system run. No inferential test is reported for six non-random historical runs.",
         "",
         "## RQ1 - Comparison with existing frameworks",
@@ -460,7 +497,7 @@ def write_markdown_report(path: Path, result: dict[str, Any]) -> None:
         "| Coordinate Motion | GPT-Engineer | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED |",
         "| Coordinate Motion | MetaGPT | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED |",
         "| Coordinate Motion | ChatDev | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED |",
-        f"| Coordinate Motion | SMPAgent | {percent(task['rate'])} ({task['successes']}/{task['n']}) | {percent(compile_result['rate'])} ({compile_result['successes']}/{compile_result['n']}) | {percent(coverage['mean'])} +/- {percent(coverage['sd'])} (n={coverage['n']}) | {seconds_summary(generation_time)} (n={generation_time['n']}) | AUTHOR_INPUT_NEEDED |",
+        f"| Coordinate Motion | SMPAgent | {percent(task['rate'])} ({task['successes']}/{task['n']}) | {percent(compile_result['rate'])} ({compile_result['successes']}/{compile_result['n']}) | {percent(coverage['mean'])} +/- {percent(coverage['sd'])} (n={coverage['n']}) | {seconds_summary(generation_time)} (n={generation_time['n']}) | {seconds_summary(token_summary['total_tokens'])} (n={token_summary['total_tokens']['n']}) |",
         "| Program Management | all methods | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED |",
         "| Tool Management | all methods | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED | AUTHOR_INPUT_NEEDED |",
         "",
@@ -483,20 +520,23 @@ def write_markdown_report(path: Path, result: dict[str, Any]) -> None:
         "",
         "## Per-run audit table",
         "",
-        "| Run | Compile | Program complete | Task success | Strict workflow success | API coverage | Position values | Feed values | Idle | Started/static | Running/motion | PCAP bytes |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Run | Compile | Program complete | Task success | Strict workflow success | API coverage | Prompt tokens | Completion tokens | Total tokens | Position values | Feed values | Idle | Started/static | Running/motion | PCAP bytes |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in result["runs"]:
         dynamic = row["dynamic_evidence"]
         strict_value = row["workflow_strict_success"]
         lines.append(
-            "| {run} | {compile} | {complete} | {task} | {strict} | {coverage} | {position} | {feed} | {idle} | {static} | {motion} | {pcap} |".format(
+            "| {run} | {compile} | {complete} | {task} | {strict} | {coverage} | {prompt} | {completion} | {total} | {position} | {feed} | {idle} | {static} | {motion} | {pcap} |".format(
                 run=row["run"],
                 compile="yes" if row["compile_success"] else "no",
                 complete="yes" if row["program_completed"] else "no",
                 task="yes" if row["scenario_task_success"] else "no",
                 strict="N/A" if strict_value is None else ("yes" if strict_value else "no"),
                 coverage=percent(row["api_coverage"]),
+                prompt=(row["token_usage"] or {}).get("prompt_tokens", "N/A"),
+                completion=(row["token_usage"] or {}).get("completion_tokens", "N/A"),
+                total=(row["token_usage"] or {}).get("total_tokens", "N/A"),
                 position=dynamic["position_unique_count"],
                 feed=dynamic["feed_unique_count"],
                 idle="yes" if dynamic["state_has_idle"] else "no",

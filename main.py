@@ -52,16 +52,17 @@ def parse_args() -> argparse.Namespace:
         help="Use scenario-focused planning for RQ1/RQ3 representative benchmarks instead of global function coverage.",
     )
     parser.add_argument("--llm-provider", default="openai_compatible", choices=["disabled", "tokenhub", "openai_compatible"])
-    parser.add_argument("--llm-model", default="gpt-5.5")
-    parser.add_argument("--llm-base-url", default="https://fast.smartaipro.cn/v1")
-    parser.add_argument("--llm-api-key-env", default="SMARTAIPRO_API_KEY")
+    parser.add_argument("--llm-model", default="deepseek-flash")
+    parser.add_argument("--llm-base-url", default="https://api.deepseek.com")
+    parser.add_argument("--llm-api-key-env", default="DEEPSEEK_API_KEY")
     parser.add_argument("--llm-wire-api", default="chat_completions", choices=["chat_completions", "responses"])
-    parser.add_argument("--llm-reasoning-effort", default=None, choices=["low", "medium", "high"])
+    parser.add_argument("--llm-reasoning-effort", default="high", choices=["low", "medium", "high"])
     parser.add_argument("--llm-max-output-tokens", type=int, default=None)
     parser.add_argument("--llm-timeout-seconds", type=float, default=120.0)
+    parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument(
         "--llm-transport",
-        default="sdk",
+        default="http",
         choices=["sdk", "http"],
         help="LLM transport; use http for gateways that block SDK headers.",
     )
@@ -125,6 +126,28 @@ def parse_args() -> argparse.Namespace:
         help="Generate and compile the FOCAS client only; omit traffic capture, CSV collection, simulator UI, and runtime logs.",
     )
     parser.add_argument(
+        "--ablation",
+        default="none",
+        choices=["none", "single-agent", "without-router"],
+        help=(
+            "RQ3 architecture variant. single-agent uses one strict autonomous research/generation/repair role "
+            "without RouterAgent, PlanningAgent, CodeGenerationAgent, CodeSpec, or memory; without-router directly sequences planning "
+            "and code generation. Ablations are supported for --no-execute runs."
+        ),
+    )
+    parser.add_argument(
+        "--max-repairs",
+        type=int,
+        default=3,
+        help="Maximum raw-compiler-feedback repair attempts for strict Single-Agent.",
+    )
+    parser.add_argument(
+        "--historical-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Load and persist prior repair memory. Disable for fair RQ3 comparisons.",
+    )
+    parser.add_argument(
         "--verbose-console",
         action="store_true",
         help="Print full plan/artifact/execution details to the console. By default details are saved to files only.",
@@ -135,6 +158,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     global RUN_STARTED_AT, VERBOSE_CONSOLE
     args = parse_args()
+    if args.ablation != "none" and args.execute:
+        raise SystemExit("--ablation requires --no-execute for the RQ3 code-only experiment")
     AGENT_STARTED_AT.clear()
     AGENT_DURATIONS.clear()
     RUN_STARTED_AT = time.perf_counter()
@@ -146,10 +171,8 @@ def main() -> int:
 
     from smart_traffic_agent.knowledge import KnowledgeBase
     from smart_traffic_agent.llm import LlmClient, LlmConfig
-    from smart_traffic_agent.memory import LongTermMemoryStore
     from smart_traffic_agent.models import TaskRequest, WorkflowState
     from smart_traffic_agent.utils import ensure_dir, json_default, write_json
-    from smart_traffic_agent.workflow import TrafficGenerationWorkflow, workflow_summary
 
     out_dir = ensure_dir(next_run_output_dir(args.out))
     args.out = out_dir
@@ -161,7 +184,7 @@ def main() -> int:
     print("Loading RAG knowledge base...", flush=True)
     knowledge_base = KnowledgeBase(vector_db_dir=args.vector_db)
 
-    # 3. 接入大模型。默认使用项目本地 .env 中的 SMARTAIPRO_API_KEY，不需要写到系统全局环境变量。
+    # 3. 接入大模型。默认使用项目本地 .env 中的 DEEPSEEK_API_KEY，不需要写到系统全局环境变量。
     print("Initializing LLM client...", flush=True)
     llm_client = LlmClient.from_config(
         LlmConfig(
@@ -169,22 +192,13 @@ def main() -> int:
             model=args.llm_model,
             base_url=args.llm_base_url,
             api_key_env=args.llm_api_key_env,
+            temperature=args.temperature,
             transport=args.llm_transport,
             wire_api=args.llm_wire_api,
             reasoning_effort=args.llm_reasoning_effort,
             max_output_tokens=args.llm_max_output_tokens,
             timeout_seconds=args.llm_timeout_seconds,
         )
-    )
-
-    # 4. 初始化 LangGraph 多Agent工作流。这里复用系统里的 Router/Planner/CodeGenerator/Executor/Annotator。
-    print("Initializing workflow...", flush=True)
-    memory_store = LongTermMemoryStore()
-    workflow = TrafficGenerationWorkflow(
-        knowledge_base,
-        llm_client=llm_client,
-        memory_store=memory_store,
-        progress_callback=print_progress_event,
     )
 
     # 5. 构造任务状态。target_environment 决定 ExecutionAgent 连接仿真客户端还是 FANUC NCGuide bridge。
@@ -198,11 +212,68 @@ def main() -> int:
                 "allow_delete_all_programs": args.allow_delete_all_programs,
                 "representative_scenario": args.representative_scenario,
                 "code_only_evaluation": args.code_only_evaluation,
+                "ablation_variant": args.ablation,
+                "historical_memory_enabled": args.historical_memory,
             },
             quality_gate_enabled=(args.quality_gate if args.quality_gate is not None else args.target != "simulator"),
         )
     )
-    state.long_term_memories = memory_store.search(args.task)
+
+    if args.ablation == "single-agent":
+        from smart_traffic_agent.agents.single_agent import StrictSingleAgent
+
+        print("Initializing strict SingleAgent only...", flush=True)
+        single_agent = StrictSingleAgent(
+            knowledge_base,
+            llm_client,
+            max_repairs=args.max_repairs,
+            progress_callback=print_progress_event,
+        )
+        try:
+            outcome = single_agent.run(state, out_dir)
+            state = outcome.state
+        except Exception as exc:
+            state.errors.append(f"{type(exc).__name__}: {exc}")
+            state.tool_call_history = list(single_agent.tool_runtime.history)
+            from smart_traffic_agent.agents.single_agent import SingleAgentRunResult
+
+            outcome = SingleAgentRunResult(
+                state=state,
+                framework_success=False,
+                compilation_success=False,
+                failure_category=classify_single_agent_exception(exc, state),
+                generated_file_count=0,
+                repair_attempts=state.repair_attempts,
+            )
+        summary = build_single_agent_summary(state, outcome, llm_client, single_agent)
+        write_json(out_dir / "summary.json", summary)
+        metrics = build_run_metrics(state, summary, llm_client=llm_client)
+        metrics.update({
+            "framework_success": outcome.framework_success,
+            "compilation_success": outcome.compilation_success,
+            "failure_category": outcome.failure_category,
+            "generated_file_count": outcome.generated_file_count,
+            "max_repairs": args.max_repairs,
+            "historical_memory_enabled": False,
+            "autonomous_queries": single_agent.autonomous_queries,
+        })
+        write_json(out_dir / "run_metrics.json", metrics)
+        print_single_agent_files(out_dir, summary)
+        return 0 if outcome.framework_success else 1
+
+    # Full SMPAgent and w/o RouterAgent retain the existing multi-agent stack.
+    from smart_traffic_agent.memory import LongTermMemoryStore
+    from smart_traffic_agent.workflow import TrafficGenerationWorkflow, workflow_summary
+
+    print("Initializing workflow...", flush=True)
+    memory_store = LongTermMemoryStore()
+    workflow = TrafficGenerationWorkflow(
+        knowledge_base,
+        llm_client=llm_client,
+        memory_store=memory_store,
+        progress_callback=print_progress_event,
+    )
+    state.long_term_memories = memory_store.search(args.task) if args.historical_memory else []
     if state.long_term_memories:
         print(f"    long_term_memories: {len(state.long_term_memories)}", flush=True)
 
@@ -223,10 +294,14 @@ def main() -> int:
             print_run_files(out_dir, summary)
         return 0
 
-    # 6. 路由Agent：根据当前状态判断下一步应该进入规划、代码生成、执行还是标注。
-    print("\n[1] RouterAgent")
-    state.stage = workflow.router.route(state)
-    print(f"    next_stage: {state.stage}")
+    if args.ablation == "none":
+        # 6. 路由Agent：根据当前状态判断下一步应该进入规划、代码生成、执行还是标注。
+        print("\n[1] RouterAgent")
+        state.stage = workflow.router.route(state)
+        print(f"    next_stage: {state.stage}")
+    else:
+        print("\n[1] RouterAgent")
+        print(f"    removed by RQ3 ablation: {args.ablation}")
 
     # 7. 规划Agent：围绕用户任务选择场景模板、检索RAG规则，并生成NC程序需求和API采集步骤。
     print("\n[2] PlanningAgent")
@@ -237,14 +312,35 @@ def main() -> int:
     else:
         print(f"    plan: {out_dir / 'plan.json'}")
 
-    # 8. 再次路由：规划完成后应进入代码生成阶段。
+    # 8. 完整系统再次路由；消融系统按固定实验顺序直接进入代码生成。
     print("\n[3] RouterAgent")
-    state.stage = workflow.router.route(state)
-    print(f"    next_stage: {state.stage}")
+    if args.ablation == "none":
+        state.stage = workflow.router.route(state)
+        print(f"    next_stage: {state.stage}")
+    else:
+        state.stage = "code_generation"
+        print(f"    removed; direct next_stage: {state.stage}")
 
     # 9. 代码生成Agent：生成NC程序、Python API脚本和FOCAS C++测试框架。
     print("\n[4] CodeGenerationAgent")
-    state = workflow.generator.run(state, out_dir)
+    try:
+        state = workflow.generator.run(state, out_dir)
+    except Exception as exc:
+        # Compilation/validation failure is an experimental outcome, not a
+        # reason to lose time/token evidence. Persist the partial artifact and
+        # metrics so the independent evaluator can assign compile score 0.
+        state.errors.append(f"{type(exc).__name__}: {exc}")
+        summary = workflow_summary(state)
+        summary["framework_success"] = False
+        summary["failure_category"] = "no_artifact" if state.artifacts is None else "compile_error"
+        summary["generated_file_count"] = count_generated_files(out_dir)
+        summary["llm_usage"] = summarize_llm_usage(llm_client)
+        write_json(out_dir / "summary.json", summary)
+        metrics = build_run_metrics(state, summary, llm_client=llm_client)
+        write_json(out_dir / "run_metrics.json", metrics)
+        print(f"    generation_failed: {short_text(str(exc), 240)}", flush=True)
+        print_run_files(out_dir, summary)
+        return 1
     if VERBOSE_CONSOLE:
         print_artifacts(state)
     else:
@@ -252,10 +348,14 @@ def main() -> int:
         print(f"    api_script: {state.artifacts.api_script_path}")
         print(f"    nc_program: {state.artifacts.nc_program_path}")
 
-    # 10. 再次路由：代码生成完成后应进入执行阶段。
+    # 10. 完整系统再次路由；消融系统在 code-only 边界停止。
     print("\n[5] RouterAgent")
-    state.stage = workflow.router.route(state)
-    print(f"    next_stage: {state.stage}")
+    if args.ablation == "none":
+        state.stage = workflow.router.route(state)
+        print(f"    next_stage: {state.stage}")
+    else:
+        state.stage = "execution"
+        print("    removed; code-only artifact generation complete")
 
     if args.execute:
         # 11. 执行Agent：连接当前 target 指定的执行环境。
@@ -281,8 +381,13 @@ def main() -> int:
 
     # 14. 写出本次运行摘要，便于论文实验记录和后续批量对比。
     summary = workflow_summary(state)
+    if args.ablation == "without-router":
+        summary["framework_success"] = True
+        summary["failure_category"] = "success"
+        summary["generated_file_count"] = count_generated_files(out_dir)
     summary["llm_usage"] = summarize_llm_usage(llm_client)
-    memory_store.remember_workflow(state)
+    if args.historical_memory:
+        memory_store.remember_workflow(state)
     write_json(out_dir / "summary.json", summary)
     metrics = build_run_metrics(state, summary, llm_client=llm_client)
     write_json(out_dir / "run_metrics.json", metrics)
@@ -317,6 +422,13 @@ def next_run_output_dir(base_out: Path) -> Path:
         if not candidate.exists():
             return candidate
     raise RuntimeError(f"Could not allocate a new run directory under {base_out}")
+
+
+def count_generated_files(out_dir: Path) -> int:
+    generated_dir = out_dir / "generated"
+    if not generated_dir.is_dir():
+        return 0
+    return sum(1 for path in generated_dir.iterdir() if path.is_file())
 
 
 def print_progress_event(event: str, payload: dict) -> None:
@@ -362,6 +474,52 @@ def print_progress_event(event: str, payload: dict) -> None:
         status = "ok" if payload.get("success") else "failed"
         print(
             f"    [Tool] {payload['tool_name']} {status} elapsed={payload.get('duration_ms', 0)}ms",
+            flush=True,
+        )
+    elif event == "single_agent_phase":
+        print(f"[SingleAgent] {payload['message']}", flush=True)
+    elif event == "single_agent_llm":
+        print(
+            f"[SingleAgent] LLM call {payload['call']} {payload['status']} "
+            f"({payload['phase']})",
+            flush=True,
+        )
+    elif event == "single_agent_query":
+        print(
+            f"[SingleAgent] query {payload['tool_name']}: "
+            f"{short_text(payload['query'], 180)}",
+            flush=True,
+        )
+    elif event == "single_agent_query_rejected":
+        print(
+            f"[SingleAgent] rejected malformed {payload['tool_name']} call: "
+            f"{short_text(payload['error'], 180)}; returning it to the same agent",
+            flush=True,
+        )
+    elif event == "single_agent_solution":
+        print(
+            f"[SingleAgent] solution ready functions={payload['selected_function_count']} "
+            f"nc={'yes' if payload['has_nc_program'] else 'no'} "
+            f"repair_attempt={payload['repair_attempt']}",
+            flush=True,
+        )
+    elif event == "single_agent_compile":
+        status = "passed" if payload["success"] else "failed"
+        print(
+            f"[SingleAgent] compile {status} repair_attempt={payload['repair_attempt']}",
+            flush=True,
+        )
+    elif event == "single_agent_repair":
+        print(
+            f"[SingleAgent] repairing from raw compiler output "
+            f"attempt={payload['attempt']}/{payload['max_repairs']}",
+            flush=True,
+        )
+    elif event == "single_agent_done":
+        status = "success" if payload["success"] else "failed"
+        print(
+            f"[SingleAgent] {status} repairs={payload['repair_attempts']} "
+            f"llm_calls={payload['llm_calls']}",
             flush=True,
         )
     elif event == "repair_start":
@@ -487,6 +645,7 @@ def print_detailed_outputs(state: WorkflowState) -> None:
 def print_header(args: argparse.Namespace) -> None:
     print("========== SMPAgent Run ==========")
     print(f"task_id={args.task_id} target={args.target} execute={args.execute}")
+    print(f"ablation={args.ablation}")
     print(f"out={args.out}")
     print("==================================")
 
@@ -505,6 +664,74 @@ def print_run_files(out_dir: Path, summary: dict) -> None:
     if summary.get("api_log_count"):
         print(f"execution: {out_dir / 'execution'}")
     print("=========================")
+
+
+def build_single_agent_summary(state, outcome, llm_client, single_agent) -> dict:
+    artifacts = state.artifacts
+    return {
+        "task_id": state.request.task_id,
+        "stage": state.stage,
+        "success": outcome.framework_success,
+        "framework_success": outcome.framework_success,
+        "compilation_success": outcome.compilation_success,
+        "failure_category": outcome.failure_category,
+        "scenario_type": None,
+        "plan_steps": 0,
+        "retrieved_chunks": 0,
+        "rag_context_counts": {},
+        "tool_call_history": [row.to_dict() for row in state.tool_call_history],
+        "artifacts": (
+            {
+                "api_script_path": str(artifacts.api_script_path) if artifacts.api_script_path else None,
+                "nc_program_path": str(artifacts.nc_program_path) if artifacts.nc_program_path else None,
+                "diagnostics": artifacts.diagnostics,
+                "harness_path": str(artifacts.harness_path) if artifacts.harness_path else None,
+                "fragment_path": str(artifacts.fragment_path) if artifacts.fragment_path else None,
+            }
+            if artifacts is not None
+            else None
+        ),
+        "errors": state.errors,
+        "repair_attempts": outcome.repair_attempts,
+        "long_term_memory_count": 0,
+        "historical_memory_enabled": False,
+        "generated_file_count": outcome.generated_file_count,
+        "orchestrator": "strict_single_agent",
+        "agent_roles": [single_agent.role_name],
+        "autonomous_queries": single_agent.autonomous_queries,
+        "initial_user_prompt": single_agent.initial_user_prompt,
+        "llm_usage": summarize_llm_usage(llm_client),
+    }
+
+
+def classify_single_agent_exception(exc: Exception, state) -> str:
+    text = str(exc).lower()
+    infrastructure_markers = [
+        "missing api key",
+        "http llm request",
+        "timeout",
+        "connectionerror",
+        "toolchain was not found",
+        "vector db",
+    ]
+    if any(marker in text for marker in infrastructure_markers):
+        return "infrastructure_failure"
+    return "no_artifact" if state.artifacts is None else "compile_error"
+
+
+def print_single_agent_files(out_dir: Path, summary: dict) -> None:
+    print("\n========== Strict Single-Agent Files ==========")
+    print(f"elapsed: {total_elapsed_text()}")
+    print(f"success: {summary['success']}")
+    print(f"failure_category: {summary['failure_category']}")
+    print(f"summary: {out_dir / 'summary.json'}")
+    print(f"metrics: {out_dir / 'run_metrics.json'}")
+    artifacts = summary.get("artifacts") or {}
+    if artifacts.get("api_script_path"):
+        print(f"api_script: {artifacts['api_script_path']}")
+    if artifacts.get("nc_program_path"):
+        print(f"nc_program: {artifacts['nc_program_path']}")
+    print("================================================")
 
 
 def short_text(value: str, max_chars: int = 160) -> str:
@@ -563,6 +790,7 @@ def build_run_metrics(state: WorkflowState, summary: dict, *, llm_client: LlmCli
     return {
         "task_id": state.request.task_id,
         "target_environment": state.request.target_environment,
+        "ablation_variant": state.request.permissions.get("ablation_variant", "none"),
         "stage": state.stage,
         "success": summary.get("success"),
         "total_elapsed_seconds": total_elapsed_seconds(),

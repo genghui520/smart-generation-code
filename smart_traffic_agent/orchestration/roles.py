@@ -54,6 +54,18 @@ class AgentTemplate(Role):
         if constraints is not None:
             self.constraints = tuple(constraints)
         self.environment: Any | None = None
+        self.tool_runtime: Any | None = None
+
+    def tool_loop(self, *, max_turns: int = 6):
+        """Create an independent bounded tool loop for this Agent."""
+        if self.tool_runtime is None:
+            raise RuntimeError(f"{self.role_name} has no ToolRuntime configured.")
+        from ..tool_runtime import ToolCallLoop
+
+        llm_client = getattr(self, "llm_client", None)
+        if llm_client is None:
+            raise RuntimeError(f"{self.role_name} has no LlmClient configured.")
+        return ToolCallLoop(llm_client, self.tool_runtime, max_turns=max_turns)
 
     def register_actions(self, *actions: ActionSpec) -> None:
         self.set_actions(*actions)

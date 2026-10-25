@@ -89,6 +89,22 @@ class FocasFunctionManifestTests(unittest.TestCase):
             self.assertEqual(context["selected_batch"][0]["function"], "pmc_rdpmcrng")
             self.assertEqual(context["selected_batch"][0]["coverage_role"], "target")
 
+    def test_selected_targets_keep_unselected_support_functions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "function_manifest.jsonl"
+            rows = [
+                {"function": "cnc_absolute", "raw_function": "absolute", "function_family": "cnc", "category": "axis"},
+                {"function": "cnc_statinfo", "raw_function": "statinfo", "function_family": "cnc", "category": "others"},
+                {"function": "cnc_dwnstart3", "raw_function": "dwnstart3", "function_family": "cnc", "category": "program"},
+            ]
+            manifest.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+            context = build_function_coverage_context(
+                manifest, target_functions={"cnc_absolute"}, scenario_type="coordinate_motion", batch_size=1,
+            )
+            self.assertEqual(context["target_function_count"], 1)
+            self.assertEqual([row["function"] for row in context["target_batch"]], ["cnc_absolute"])
+            self.assertIn("cnc_statinfo", [row["function"] for row in context["support_batch"]])
+
     def test_coverage_context_interleaves_scenario_support_apis(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             manifest = Path(tmp) / "function_manifest.jsonl"
@@ -114,6 +130,54 @@ class FocasFunctionManifestTests(unittest.TestCase):
             self.assertEqual(context["target_batch"][0]["coverage_role"], "target")
             self.assertIn("cnc_dwnstart3", [row["function"] for row in context["support_batch"]])
             self.assertTrue(all(row["coverage_role"] == "support" for row in context["support_batch"]))
+
+    def test_program_transfer_does_not_become_coordinate_motion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "function_manifest.jsonl"
+            rows = [
+                {"function": "cnc_saveprog_start", "category": "CNC program", "description": "Save program execution position"},
+                {"function": "cnc_saveprog_end", "category": "CNC program", "description": "Save program position"},
+                {"function": "cnc_dwnstart3", "category": "CNC program", "description": "Download NC program"},
+                {"function": "cnc_absolute", "category": "axis", "description": "Read absolute position"},
+            ]
+            manifest.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+            program = build_function_coverage_context(
+                manifest,
+                target_functions={"cnc_saveprog_start", "cnc_saveprog_end", "cnc_dwnstart3"},
+                batch_size=8, max_segments=1,
+            )
+            segment = program["segments"][0]
+            self.assertEqual(segment["scenario_batch_id"], "program_lifecycle")
+            self.assertTrue(segment["nc_program_required"])
+            self.assertFalse(segment["cycle_start_required"])
+            self.assertEqual(len(segment["target_batch"]), 3)
+
+            motion = build_function_coverage_context(
+                manifest, target_functions={"cnc_absolute"}, batch_size=8, max_segments=1,
+            )["segments"][0]
+            self.assertEqual(motion["scenario_batch_id"], "programmed_coordinate_motion")
+            self.assertTrue(motion["cycle_start_required"])
+
+    def test_cnc_skip_uses_read_only_axis_variation_scenario(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "function_manifest.jsonl"
+            manifest.write_text(json.dumps({
+                "function": "cnc_skip",
+                "raw_function": "skip",
+                "category": "controlled axis/spindle",
+                "description": "Read skipped position",
+            }), encoding="utf-8")
+
+            context = build_function_coverage_context(
+                manifest, target_functions={"cnc_skip"}, batch_size=2, max_segments=1,
+            )
+
+            segment = context["segments"][0]
+            self.assertEqual(segment["scenario_batch_id"], "skip_axis_parameter_variation")
+            self.assertFalse(segment["nc_program_required"])
+            self.assertFalse(segment["cycle_start_required"])
+            self.assertTrue(segment["execution_allowed"])
+            self.assertIn("never guess axis numbers", segment["execution_gate"])
 
     def test_coverage_context_skips_terminal_covered_target_functions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

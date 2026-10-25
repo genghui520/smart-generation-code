@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import json
 import time
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,18 +13,32 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
 
+# Use the project-local DeepSeek credential by default. Callers may still
+# override the environment-variable name for another compatible gateway.
+DEFAULT_API_KEY_ENV = "DEEPSEEK_API_KEY"
+
+
+class TransientLlmError(RuntimeError):
+    """A retryable provider/network failure, not a planning-quality failure."""
+
+    category = "transient_llm_error"
+
+
 @dataclass(slots=True)
 class LlmConfig:
     provider: str = "disabled"
     model: str = ""
     base_url: str = ""
-    api_key_env: str = "LLM_API_KEY"
+    api_key_env: str = DEFAULT_API_KEY_ENV
     temperature: float = 0.0
     transport: str = "sdk"
     wire_api: str = "chat_completions"
     timeout_seconds: float = 120.0
     reasoning_effort: str | None = None
     max_output_tokens: int | None = None
+    # Agent-level retry owns transient failures; the HTTP transport sends one
+    # request per invocation so retry counts remain truthful.
+    max_attempts: int = 1
 
 
 class LlmClient:
@@ -52,18 +68,19 @@ class LlmClient:
             return cls()
         if config.provider == "tokenhub":
             api_key_env = config.api_key_env
-            if api_key_env == "LLM_API_KEY":
-                api_key_env = "TOKENHUB_API_KEY"
+            if api_key_env in {"LLM_API_KEY", "TOKENHUB_API_KEY"}:
+                api_key_env = DEFAULT_API_KEY_ENV
             config = LlmConfig(
                 provider="openai_compatible",
                 model=config.model or "glm-5.2",
                 base_url=config.base_url or "https://api.tokenhub.market/v1",
-                api_key_env=api_key_env or "TOKENHUB_API_KEY",
+                api_key_env=api_key_env or DEFAULT_API_KEY_ENV,
                 temperature=config.temperature,
                 transport=config.transport,
                 timeout_seconds=config.timeout_seconds,
                 reasoning_effort=config.reasoning_effort,
                 max_output_tokens=config.max_output_tokens,
+                max_attempts=config.max_attempts,
             )
             return cls.from_config(config)
         if config.provider in {"openai_compatible", "openai"}:
@@ -79,9 +96,16 @@ class LlmClient:
             return cls(load_openai_compatible_model(config))
         raise ValueError(f"Unsupported LLM provider: {config.provider}")
 
-    def invoke_text(self, system_prompt: str, user_prompt: str) -> str:
+    def invoke_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        agent_name: str = "unknown",
+        diagnostics_context: dict[str, Any] | None = None,
+    ) -> str:
         if self.http_config is not None:
-            return self._invoke_http_text(system_prompt, user_prompt)
+            return self._invoke_http_text(system_prompt, user_prompt, agent_name=agent_name, diagnostics_context=diagnostics_context)
         if self.chat_model is None:
             raise RuntimeError("LLM is not configured")
         result = self.chat_model.invoke(
@@ -95,7 +119,14 @@ class LlmClient:
             return content
         return str(content)
 
-    def _invoke_http_text(self, system_prompt: str, user_prompt: str) -> str:
+    def _invoke_http_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        agent_name: str = "unknown",
+        diagnostics_context: dict[str, Any] | None = None,
+    ) -> str:
         """Call an OpenAI-compatible endpoint without SDK-specific headers."""
         config = self.http_config
         if config is None:
@@ -130,15 +161,21 @@ class LlmClient:
             ]
             payload["temperature"] = config.temperature
             if config.reasoning_effort:
+                if "api.deepseek.com" in config.base_url.lower():
+                    payload["thinking"] = {"type": "enabled"}
                 payload["reasoning_effort"] = config.reasoning_effort
             if config.max_output_tokens:
                 payload["max_tokens"] = config.max_output_tokens
         diagnostics = os.getenv("SMPAGENT_LLM_DIAGNOSTICS") == "1"
+        input_tokens_estimate = max(1, (len(system_prompt) + len(user_prompt)) // 4)
+        body_bytes = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
         started = time.perf_counter()
         if diagnostics:
             print(
-                f"[LLM] request endpoint={endpoint} model={config.model} "
-                f"system_chars={len(system_prompt)} user_chars={len(user_prompt)}",
+                f"[LLM] agent={agent_name} attempt=1 endpoint={endpoint} model={config.model} "
+                f"input_tokens_est={input_tokens_estimate} body_bytes={body_bytes} "
+                f"temperature={config.temperature} reasoning={config.reasoning_effort!r} "
+                f"max_output_tokens={config.max_output_tokens} timeout={config.timeout_seconds} context={diagnostics_context or {}}",
                 flush=True,
             )
         headers = {
@@ -147,25 +184,84 @@ class LlmClient:
             "Accept": "application/json",
         }
         response = None
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            try:
-                response = requests.post(
-                    url,
-                    headers=headers,
-                    json=payload,
-                    timeout=config.timeout_seconds,
-                    allow_redirects=True,
+        max_attempts = max(1, int(config.max_attempts))
+        heartbeat_stop = threading.Event()
+
+        def heartbeat() -> None:
+            while not heartbeat_stop.wait(10.0):
+                elapsed = time.perf_counter() - started
+                print(
+                    f"[LLM] agent={agent_name} still waiting; elapsed={elapsed:.0f}s "
+                    f"attempt_in_progress; timeout_window={config.timeout_seconds}s",
+                    flush=True,
                 )
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
-                if attempt == max_attempts:
-                    raise RuntimeError(f"HTTP LLM request failed after {attempt} attempts: {type(exc).__name__}: {exc}") from exc
+
+        heartbeat_thread = threading.Thread(target=heartbeat, name="smpagent-llm-heartbeat", daemon=True)
+        heartbeat_thread.start()
+        try:
+            for attempt in range(1, max_attempts + 1):
+                if diagnostics and attempt > 1:
+                    print(
+                        f"[LLM] agent={agent_name} attempt={attempt}/{max_attempts} "
+                        f"input_tokens_est={input_tokens_estimate} body_bytes={body_bytes} "
+                        f"timeout={config.timeout_seconds}",
+                        flush=True,
+                    )
+                try:
+                    response = requests.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        timeout=config.timeout_seconds,
+                        allow_redirects=True,
+                    )
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                    if attempt == max_attempts:
+                        elapsed = time.perf_counter() - started
+                        if diagnostics:
+                            print(
+                                f"[LLM] agent={agent_name} attempt={attempt} elapsed={elapsed:.2f}s "
+                                f"timeout={config.timeout_seconds} failure_category=transient_llm_error",
+                                flush=True,
+                            )
+                        raise TransientLlmError(
+                            f"HTTP LLM request failed after {attempt} attempts: {type(exc).__name__}: {exc} "
+                            f"[agent={agent_name}, input_tokens_est={input_tokens_estimate}, "
+                            f"body_bytes={body_bytes}, timeout={config.timeout_seconds}]"
+                        ) from exc
+                    time.sleep(2 ** (attempt - 1))
+                    continue
+                if not 500 <= response.status_code <= 599 or attempt == max_attempts:
+                    break
                 time.sleep(2 ** (attempt - 1))
-                continue
-            if response.status_code not in {502, 503, 504} or attempt == max_attempts:
-                break
-            time.sleep(2 ** (attempt - 1))
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1.0)
         assert response is not None
+        compatibility_retry = False
+        if response.status_code == 400 and config.wire_api == "responses":
+            # Some OpenAI-compatible deployments advertise /responses while
+            # rejecting optional Codex fields with an empty HTTP 400. Retry
+            # once with the minimum documented Responses body. The prompts,
+            # model, and evaluation task are unchanged.
+            minimal_payload = {
+                "model": config.model,
+                "instructions": system_prompt,
+                "input": user_prompt,
+            }
+            compatibility_retry = True
+            print(
+                "[LLM] Responses compatibility retry after HTTP 400 "
+                "(optional fields removed)",
+                flush=True,
+            )
+            response = requests.post(
+                url,
+                headers=headers,
+                json=minimal_payload,
+                timeout=config.timeout_seconds,
+                allow_redirects=True,
+            )
         if diagnostics:
             print(
                 f"[LLM] response status={response.status_code} "
@@ -175,7 +271,25 @@ class LlmClient:
             )
         if response.status_code >= 400:
             detail = response.text[:500].replace("\n", " ")
-            raise RuntimeError(f"HTTP LLM request returned {response.status_code}: {detail}")
+            request_id = (
+                response.headers.get("x-request-id")
+                or response.headers.get("request-id")
+                or response.headers.get("cf-ray")
+                or "unavailable"
+            )
+            content_type = response.headers.get("Content-Type", "unknown")
+            error_text = (
+                f"HTTP LLM request returned {response.status_code}: {detail} "
+                f"[agent={agent_name}, endpoint={endpoint}, model={config.model}, "
+                f"request_id={request_id}, content_type={content_type}, "
+                f"input_tokens_est={input_tokens_estimate}, body_bytes={body_bytes}, "
+                f"temperature={config.temperature}, reasoning={config.reasoning_effort!r}, "
+                f"max_output_tokens={config.max_output_tokens}, timeout={config.timeout_seconds}, "
+                f"compatibility_retry={compatibility_retry}]"
+            )
+            if 500 <= response.status_code <= 599:
+                raise TransientLlmError(error_text)
+            raise RuntimeError(error_text)
         try:
             data = response.json()
         except ValueError as exc:
@@ -203,11 +317,21 @@ class LlmClient:
             self.usage_history.append(dict(self.last_usage))
         return content if isinstance(content, str) else str(content)
 
-    def invoke_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
-        text = self.invoke_text(system_prompt, user_prompt)
+    def invoke_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        agent_name: str = "unknown",
+        diagnostics_context: dict[str, Any] | None = None,
+        repair_invalid_json: bool = True,
+    ) -> dict[str, Any]:
+        text = self.invoke_text(system_prompt, user_prompt, agent_name=agent_name, diagnostics_context=diagnostics_context)
         try:
             return parse_json_object_response(text)
         except ValueError:
+            if not repair_invalid_json:
+                raise
             repair_prompt = (
                 "Convert the model output below into one valid JSON object only. "
                 "Do not add Markdown, comments, or explanations. If the output is empty, "
@@ -222,8 +346,25 @@ class LlmClient:
             repaired = self.invoke_text(
                 "You are a strict JSON repair assistant. Return JSON only.",
                 repair_prompt,
+                agent_name=agent_name,
+                diagnostics_context=diagnostics_context,
             )
             return parse_json_object_response(repaired)
+
+
+@contextmanager
+def temporary_llm_timeout(client: LlmClient, timeout_seconds: float):
+    """Temporarily adjust a shared client's HTTP timeout for one agent."""
+    config = client.http_config
+    if config is None:
+        yield
+        return
+    previous = config.timeout_seconds
+    config.timeout_seconds = float(timeout_seconds)
+    try:
+        yield
+    finally:
+        config.timeout_seconds = previous
 
 
 def _response_text(data: Any) -> str:
@@ -290,6 +431,12 @@ def parse_json_object_response(text: str) -> dict[str, Any]:
 
 
 def load_openai_compatible_model(config: LlmConfig) -> BaseChatModel:
+    load_dotenv_file(Path(".env"))
+
+    api_key = os.getenv(config.api_key_env)
+    if not api_key:
+        raise RuntimeError(f"Missing API key environment variable: {config.api_key_env}")
+
     try:
         from langchain_openai import ChatOpenAI
     except ImportError as exc:
@@ -298,12 +445,6 @@ def load_openai_compatible_model(config: LlmConfig) -> BaseChatModel:
             "Install it with: pip install langchain-openai"
         ) from exc
 
-    load_dotenv_file(Path(".env"))
-
-    api_key = os.getenv(config.api_key_env)
-    if not api_key:
-        raise RuntimeError(f"Missing API key environment variable: {config.api_key_env}")
-
     kwargs: dict[str, Any] = {
         "model": config.model,
         "api_key": api_key,
@@ -311,6 +452,11 @@ def load_openai_compatible_model(config: LlmConfig) -> BaseChatModel:
     }
     if config.base_url:
         kwargs["base_url"] = config.base_url
+    if config.reasoning_effort and "api.deepseek.com" in config.base_url.lower():
+        kwargs["extra_body"] = {
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": config.reasoning_effort,
+        }
     return ChatOpenAI(**kwargs)
 
 

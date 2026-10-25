@@ -32,6 +32,7 @@ class ApiContract:
     operation_id: str
     arguments: dict[str, Any] = field(default_factory=dict)
     prototype: str = ""
+    documented_prototype: str = ""
     return_type: str = ""
     parameter_types: list[str] = field(default_factory=list)
     output_fields: list[str] = field(default_factory=list)

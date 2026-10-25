@@ -1,21 +1,56 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 from .models import ApiCallLog, ExecutionPlan, ExecutionResult, WorkflowState, utc_now
+from .focas_contracts import resolve_api_return_code
 
 
 DEFAULT_FUNCTION_COVERAGE_STATE = Path("rag_indexes/focas/function_coverage_state.json")
-TERMINAL_COVERAGE_STATUSES = {
+CAPTURED_TRAFFIC_STATUSES = {
     "covered_success",
     "covered_expected_error",
+}
+RESOLVED_FUNCTION_STATUSES = CAPTURED_TRAFFIC_STATUSES | {
+    "local_success",
     "unsupported_by_header",
     "export_missing",
     "option_unsupported",
     "blocked_permission_required",
 }
+UNAVAILABLE_FUNCTION_STATUSES = RESOLVED_FUNCTION_STATUSES - CAPTURED_TRAFFIC_STATUSES - {"local_success"}
+
+# Local library/handle configuration calls do not necessarily create a CNC
+# Ethernet request/response. A successful call is still valid API coverage.
+NON_WIRE_OBSERVABLE_APIS = frozenset({
+    "cnc_settimeout",
+    "cnc_getlibopt",
+    "cnc_setlibopt",
+    "cnc_setdefnode",
+})
+
+
+def is_non_wire_observable(function: str) -> bool:
+    return str(function or "").strip() in NON_WIRE_OBSERVABLE_APIS
+
+
+def has_captured_traffic(record: dict[str, Any]) -> bool:
+    # Collection coverage requires wire evidence, while diversity quality is
+    # retained independently in the batch's offline_audit.json.
+    return record.get("status") in CAPTURED_TRAFFIC_STATUSES and record.get("traffic_matched") is True
+
+
+def has_successful_coverage(record: dict[str, Any]) -> bool:
+    """Whether persisted evidence satisfies the independent API success rule."""
+    return has_captured_traffic(record) or record.get("status") == "local_success"
+
+
+def is_resolved(record: dict[str, Any]) -> bool:
+    return (has_successful_coverage(record)
+            or record.get("status") in UNAVAILABLE_FUNCTION_STATUSES)
 
 
 def build_function_coverage_metrics(
@@ -45,6 +80,14 @@ def build_function_coverage_metrics(
     }
     if not target_functions:
         target_functions = {str(row.get("function", "")).strip() for row in selected_rows}
+    from .parameter_coverage import audit_parameter_coverage
+    try:
+        parameter_report = audit_parameter_coverage(plan, result.api_logs if result else [])
+    except Exception as exc:
+        parameter_report = {
+            "version": 1, "functions": {}, "passed": False,
+            "errors": [f"PARAMETER_COVERAGE_AUDIT_ERROR: {type(exc).__name__}: {exc}"],
+        }
     attempted_by_function = collect_attempted_functions(result.api_logs if result is not None else [])
     attempted_functions = set(attempted_by_function)
     successful_functions = {
@@ -55,7 +98,22 @@ def build_function_coverage_metrics(
     expected_error_functions = {
         function
         for function, rows in attempted_by_function.items()
-        if function not in successful_functions and rows
+        if function not in successful_functions and any(is_planned_expected_error(plan, function, row) for row in rows)
+    }
+    matched_success_functions = {
+        function for function, rows in attempted_by_function.items()
+        if any(((_has_wire_evidence(row) or is_non_wire_observable(function))
+                and row["status_code"] == 0
+                and not row.get("error")) for row in rows)
+    }
+    matched_expected_error_functions = {
+        function for function, rows in attempted_by_function.items()
+        if any(row["traffic_status"] == "matched" and is_planned_expected_error(plan, function, row)
+               for row in rows)
+    }
+    option_unsupported_functions = {
+        function for function, rows in attempted_by_function.items()
+        if function not in matched_success_functions and any(row["status_code"] == 6 and row["traffic_status"] == "matched" for row in rows)
     }
     attempted_batch_functions = target_functions.intersection(attempted_functions)
     attempted_support_functions = support_functions.intersection(attempted_functions)
@@ -66,6 +124,8 @@ def build_function_coverage_metrics(
     batch_count = len(target_functions)
     segment_metrics = build_segment_metrics(selected_rows, attempted_functions, successful_functions, expected_error_functions)
     return {
+        "parameter_coverage": parameter_report,
+        "parameter_coverage_incomplete_functions": [name for name, row in parameter_report["functions"].items() if not row["passed"]],
         "source_manifest": manifest_context.get("source_manifest"),
         "scenario_batch_id": manifest_context.get("scenario_batch_id"),
         "main_state_driver": manifest_context.get("main_state_driver"),
@@ -95,10 +155,14 @@ def build_function_coverage_metrics(
         "attempted_support_functions": sorted(attempted_support_functions),
         "successful_batch_functions": sorted(successful_batch_functions),
         "successful_target_functions": sorted(successful_batch_functions),
+        "traffic_successful_target_functions": sorted(target_functions & matched_success_functions),
+        "traffic_expected_error_target_functions": sorted(target_functions & matched_expected_error_functions),
         "successful_support_functions": sorted(successful_support_functions),
         "expected_error_batch_functions": sorted(expected_error_batch_functions),
         "expected_error_target_functions": sorted(expected_error_batch_functions),
         "expected_error_support_functions": sorted(expected_error_support_functions),
+        "unexpected_error_target_functions": sorted(attempted_batch_functions - successful_functions - expected_error_functions),
+        "option_unsupported_target_functions": sorted(target_functions & option_unsupported_functions),
         "support_functions": sorted(support_functions),
         "segment_metrics": segment_metrics,
         "missing_batch_functions": sorted(target_functions - attempted_batch_functions),
@@ -179,17 +243,27 @@ def empty_function_coverage_state() -> dict[str, Any]:
 
 
 def load_terminal_covered_functions(path: Path = DEFAULT_FUNCTION_COVERAGE_STATE) -> set[str]:
+    """Return only functions with captured request/response traffic."""
     state = load_function_coverage_state(path)
     functions = state.get("functions", {})
     if not isinstance(functions, dict):
         return set()
-    covered: set[str] = set()
-    for function, record in functions.items():
-        if not isinstance(record, dict):
-            continue
-        if record.get("terminal") or record.get("status") in TERMINAL_COVERAGE_STATUSES:
-            covered.add(str(function))
-    return covered
+    return {
+        str(function) for function, record in functions.items()
+        if isinstance(record, dict) and has_captured_traffic(record)
+    }
+
+
+def load_resolved_functions(path: Path = DEFAULT_FUNCTION_COVERAGE_STATE) -> set[str]:
+    """Return captured plus proven unavailable functions for batch selection."""
+    state = load_function_coverage_state(path)
+    functions = state.get("functions", {})
+    if not isinstance(functions, dict):
+        return set()
+    return {
+        str(function) for function, record in functions.items()
+        if isinstance(record, dict) and is_resolved(record)
+    }
 
 
 def merge_workflow_function_coverage_state(
@@ -211,24 +285,59 @@ def merge_workflow_function_coverage_state(
     scenario_batch_id = metrics.get("scenario_batch_id")
     target_updates: list[dict[str, Any]] = []
     support_observations: list[dict[str, Any]] = []
+    attempted_by_function = collect_attempted_functions(
+        workflow_state.result.api_logs if workflow_state.result else []
+    )
+    # Coverage is about observed wire traffic, not merely a logged API call.
+    matched_functions = {
+        log.protocol_function for log in (workflow_state.result.api_logs if workflow_state.result else [])
+        if _has_wire_evidence({
+            "function": log.protocol_function,
+            "protocol_function": log.protocol_function,
+            "invocation_id": log.invocation_id,
+            "status_code": log.status_code,
+            "traffic_status": log.traffic_status,
+            "response": log.response,
+        })
+    }
 
     for function in metrics.get("attempted_target_functions", []):
-        status = (
-            "covered_success"
-            if function in set(metrics.get("successful_target_functions", []))
-            else "covered_expected_error"
-            if function in set(metrics.get("expected_error_target_functions", []))
-            else "attempted_nonterminal"
-        )
+        if function not in matched_functions:
+            local_ok = is_non_wire_observable(function) and any(
+                log.protocol_function == function and log.status_code == 0 and not log.error
+                for log in (workflow_state.result.api_logs if workflow_state.result else [])
+            )
+            status = "local_success" if local_ok else "attempted_no_traffic"
+        elif function in set(metrics.get("traffic_successful_target_functions", [])):
+            status = "covered_success"
+        elif function in set(metrics.get("option_unsupported_target_functions", [])):
+            status = "option_unsupported"
+        elif function in set(metrics.get("traffic_expected_error_target_functions", [])):
+            status = "covered_expected_error"
+        else:
+            status = "attempted_nonterminal"
         record = function_record(functions, function)
+        if record.get("status") in CAPTURED_TRAFFIC_STATUSES and not has_captured_traffic(record):
+            record["status"] = "unplanned"
+            record["terminal"] = False
+        record.pop("parameter_coverage", None)
+        record.pop("parameter_coverage_passed", None)
         record["status"] = strongest_status(str(record.get("status", "")), status)
-        record["terminal"] = record["status"] in TERMINAL_COVERAGE_STATUSES
+        if status in CAPTURED_TRAFFIC_STATUSES:
+            record["traffic_matched"] = True
+            record["traffic_matched_at"] = now
+        elif status == "local_success":
+            record["local_observation"] = True
+            record["local_observed_at"] = now
+        if status == "option_unsupported":
+            record["unavailable_evidence"] = "EW_NOOPT returned with matched request/response traffic"
+        record["terminal"] = is_resolved(record)
         record["coverage_role"] = "target"
         record["last_seen_at"] = now
         record["last_task_id"] = task_id
         record["last_scenario_batch_id"] = scenario_batch_id
         record["attempt_count"] = int(record.get("attempt_count", 0)) + 1
-        if status == "covered_success":
+        if status in {"covered_success", "local_success"}:
             record["success_count"] = int(record.get("success_count", 0)) + 1
         elif status == "covered_expected_error":
             record["expected_error_count"] = int(record.get("expected_error_count", 0)) + 1
@@ -236,9 +345,21 @@ def merge_workflow_function_coverage_state(
 
     for function in metrics.get("missing_target_functions", []):
         record = function_record(functions, function)
-        if str(record.get("status", "")) not in TERMINAL_COVERAGE_STATUSES:
+        if not is_resolved(record):
             record["status"] = "not_attempted"
             record["terminal"] = False
+            for log in workflow_state.result.api_logs if workflow_state.result else []:
+                if log.protocol_function != "host_api_prerequisite":
+                    continue
+                data = str(log.response.get("data", ""))
+                fields = dict(item.split("=", 1) for item in data.split(";") if "=" in item)
+                if fields.get("function") == function:
+                    reason = fields.get("reason", "")
+                    record["status"] = "export_missing" if reason == "export_missing" else "blocked_prerequisite"
+                    record["prerequisite_reason"] = reason
+                    record["terminal"] = is_resolved(record)
+                    target_updates.append({"function": function, "status": record["status"], "terminal": record["terminal"]})
+                    break
         record["coverage_role"] = "target"
         record["last_task_id"] = task_id
         record["last_scenario_batch_id"] = scenario_batch_id
@@ -249,6 +370,32 @@ def merge_workflow_function_coverage_state(
         record["last_support_seen_at"] = now
         record["last_support_task_id"] = task_id
         record["last_support_scenario_batch_id"] = scenario_batch_id
+        support_rows = attempted_by_function.get(function, [])
+        local_success = is_non_wire_observable(function) and any(
+            _successful_return_code(row) for row in support_rows
+        )
+        traffic_success = any(
+            _successful_return_code(row)
+            and _has_wire_evidence(row)
+            for row in support_rows
+        )
+        if local_success or traffic_success:
+            verified_status = "local_success" if local_success else "covered_success"
+            record["status"] = strongest_status(str(record.get("status", "")), verified_status)
+            record["terminal"] = True
+            record["support_coverage_verified"] = True
+            record["support_success_count"] = int(record.get("support_success_count", 0)) + 1
+            if local_success:
+                record["local_observation"] = True
+                record["local_observed_at"] = now
+            else:
+                record["traffic_matched"] = True
+                record["traffic_matched_at"] = now
+        elif not record.get("status"):
+            record["status"] = "support_observed"
+            record["terminal"] = False
+        if record.get("coverage_role") != "target":
+            record["coverage_role"] = "support"
         if not record.get("status"):
             record["status"] = "support_observed"
             record["terminal"] = False
@@ -283,26 +430,60 @@ def merge_workflow_function_coverage_state(
     return summary
 
 
+def _has_wire_evidence(row: dict[str, Any]) -> bool:
+    """Return true for ordinary exchanges or fully validated session members."""
+    from .execution_contracts import API_TRAFFIC_SESSION_RULES
+    from .traffic_transactions import valid_session_segment_evidence
+
+    function = str(row.get("function") or row.get("protocol_function") or row.get("api") or "")
+    if function in API_TRAFFIC_SESSION_RULES:
+        return valid_session_segment_evidence(row)
+    return row.get("traffic_status") == "matched"
+
+
+def _successful_return_code(row: dict[str, Any]) -> bool:
+    try:
+        return int(row.get("status_code", 9999)) == 0 and not row.get("error")
+    except (TypeError, ValueError):
+        return False
+
+
 def summarize_function_coverage_state(state: dict[str, Any]) -> dict[str, Any]:
     functions = state.get("functions", {})
     if not isinstance(functions, dict):
         functions = {}
     status_counts: dict[str, int] = {}
-    terminal_count = 0
+    captured_count = 0
+    local_success_count = 0
+    resolved_count = 0
+    unavailable_count = 0
     support_observed_count = 0
     for record in functions.values():
         if not isinstance(record, dict):
             continue
         status = str(record.get("status", "unknown"))
+        if status in CAPTURED_TRAFFIC_STATUSES and not has_captured_traffic(record):
+            status = "legacy_unverified"
         status_counts[status] = status_counts.get(status, 0) + 1
-        if record.get("terminal") or status in TERMINAL_COVERAGE_STATUSES:
-            terminal_count += 1
+        if has_captured_traffic(record):
+            captured_count += 1
+        if status == "local_success":
+            local_success_count += 1
+        if status in UNAVAILABLE_FUNCTION_STATUSES:
+            unavailable_count += 1
+        if is_resolved(record):
+            resolved_count += 1
         if int(record.get("support_observation_count", 0)) > 0:
             support_observed_count += 1
     return {
         "schema_version": state.get("schema_version", 1),
         "tracked_function_count": len(functions),
-        "terminal_covered_function_count": terminal_count,
+        "captured_function_count": captured_count,
+        "local_success_function_count": local_success_count,
+        "resolved_function_count": resolved_count,
+        "unavailable_function_count": unavailable_count,
+        # Backward-compatible name, now strictly traffic-backed.
+        "terminal_covered_function_count": captured_count,
         "support_observed_function_count": support_observed_count,
         "status_counts": dict(sorted(status_counts.items())),
         "run_count": len(state.get("runs", [])) if isinstance(state.get("runs"), list) else 0,
@@ -321,12 +502,15 @@ def function_record(functions: dict[str, Any], function: str) -> dict[str, Any]:
 def strongest_status(existing: str, new: str) -> str:
     priority = {
         "covered_success": 100,
+        "local_success": 95,
         "covered_expected_error": 90,
         "option_unsupported": 85,
         "export_missing": 80,
         "unsupported_by_header": 80,
         "blocked_permission_required": 70,
+        "blocked_prerequisite": 45,
         "attempted_nonterminal": 40,
+        "attempted_no_traffic": 35,
         "not_attempted": 10,
         "support_observed": 5,
         "unplanned": 0,
@@ -341,14 +525,38 @@ def collect_attempted_functions(api_logs: list[ApiCallLog]) -> dict[str, list[di
         for function in split_protocol_functions(log.protocol_function or str(log.response.get("function", ""))):
             attempted.setdefault(function, []).append(
                 {
+                    "function": function,
+                    "protocol_function": function,
                     "log_index": index,
                     "step_id": log.step_id,
                     "interface_name": log.interface_name,
                     "status_code": log.status_code,
                     "error": log.error,
+                    "input_parameters": log.input_parameters,
+                    "traffic_status": log.traffic_status,
+                    "invocation_id": log.invocation_id,
+                    "response": log.response,
                 }
             )
     return attempted
+
+
+def is_planned_expected_error(plan: ExecutionPlan, function: str, row: dict[str, Any]) -> bool:
+    """An error is expected only when the plan explicitly requests that code."""
+    code = int(row.get("status_code", 0))
+    if code == 0 or not resolve_api_return_code(function, code)["documented_for_api"]:
+        return False
+    raw = str(row.get("input_parameters", {}).get("raw", ""))
+    annotated = re.search(r"(?:^|;)expected_return_code=(-?\d+)(?:;|$)", raw)
+    if not annotated or int(annotated[1]) != code:
+        return False
+    for step in plan.steps:
+        if step.step_id != row.get("step_id") or function not in split_protocol_functions(step.protocol_function or ""):
+            continue
+        expected = step.parameters.get("expected_return_code")
+        if expected is not None and str(expected) == str(code):
+            return True
+    return False
 
 
 def split_protocol_functions(value: str) -> list[str]:

@@ -140,6 +140,7 @@ def interactive_capture(hwnd: int, window_title: str) -> int:
         "  --llm-provider disabled `\n"
         "  --trigger-ncguide-ui `\n"
         f'  --ncguide-window-title "{window_title}" `\n'
+        "  --ncguide-click-mode client `\n"
         f"  --ncguide-mode-x {mode_x} `\n"
         f"  --ncguide-mode-y {mode_y} `\n"
         f"  --ncguide-cycle-start-x {start_x} `\n"

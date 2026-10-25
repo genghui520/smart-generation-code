@@ -1,0 +1,795 @@
+{
+  "source_index": "rag_indexes/focas/chunks.jsonl",
+  "global_reference_url": "https://www.woody.vip/fanuc/errcode.htm",
+  "sdk_headers": [
+    "C:\\Lib\\FOCAS2 Library\\Fwlib\\0i\\Fwlib32.h",
+    "C:\\Lib\\FOCAS2 Library\\Fwlib\\0iB\\Fwlib32.h",
+    "C:\\Lib\\FOCAS2 Library\\Fwlib\\0iD\\Fwlib32.h",
+    "C:\\Lib\\FOCAS2 Library\\Fwlib\\150\\Fwlib32.h",
+    "C:\\Lib\\FOCAS2 Library\\Fwlib\\15i\\Fwlib32.h",
+    "C:\\Lib\\FOCAS2 Library\\Fwlib\\160\\Fwlib32.h",
+    "C:\\Lib\\FOCAS2 Library\\Fwlib\\16W\\Fwlib32.h",
+    "C:\\Lib\\FOCAS2 Library\\Fwlib\\30i\\Fwlib32.h",
+    "C:\\Lib\\FOCAS2 Library\\Fwlib\\e1\\Fwlib32.h",
+    "C:\\Lib\\FOCAS2 Library\\Fwlib\\Linux\\fwlib32.h",
+    "C:\\Lib\\FOCAS2 Library\\Fwlib\\PM\\Fwlib32.h",
+    "C:\\Lib\\FOCAS2 Library\\Fwlib\\PMi\\Fwlib32.h"
+  ],
+  "api_error_section_count": 687,
+  "api_return_code_row_count": 2278,
+  "api_with_error_section_count": 687,
+  "unresolved_api_code_names": [
+    "EW_OVERFLOW"
+  ],
+  "sdk_cross_series_conflicts": {},
+  "site_conflicts": {},
+  "codes": [
+    {
+      "name": "EW_PROTOCOL",
+      "value": -17,
+      "sdk_value": -17,
+      "site_value": -17,
+      "api_count": 0,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Protocol error (Ethernet version only)",
+          "handling": "Data from Ethernet Board is incorrect.\nContact with the service section or the section in charge."
+        },
+        "pmc": {
+          "meaning": "Protocol error (Ethernet version only)",
+          "handling": "Data from Ethernet Board is incorrect.\nContact with the service section or the section in charge."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_PROTOCOL"
+      ]
+    },
+    {
+      "name": "EW_SOCKET",
+      "value": -16,
+      "sdk_value": -16,
+      "site_value": -16,
+      "api_count": 1,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Socket error (Ethernet version only)",
+          "handling": "Investigate CNC power supply, Ethernet cable and I/F board."
+        },
+        "pmc": {
+          "meaning": "Socket error (Ethernet version only)",
+          "handling": "Investigate CNC power supply, Ethernet cable and I/F board."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_SOCKET"
+      ]
+    },
+    {
+      "name": "EW_NODLL",
+      "value": -15,
+      "sdk_value": -15,
+      "site_value": -15,
+      "api_count": 2,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "DLL file error",
+          "handling": "There is no DLL file for each CNC series corresponding to specified node."
+        },
+        "pmc": {
+          "meaning": "DLL file error",
+          "handling": "There is no DLL file for each CNC series corresponding to specified node."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_NODLL"
+      ]
+    },
+    {
+      "name": "EW_INIERR",
+      "value": -14,
+      "sdk_value": -14,
+      "site_value": null,
+      "api_count": 0,
+      "global_descriptions": {},
+      "site_url": null,
+      "same_value_names": [
+        "EW_INIERR"
+      ]
+    },
+    {
+      "name": "EW_ITLOW",
+      "value": -13,
+      "sdk_value": -13,
+      "site_value": null,
+      "api_count": 0,
+      "global_descriptions": {},
+      "site_url": null,
+      "same_value_names": [
+        "EW_ITLOW"
+      ]
+    },
+    {
+      "name": "EW_ITHIGHT",
+      "value": -12,
+      "sdk_value": -12,
+      "site_value": null,
+      "api_count": 0,
+      "global_descriptions": {},
+      "site_url": null,
+      "same_value_names": [
+        "EW_ITHIGHT"
+      ]
+    },
+    {
+      "name": "EW_BUS",
+      "value": -11,
+      "sdk_value": -11,
+      "site_value": -11,
+      "api_count": 0,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Bus error (HSSB version only)",
+          "handling": "A bus error of CNC system occurred.\nContact with the service section or the section in charge."
+        },
+        "pmc": {
+          "meaning": "Bus error (HSSB version only)",
+          "handling": "A bus error of CNC system occurred.\nContact with the service section or the section in charge."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_BUS"
+      ]
+    },
+    {
+      "name": "EW_SYSTEM2",
+      "value": -10,
+      "sdk_value": -10,
+      "site_value": -10,
+      "api_count": 0,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "System error (2) (HSSB version only)",
+          "handling": "A system error of CNC system occurred.\nContact with the service section or the section in charge."
+        },
+        "pmc": {
+          "meaning": "System error (2) (HSSB version only)",
+          "handling": "A system error of CNC system occurred.\nContact with the service section or the section in charge."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_SYSTEM2"
+      ]
+    },
+    {
+      "name": "EW_HSSB",
+      "value": -9,
+      "sdk_value": -9,
+      "site_value": -9,
+      "api_count": 2,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Communication error of HSSB (HSSB version only)",
+          "handling": "Investigate the serial line or I/F board of HSSB."
+        },
+        "pmc": {
+          "meaning": "Communication error of HSSB (HSSB version only)",
+          "handling": "Investigate the serial line or I/F board of HSSB."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_HSSB"
+      ]
+    },
+    {
+      "name": "EW_HANDLE",
+      "value": -8,
+      "sdk_value": -8,
+      "site_value": -8,
+      "api_count": 4,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Handle number error",
+          "handling": "Get the library handle number."
+        },
+        "pmc": {
+          "meaning": "Handle number error",
+          "handling": "Get the library handle number."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_HANDLE"
+      ]
+    },
+    {
+      "name": "EW_VERSION",
+      "value": -7,
+      "sdk_value": -7,
+      "site_value": -7,
+      "api_count": 14,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Version mismatch between the CNC/PMC and library",
+          "handling": "The CNC/PMC version does not match that of the library.\nReplace the library or the CNC/PMC control software."
+        },
+        "pmc": {
+          "meaning": "Version mismatch between the CNC/PMC and library",
+          "handling": "The CNC/PMC version does not match that of the library.\nReplace the library or the CNC/PMC control software."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_VERSION"
+      ]
+    },
+    {
+      "name": "EW_UNEXP",
+      "value": -6,
+      "sdk_value": -6,
+      "site_value": -6,
+      "api_count": 0,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Abnormal library state",
+          "handling": "An unanticipated error occurred.\nContact with the section in charge."
+        },
+        "pmc": {
+          "meaning": "Abnormal library state",
+          "handling": "An unanticipated error occurred.\nContact with the section in charge."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_UNEXP"
+      ]
+    },
+    {
+      "name": "EW_SYSTEM",
+      "value": -5,
+      "sdk_value": -5,
+      "site_value": -5,
+      "api_count": 0,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "System error (HSSB version only)",
+          "handling": "A system error of CNC occurred.\nContact with the service section or the section in charge."
+        },
+        "pmc": {
+          "meaning": "System error (HSSB version only)",
+          "handling": "A system error of CNC occurred.\nContact with the service section or the section in charge."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_SYSTEM"
+      ]
+    },
+    {
+      "name": "EW_PARITY",
+      "value": -4,
+      "sdk_value": -4,
+      "site_value": -4,
+      "api_count": 0,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Shared RAM parity error (HSSB version only)",
+          "handling": "A hardware error occurred.\nContact with the service section."
+        },
+        "pmc": {
+          "meaning": "Shared RAM parity error (HSSB version only)",
+          "handling": "A hardware error occurred.\nContact with the service section."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_PARITY"
+      ]
+    },
+    {
+      "name": "EW_MMCSYS",
+      "value": -3,
+      "sdk_value": -3,
+      "site_value": -3,
+      "api_count": 4,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "FANUC drivers installation error (HSSB version only)",
+          "handling": "The drivers required for execution are not installed."
+        },
+        "pmc": {
+          "meaning": "FANUC drivers installation error (HSSB version only)",
+          "handling": "The drivers required for execution are not installed."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_MMCSYS"
+      ]
+    },
+    {
+      "name": "EW_RESET",
+      "value": -2,
+      "sdk_value": -2,
+      "site_value": -2,
+      "api_count": 24,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Reset or stop request",
+          "handling": "The RESET or STOP button was pressed.\nCall the termination function."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_RESET"
+      ]
+    },
+    {
+      "name": "EW_BUSY",
+      "value": -1,
+      "sdk_value": -1,
+      "site_value": -1,
+      "api_count": 111,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Busy",
+          "handling": "Wait until the completion of CNC processing, or retry."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_BUSY"
+      ]
+    },
+    {
+      "name": "EW_OK",
+      "value": 0,
+      "sdk_value": 0,
+      "site_value": 0,
+      "api_count": 0,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Normal termination",
+          "handling": ""
+        },
+        "pmc": {
+          "meaning": "Normal termination",
+          "handling": ""
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_OK"
+      ]
+    },
+    {
+      "name": "EW_FUNC",
+      "value": 1,
+      "sdk_value": 1,
+      "site_value": 1,
+      "api_count": 228,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Error(function is not executed, or not available)",
+          "handling": "Specific function which must be executed beforehand has not been executed.\nOtherwise that function is not available."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_FUNC",
+        "EW_NOPMC"
+      ]
+    },
+    {
+      "name": "EW_NOPMC",
+      "value": 1,
+      "sdk_value": 1,
+      "site_value": 1,
+      "api_count": 15,
+      "global_descriptions": {
+        "pmc": {
+          "meaning": "Error(No PMC)",
+          "handling": "The PMC does not exist."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_FUNC",
+        "EW_NOPMC"
+      ]
+    },
+    {
+      "name": "EW_LENGTH",
+      "value": 2,
+      "sdk_value": 2,
+      "site_value": 2,
+      "api_count": 200,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Error(data block length error, error of number of data)",
+          "handling": "Check and correct the data block length or number of data."
+        },
+        "pmc": {
+          "meaning": "Error(data block length error)",
+          "handling": "Check and correct the data block length."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_LENGTH"
+      ]
+    },
+    {
+      "name": "EW_NUMBER",
+      "value": 3,
+      "sdk_value": 3,
+      "site_value": 3,
+      "api_count": 208,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Error(data number error)",
+          "handling": "Check and correct the data number."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_NUMBER",
+        "EW_RANGE"
+      ]
+    },
+    {
+      "name": "EW_RANGE",
+      "value": 3,
+      "sdk_value": 3,
+      "site_value": 3,
+      "api_count": 18,
+      "global_descriptions": {
+        "pmc": {
+          "meaning": "Error(address range error)",
+          "handling": "Check and correct the address range."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_NUMBER",
+        "EW_RANGE"
+      ]
+    },
+    {
+      "name": "EW_ATTRIB",
+      "value": 4,
+      "sdk_value": 4,
+      "site_value": 4,
+      "api_count": 144,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Error(data attribute error)",
+          "handling": "Check and correct the data attribute."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_ATTRIB",
+        "EW_TYPE"
+      ]
+    },
+    {
+      "name": "EW_TYPE",
+      "value": 4,
+      "sdk_value": 4,
+      "site_value": 4,
+      "api_count": 0,
+      "global_descriptions": {
+        "pmc": {
+          "meaning": "Error(address type/data type error)",
+          "handling": "Check and correct the address type/data type"
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_ATTRIB",
+        "EW_TYPE"
+      ]
+    },
+    {
+      "name": "EW_DATA",
+      "value": 5,
+      "sdk_value": 5,
+      "site_value": 5,
+      "api_count": 230,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Error(data error)",
+          "handling": "Check and correct the data.\nFor the following operations, this code indicates that the specified program cannot be found.\nDelete specified program\nSearch specified program\nStart uploading NC program"
+        },
+        "pmc": {
+          "meaning": "Error(data error)",
+          "handling": "Check and correct the data."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_DATA"
+      ]
+    },
+    {
+      "name": "EW_NOOPT",
+      "value": 6,
+      "sdk_value": 6,
+      "site_value": 6,
+      "api_count": 521,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Error(no option)",
+          "handling": "There is no corresponding CNC option."
+        },
+        "pmc": {
+          "meaning": "Error(no option)",
+          "handling": "There is no corresponding CNC option."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_NOOPT"
+      ]
+    },
+    {
+      "name": "EW_PROT",
+      "value": 7,
+      "sdk_value": 7,
+      "site_value": 7,
+      "api_count": 85,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Error(write protection)",
+          "handling": "Write operation is prohibited."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_PROT"
+      ]
+    },
+    {
+      "name": "EW_OVRFLOW",
+      "value": 8,
+      "sdk_value": 8,
+      "site_value": 8,
+      "api_count": 24,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Error(memory overflow)",
+          "handling": "CNC tape memory is overflowed."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_OVRFLOW"
+      ]
+    },
+    {
+      "name": "EW_PARAM",
+      "value": 9,
+      "sdk_value": 9,
+      "site_value": 9,
+      "api_count": 93,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Error(CNC parameter error)",
+          "handling": "CNC parameter is set incorrectly."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_PARAM"
+      ]
+    },
+    {
+      "name": "EW_BUFFER",
+      "value": 10,
+      "sdk_value": 10,
+      "site_value": 10,
+      "api_count": 21,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Error(buffer empty/full)",
+          "handling": "The buffer is empty or full.\nWait until completion of CNC processing, or retry."
+        },
+        "pmc": {
+          "meaning": "Error(buffer empty/full)",
+          "handling": "The buffer is empty or full.\nWait until completion of PMC processing, or retry.\nAlternatively, add the required processing for the PMC."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_BUFFER"
+      ]
+    },
+    {
+      "name": "EW_PATH",
+      "value": 11,
+      "sdk_value": 11,
+      "site_value": 11,
+      "api_count": 11,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Error(path number error)",
+          "handling": "A path number is incorrect."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_PATH"
+      ]
+    },
+    {
+      "name": "EW_MODE",
+      "value": 12,
+      "sdk_value": 12,
+      "site_value": 12,
+      "api_count": 46,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Error(CNC mode error)",
+          "handling": "The CNC mode is incorrect.\nCorrect the CNC mode."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_MODE"
+      ]
+    },
+    {
+      "name": "EW_REJECT",
+      "value": 13,
+      "sdk_value": 13,
+      "site_value": 13,
+      "api_count": 168,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Error(CNC execution rejection)",
+          "handling": "The execution at the CNC is rejected.\nCheck the condition of execution."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_REJECT"
+      ]
+    },
+    {
+      "name": "EW_DTSRVR",
+      "value": 14,
+      "sdk_value": 14,
+      "site_value": 14,
+      "api_count": 66,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Error(Data server error)",
+          "handling": "Some errors occur at the data server."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_DTSRVR"
+      ]
+    },
+    {
+      "name": "EW_ALARM",
+      "value": 15,
+      "sdk_value": 15,
+      "site_value": 15,
+      "api_count": 15,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Error(alarm)",
+          "handling": "The function cannot be executed due to an alarm in CNC.\nRemove the cause of alarm."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_ALARM"
+      ]
+    },
+    {
+      "name": "EW_STOP",
+      "value": 16,
+      "sdk_value": 16,
+      "site_value": 16,
+      "api_count": 2,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Error(stop)",
+          "handling": "CNC status is stop or emergency."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_STOP"
+      ]
+    },
+    {
+      "name": "EW_PASSWD",
+      "value": 17,
+      "sdk_value": 17,
+      "site_value": 17,
+      "api_count": 20,
+      "global_descriptions": {
+        "cnc": {
+          "meaning": "Error(State of data protection)",
+          "handling": "Data is protected by the CNC data protection function."
+        },
+        "pmc": {
+          "meaning": "Error(State of data protection)",
+          "handling": "Data is protected by the CNC data protection function."
+        }
+      },
+      "site_url": "https://www.woody.vip/fanuc/errcode.htm",
+      "same_value_names": [
+        "EW_PASSWD"
+      ]
+    },
+    {
+      "name": "EW_PMC",
+      "value": 18,
+      "sdk_value": 18,
+      "site_value": null,
+      "api_count": 0,
+      "global_descriptions": {},
+      "site_url": null,
+      "same_value_names": [
+        "EW_PMC"
+      ]
+    },
+    {
+      "name": "EW_PMCHANDLE",
+      "value": 19,
+      "sdk_value": 19,
+      "site_value": null,
+      "api_count": 0,
+      "global_descriptions": {},
+      "site_url": null,
+      "same_value_names": [
+        "EW_PMCHANDLE"
+      ]
+    },
+    {
+      "name": "EW_RD_OVWSTP",
+      "value": 20,
+      "sdk_value": 20,
+      "site_value": null,
+      "api_count": 0,
+      "global_descriptions": {},
+      "site_url": null,
+      "same_value_names": [
+        "EW_RD_OVWSTP"
+      ]
+    },
+    {
+      "name": "EW_RD_RSTFIN",
+      "value": 21,
+      "sdk_value": 21,
+      "site_value": null,
+      "api_count": 0,
+      "global_descriptions": {},
+      "site_url": null,
+      "same_value_names": [
+        "EW_RD_RSTFIN"
+      ]
+    },
+    {
+      "name": "EW_OVERFLOW",
+      "value": null,
+      "sdk_value": null,
+      "site_value": null,
+      "api_count": 1,
+      "global_descriptions": {},
+      "site_url": null,
+      "same_value_names": []
+    }
+  ]
+}

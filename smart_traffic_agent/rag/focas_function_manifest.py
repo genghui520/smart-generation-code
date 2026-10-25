@@ -11,9 +11,18 @@ import xml.etree.ElementTree as ET
 
 DEFAULT_FOCAS_FUNCTION_WORKBOOK = Path(r"e:\2025-06\codenew\focas_funcs.xlsx")
 DEFAULT_FOCAS_FUNCTION_MANIFEST = Path("rag_indexes/focas/function_manifest.jsonl")
-DEFAULT_COVERAGE_BATCH_SIZE = 40
+DEFAULT_COVERAGE_BATCH_SIZE = 1
 DEFAULT_SUPPORT_BATCH_SIZE = 16
 DEFAULT_COVERAGE_SEGMENT_COUNT = 3
+
+# Only these returned-value families require an executing NC motion program.
+# Matching descriptions such as "save program position" is too broad: it
+# previously put cnc_saveprog_start/end into the motion segment.
+MOTION_FUNCTION_RE = re.compile(
+    r"^cnc_(?:absolute\d*|machine\d*|relative\d*|distance\d*|"
+    r"rdposition|rddynamic\d*|actf|acts|rdactf|rdacts|rdspeed)$",
+    re.IGNORECASE,
+)
 
 SHEET_NS = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 REL_NS = {"rel": "http://schemas.openxmlformats.org/package/2006/relationships"}
@@ -26,6 +35,21 @@ HEADER_ALIASES = {
 }
 
 SCENARIO_BATCH_SPECS: list[dict[str, Any]] = [
+    {
+        "scenario_batch_id": "skip_axis_parameter_variation",
+        "scenario_types": {"axis_input_variation", "input_parameter_variation"},
+        "main_state_driver": "discover_controlled_axes_then_read_aggregate_and_each_valid_axis",
+        "quality_target": "retain direct cnc_skip traffic across documented aggregate and controller-reported axis selectors",
+        "target_keywords": ["cnc_skip", "skip position", "skipped position"],
+        "support_functions": [
+            "cnc_allclibhndl3", "cnc_freelibhndl", "cnc_statinfo", "cnc_alarm2",
+            "cnc_rdaxisname",
+        ],
+        "nc_program_required": False,
+        "cycle_start_required": False,
+        "execution_allowed": True,
+        "execution_gate": "read_only_documented_axis_inputs; never guess axis numbers",
+    },
     {
         "scenario_batch_id": "programmed_coordinate_motion",
         "scenario_types": {"coordinate_motion", "feed_speed_change", "general_status_collection", "comprehensive_focas_traffic"},
@@ -44,7 +68,6 @@ SCENARIO_BATCH_SPECS: list[dict[str, Any]] = [
             "speed",
             "spindle",
             "servo delay",
-            "skip",
         ],
         "support_functions": [
             "cnc_allclibhndl3",
@@ -68,7 +91,7 @@ SCENARIO_BATCH_SPECS: list[dict[str, Any]] = [
         "main_state_driver": "create_select_read_upload_download_program_artifacts",
         "quality_target": "program directory/transfer/selection/readback state transitions",
         "target_keywords": ["program", "prog", "download", "upload", "dwn", "search", "seq", "mdi"],
-        "support_functions": ["cnc_allclibhndl3", "cnc_freelibhndl", "cnc_statinfo", "cnc_alarm2"],
+        "support_functions": ["cnc_allclibhndl3", "cnc_freelibhndl", "cnc_statinfo", "cnc_alarm2", "cnc_rdprogdir3", "cnc_rdprgnum", "cnc_getdtailerr", "cnc_delete"],
     },
     {
         "scenario_batch_id": "tool_offset_work_coordinate_restore",
@@ -163,16 +186,20 @@ def build_function_coverage_context(
     manifest_path: Path = DEFAULT_FOCAS_FUNCTION_MANIFEST,
     *,
     covered_functions: set[str] | None = None,
+    target_functions: set[str] | None = None,
     batch_size: int = DEFAULT_COVERAGE_BATCH_SIZE,
     scenario_type: str = "comprehensive_focas_traffic",
     support_batch_size: int = DEFAULT_SUPPORT_BATCH_SIZE,
     max_segments: int = DEFAULT_COVERAGE_SEGMENT_COUNT,
 ) -> dict[str, Any]:
-    rows = dedupe_manifest_rows(load_function_manifest(manifest_path))
+    all_rows = dedupe_manifest_rows(load_function_manifest(manifest_path))
+    rows = all_rows
+    if target_functions is not None:
+        rows = [row for row in rows if str(row.get("function", "")) in target_functions]
     covered = set(covered_functions or set())
     remaining = [row for row in rows if str(row.get("function", "")) not in covered]
     segments = select_scenario_segments(
-        rows,
+        all_rows,
         remaining,
         scenario_type=scenario_type,
         target_batch_size=max(1, batch_size),
@@ -252,6 +279,9 @@ def select_scenario_segments(
                 "quality_target": spec["quality_target"],
                 "selection_strategy": "multi_segment_scenario_cluster_target_plus_support",
                 "nc_program_required": nc_program_required_for_spec(spec),
+                "cycle_start_required": cycle_start_required_for_spec(spec),
+                "execution_allowed": bool(spec.get("execution_allowed", True)),
+                "execution_gate": str(spec.get("execution_gate", "")),
                 "target_batch": target_rows,
                 "support_batch": support_rows,
             }
@@ -295,6 +325,9 @@ def select_scenario_batch(
                 "quality_target": spec["quality_target"],
                 "selection_strategy": "scenario_cluster_target_plus_support",
                 "nc_program_required": nc_program_required_for_spec(spec),
+                "cycle_start_required": cycle_start_required_for_spec(spec),
+                "execution_allowed": bool(spec.get("execution_allowed", True)),
+                "execution_gate": str(spec.get("execution_gate", "")),
                 "target_batch": target_rows,
                 "support_batch": support_rows,
             }
@@ -314,6 +347,7 @@ def select_scenario_batch(
         "quality_target": "attempt remaining manifest functions with bounded arguments and support evidence",
         "selection_strategy": "fallback_remaining_order_after_scenario_specs_empty",
         "nc_program_required": False,
+        "cycle_start_required": False,
         "target_batch": target_rows,
         "support_batch": support_rows,
     }
@@ -327,6 +361,7 @@ def empty_segment() -> dict[str, Any]:
         "quality_target": "",
         "selection_strategy": "",
         "nc_program_required": False,
+        "cycle_start_required": False,
         "target_batch": [],
         "support_batch": [],
     }
@@ -352,9 +387,15 @@ def assign_segment_id(rows: list[dict[str, Any]], segment_id: str) -> None:
 
 
 def nc_program_required_for_spec(spec: dict[str, Any]) -> bool:
-    driver = str(spec.get("main_state_driver", "")).lower()
     scenario_id = str(spec.get("scenario_batch_id", "")).lower()
-    return "nc_program" in driver or "programmed_coordinate_motion" in scenario_id or "program_lifecycle" in scenario_id
+    # Program-transfer APIs need a valid NC text payload without executing it.
+    return scenario_id in {"programmed_coordinate_motion", "program_lifecycle"}
+
+
+def cycle_start_required_for_spec(spec: dict[str, Any]) -> bool:
+    return str(spec.get("scenario_batch_id", "")).lower() in {
+        "programmed_coordinate_motion"
+    }
 
 
 def scenario_specs_for(scenario_type: str) -> list[dict[str, Any]]:
@@ -407,6 +448,8 @@ def annotate_batch_row(row: dict[str, Any], *, role: str, spec: dict[str, Any], 
 
 
 def row_matches_spec(row: dict[str, Any], spec: dict[str, Any]) -> bool:
+    if spec.get("scenario_batch_id") == "programmed_coordinate_motion":
+        return bool(MOTION_FUNCTION_RE.fullmatch(str(row.get("function", ""))))
     category = str(row.get("category", "")).lower()
     category_keywords = [str(item).lower() for item in spec.get("target_category_keywords", [])]
     if category_keywords and any(keyword in category for keyword in category_keywords):

@@ -42,21 +42,25 @@ class ExecutorKnowledgeTests(unittest.TestCase):
                     phase="before",
                     interface_name="ReadPosition",
                     input_parameters={},
-                    status_code=5,
-                    response={"data": "FOCAS return code 5"},
+                    status_code=2,
+                    response={"data": "FOCAS return code 2"},
                     protocol_function="cnc_rdposition",
-                    error="FOCAS return code 5",
+                    error="FOCAS return code 2",
                 )
             ],
             capture_events=[],
             output_dir=Path(tempfile.gettempdir()),
-            errors=["FOCAS return code 5"],
+            errors=["FOCAS return code 2"],
         )
 
         attach_execution_error_knowledge(state, sample_knowledge())
 
         self.assertIn("execution_error_knowledge", state.plan.rag_context)
         self.assertTrue(state.plan.rag_context["execution_error_knowledge"])
+        diagnosis = state.plan.rag_context["execution_return_code_diagnostics"][0]
+        self.assertEqual(diagnosis["return_code_names"], ["EW_LENGTH"])
+        self.assertTrue(diagnosis["return_code_documented_for_api"])
+        self.assertTrue(diagnosis["api_return_code_explanations"])
 
     def test_read_cpp_csv_logs_uses_csv_timestamp(self) -> None:
         state = WorkflowState(request=TaskRequest(description="generate coordinate traffic", task_id="exec001"))

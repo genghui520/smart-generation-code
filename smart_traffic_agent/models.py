@@ -27,7 +27,7 @@ class TaskRequest:
     task_id: str
     protocol: str = "cnc"
     target_environment: str = "simulator"
-    permissions: dict[str, bool] = field(default_factory=dict)
+    permissions: dict[str, Any] = field(default_factory=dict)
     # Dynamic output-quality checks can be disabled for local simulator tests.
     quality_gate_enabled: bool = True
     created_at: str = field(default_factory=utc_now)
@@ -95,6 +95,9 @@ class GeneratedArtifacts:
     api_script_path: Path | None = None
     nc_program_path: Path | None = None
     diagnostics: list[str] = field(default_factory=list)
+    harness_path: Path | None = None
+    fragment_path: Path | None = None
+    bindings_path: Path | None = None
 
 
 @dataclass(slots=True)
@@ -110,6 +113,12 @@ class ApiCallLog:
     protocol_function: str = ""
     semantic_label: str = ""
     error: str | None = None
+    invocation_id: str = ""
+    transaction_id: str | None = None
+    start_timestamp_ns: int | None = None
+    end_timestamp_ns: int | None = None
+    device_context: dict[str, Any] = field(default_factory=dict)
+    traffic_status: str = "unavailable"
 
 
 @dataclass(slots=True)
@@ -132,6 +141,7 @@ class ToolCallRecord:
     input_summary: dict[str, Any] = field(default_factory=dict)
     output_summary: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
+    agent_name: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -146,6 +156,9 @@ class ExecutionResult:
     output_dir: Path
     errors: list[str] = field(default_factory=list)
     tool_calls: list[ToolCallRecord] = field(default_factory=list)
+    collection_status: str = "failed"
+    collection_evidence: dict[str, Any] = field(default_factory=dict)
+    offline_audit_status: str = "not_run"
 
 
 @dataclass(slots=True)
@@ -181,8 +194,11 @@ class WorkflowState:
     errors: list[str] = field(default_factory=list)
     repair_attempts: int = 0
     repair_history: list[dict[str, Any]] = field(default_factory=list)
+    error_memory_id: str | None = None
+    prerequisite_analysis_attempted: bool = False
     long_term_memories: list[dict[str, Any]] = field(default_factory=list)
     messages: list[dict[str, Any]] = field(default_factory=list)
+    tool_call_history: list[ToolCallRecord] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

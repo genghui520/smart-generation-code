@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from .utils import ensure_dir, tokenize
 
 DEFAULT_MEMORY_PATH = Path("rag_indexes/focas/repair_memory.jsonl")
 DEFAULT_MEMORY_VECTOR_DIR = Path("rag_indexes/focas/repair_memory_vector_db")
+DEFAULT_EXPERIENCE_PATH = Path("rag_indexes/focas/error_experiences.jsonl")
 MEMORY_COLLECTION = "focas_repair_memory"
 
 
@@ -57,6 +59,11 @@ class LongTermMemoryStore:
 
     def __init__(self, path: Path = DEFAULT_MEMORY_PATH, vector_db_dir: Path | None = None) -> None:
         self.path = path
+        self.experience_path = (
+            DEFAULT_EXPERIENCE_PATH
+            if path == DEFAULT_MEMORY_PATH
+            else path.parent / "error_experiences.jsonl"
+        )
         self.vector_db_dir = vector_db_dir or (
             DEFAULT_MEMORY_VECTOR_DIR
             if path == DEFAULT_MEMORY_PATH
@@ -96,7 +103,7 @@ class LongTermMemoryStore:
     def _sync_vector_store(self) -> None:
         if not self.vector_search_available:
             return
-        records = self.read_all()
+        records = self.read_all() + self.read_experiences()
         if not records:
             return
         existing = set(self._vector_collection.get(include=[]).get("ids", []))
@@ -128,7 +135,10 @@ class LongTermMemoryStore:
                     n_results=min(top_k, 50),
                     include=["distances", "metadatas"],
                 )
-                records_by_id = {str(item.get("memory_id")): item for item in self.read_all()}
+                records_by_id = {
+                    str(item.get("memory_id")): item
+                    for item in self.read_all() + self.read_experiences()
+                }
                 matches = []
                 for memory_id, distance, metadata in zip(
                     result.get("ids", [[]])[0],
@@ -145,11 +155,11 @@ class LongTermMemoryStore:
             except Exception as exc:
                 print(f"[MemoryStore] embedding search failed, using term search: {exc}")
         query_terms = set(tokenize(query))
-        if not query_terms or not self.path.exists():
+        if not query_terms:
             return []
 
         scored: list[tuple[int, dict[str, Any]]] = []
-        for record in self.read_all():
+        for record in self.read_all() + self.read_experiences():
             text = memory_search_text(record)
             score = len(query_terms.intersection(tokenize(text)))
             if score > 0:
@@ -159,6 +169,23 @@ class LongTermMemoryStore:
                 scored.append((score, enriched))
         scored.sort(key=lambda item: (item[0], item[1].get("timestamp", "")), reverse=True)
         return [record for _, record in scored[:top_k]]
+
+    def read_experiences(self) -> list[dict[str, Any]]:
+        """Read curated, evidence-backed troubleshooting experiences."""
+        if not self.experience_path.exists():
+            return []
+        rows: list[dict[str, Any]] = []
+        with self.experience_path.open("r", encoding="utf-8") as file:
+            for line in file:
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict) and payload.get("experience_id"):
+                    payload.setdefault("memory_id", f"experience:{payload['experience_id']}")
+                    payload.setdefault("record_type", "curated_error_experience")
+                    rows.append(payload)
+        return rows
 
     def remember_workflow(self, state: WorkflowState) -> None:
         if not state.repair_history:
@@ -177,6 +204,56 @@ class LongTermMemoryStore:
             notes=memory_notes_from_state(state),
         )
         self.append(record)
+
+    def remember_error(self, state: WorkflowState, *, status: str = "pending") -> str | None:
+        """Persist an error episode as soon as the Router observes it."""
+        errors = list(dict.fromkeys([*state.errors, *(state.result.errors if state.result else [])]))
+        if not errors:
+            return state.error_memory_id
+        if state.error_memory_id is None:
+            state.error_memory_id = f"error-{state.request.task_id}-{uuid.uuid4().hex[:10]}"
+        record = {
+            "memory_id": state.error_memory_id,
+            "record_type": "workflow_error_episode",
+            "error_category": "SDK_TYPE_MISMATCH" if any("SDK_TYPE_MISMATCH" in str(error) for error in errors) else "",
+            "timestamp": utc_now(),
+            "status": status,
+            "task_description": state.request.description,
+            "task_id": state.request.task_id,
+            "target_environment": state.request.target_environment,
+            "scenario_type": state.plan.scenario_type if state.plan else None,
+            "stage": state.stage,
+            "errors": errors,
+            "repair_attempts": state.repair_attempts,
+            "repair_history": list(state.repair_history),
+            "evidence": error_episode_evidence(state),
+            "final_success": False,
+        }
+        self.upsert(record)
+        return state.error_memory_id
+
+    def upsert(self, record: dict[str, Any]) -> None:
+        """Append new memories and replace an existing episode on later updates."""
+        ensure_dir(self.path.parent)
+        records = self.read_all()
+        memory_id = str(record["memory_id"])
+        if not any(str(row.get("memory_id")) == memory_id for row in records):
+            with self.path.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        else:
+            updated = [record if str(row.get("memory_id")) == memory_id else row for row in records]
+            self.path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in updated), encoding="utf-8")
+        if self._ensure_vector_store():
+            document = memory_search_text(record)
+            embedding = self._embed_fn([document])[0]
+            metadata = {
+                "memory_id": memory_id,
+                "scenario_type": str(record.get("scenario_type", "")),
+                "final_success": bool(record.get("final_success", False)),
+            }
+            existing_ids = set(self._vector_collection.get(include=[]).get("ids", []))
+            operation = self._vector_collection.update if memory_id in existing_ids else self._vector_collection.add
+            operation(ids=[memory_id], documents=[document], embeddings=[embedding], metadatas=[metadata])
 
     def append(self, record: MemoryRecord) -> None:
         ensure_dir(self.path.parent)
@@ -206,9 +283,21 @@ class LongTermMemoryStore:
 
 def memory_search_text(record: dict[str, Any]) -> str:
     parts = [
+        str(record.get("error_category", "")),
+        str(record.get("title", "")),
+        str(record.get("trigger", "")),
+        str(record.get("root_cause", "")),
+        str(record.get("fix", "")),
+        str(record.get("prevention", "")),
+        " ".join(str(item) for item in record.get("related_apis", [])),
+        " ".join(str(item) for item in record.get("evidence", [])),
         str(record.get("task_description", "")),
         str(record.get("target_environment", "")),
         str(record.get("scenario_type", "")),
+        str(record.get("status", "")),
+        str(record.get("stage", "")),
+        " ".join(str(error) for error in record.get("errors", [])),
+        str(record.get("router_reason", "")),
         " ".join(str(error) for error in record.get("final_errors", [])),
         " ".join(str(note) for note in record.get("notes", [])),
     ]
@@ -217,7 +306,24 @@ def memory_search_text(record: dict[str, Any]) -> str:
             parts.append(str(repair.get("repair_stage", "")))
             parts.append(str(repair.get("action", "")))
             parts.extend(str(error) for error in repair.get("errors", []))
+            parts.append(str(repair.get("repair_instruction", "")))
+            parts.append(str(repair.get("router_reason", "")))
     return "\n".join(parts)
+
+
+def error_episode_evidence(state: WorkflowState) -> list[dict[str, Any]]:
+    if state.result is None:
+        return []
+    return [
+        {
+            "interface_name": log.interface_name,
+            "status_code": log.status_code,
+            "error": log.error,
+            "traffic_status": log.traffic_status,
+            "input_parameters": log.input_parameters,
+        }
+        for log in state.result.api_logs[-20:]
+    ]
 
 
 def workflow_succeeded(state: WorkflowState) -> bool:

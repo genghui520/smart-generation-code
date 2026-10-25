@@ -62,6 +62,18 @@ class ToolProtocolTests(unittest.TestCase):
         self.assertEqual([call.tool_name for call in calls], ["cnc_statinfo", "cnc_absolute"])
         self.assertEqual(validate_tool_calls(calls), [])
 
+    def test_npcap_lifecycle_is_not_treated_as_focas_tools(self) -> None:
+        step = PlanStep(
+            "S001", "before", "Start Npcap capture", "Npcap loopback capture",
+            protocol_function="N/A (capture preflight)",
+            api_calls=[
+                {"call_id": "call-01", "protocol_function": "N"},
+                {"call_id": "call-02", "protocol_function": "A (capture preflight)"},
+            ],
+        )
+
+        self.assertEqual(tool_calls_from_step(step), [])
+
 
 if __name__ == "__main__":
     unittest.main()

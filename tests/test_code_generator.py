@@ -12,20 +12,38 @@ from smart_traffic_agent.agents.code_generator import (
     normalize_focas_header_include,
     normalize_nc_download_payload,
     normalize_llm_nc_program,
+    normalize_official_odbpos_axis_access,
+    normalize_plan_nc_program_contract,
     official_focas_abi_context,
     preflight_compile_generated_cpp,
     validate_real_packet_capture_usage,
+    validate_cycle_start_ready_states,
     repair_cpp_api_script_after_compile_error,
     retrieve_codegen_knowledge_context,
     select_codegen_executable_steps,
     steps_for_prompt,
     validate_generated,
+    validate_focas_loader_type_safety,
     validate_focas_position_abi,
     validate_official_output_usage,
+    validate_poselem_scalar_access,
+    validate_all_focas_symbols_against_header,
+    extract_real_focas_symbol_references,
+    build_scenario_fragment,
+    cpp_step_block,
+    normalize_capture_core,
+    validate_scenario_fragment,
+    validate_semantic_api_bindings,
 )
-from smart_traffic_agent.agent_tools import CompileCppOutput
+from smart_traffic_agent.agent_tools import (
+    CompileCppOutput,
+    RenderFocasCppTool,
+    ValidateFocasCppTool,
+    WriteGeneratedArtifactTool,
+)
 from smart_traffic_agent.knowledge import sample_knowledge
 from smart_traffic_agent.models import ExecutionPlan, NcProgramSpec, PlanStep, TaskRequest, WorkflowState
+from smart_traffic_agent.agent_roles import ApiContract, CodeSpec
 
 
 class FakeCodegenLlm:
@@ -61,6 +79,58 @@ def hard_pcap_valid_cpp(extra: str = "") -> str:
 
 
 class CodeGenerationAgentTests(unittest.TestCase):
+    def test_start_program_uses_current_run_ui_environment_without_overwrite(self) -> None:
+        source = "\n".join(
+            cpp_step_block(
+                PlanStep(
+                    "S001",
+                    "during",
+                    "start",
+                    "StartProgram",
+                    {
+                        "window_title": "OLD WINDOW",
+                        "button_text": "OLD BUTTON",
+                        "click_mode": "screen",
+                        "cycle_start_x": 989,
+                        "cycle_start_y": 914,
+                    },
+                )
+            )
+        )
+
+        self.assertIn('TriggerNcGuideCycleStart("OLD WINDOW", data)', source)
+        self.assertNotIn('SetEnvironmentVariableA("NCGUIDE_', source)
+        self.assertNotIn('"989"', source)
+        self.assertNotIn('"914"', source)
+
+    def test_empty_button_text_forces_calibrated_coordinate_path(self) -> None:
+        from smart_traffic_agent.agents.code_generator import render_cpp_api_script_v2
+
+        runtime = render_cpp_api_script_v2(
+            "coordinate_motion",
+            [PlanStep("S001", "during", "start", "StartProgram", {})],
+            "O1234\nM30\n",
+        )
+
+        self.assertIn('EnvString("NCGUIDE_START_BUTTON_TEXT", "")', runtime)
+        self.assertNotIn('EnvString("NCGUIDE_START_BUTTON_TEXT", "Run")', runtime)
+
+    def test_tool_data_access_validator_requires_real_official_call(self) -> None:
+        step = PlanStep(
+            "TM-1", "during", "read tool data", "ToolDataAccess",
+            protocol_function="cnc_rdtool",
+        )
+        missing = validate_semantic_api_bindings(
+            "// cnc_rdtool(handle, 1, &count, data);", [step]
+        )
+        self.assertTrue(any("Missing required semantic operation: tool_data_access" in item for item in missing))
+
+        valid = validate_semantic_api_bindings(
+            "IODBTLMNG data{}; short count = 1; ret = api.cnc_rdtool(handle, 1, &count, &data);",
+            [step],
+        )
+        self.assertEqual(valid, [])
+
     def test_normalize_focas_header_include_strips_generated_controller_path(self) -> None:
         variants = [
             '#include "Fwlib/0iD/Fwlib32.h"',
@@ -102,6 +172,40 @@ class CodeGenerationAgentTests(unittest.TestCase):
 
         self.assertEqual(validate_official_output_usage(source, code_spec), [])
 
+    def test_strict_header_gate_rejects_unknown_focas_symbol(self) -> None:
+        source = '#include <Fwlib32.h>\nint main(){ cnc_not_in_fwlib32(handle); }'
+        diagnostics = validate_all_focas_symbols_against_header(source)
+        self.assertEqual(len(diagnostics), 1)
+        self.assertIn("cnc_not_in_fwlib32", diagnostics[0])
+
+    def test_strict_header_gate_accepts_declared_focas_symbol(self) -> None:
+        source = '#include <Fwlib32.h>\nint main(){ cnc_statinfo(handle, &status); }'
+        self.assertEqual(validate_all_focas_symbols_against_header(source), [])
+
+    def test_strict_header_gate_ignores_local_function_pointer_aliases(self) -> None:
+        source = r'''
+#include <Fwlib32.h>
+using cnc_actf_t = decltype(&::cnc_actf);
+typedef decltype(&::cnc_statinfo) cnc_statinfo_t;
+auto cnc_actf_fn = reinterpret_cast<cnc_actf_t>(GetProcAddress(dll, "cnc_actf"));
+auto cnc_statinfo_fn = reinterpret_cast<cnc_statinfo_t>(GetProcAddress(dll, "cnc_statinfo"));
+short cnc_local_helper(unsigned short handle) { return cnc_actf_fn(handle, nullptr); }
+int main() { return cnc_statinfo_fn(handle, nullptr); }
+'''
+
+        self.assertEqual(
+            extract_real_focas_symbol_references(source),
+            {"cnc_actf", "cnc_statinfo"},
+        )
+        self.assertEqual(validate_all_focas_symbols_against_header(source), [])
+
+    def test_strict_header_gate_still_rejects_unknown_real_references(self) -> None:
+        dynamic = 'GetProcAddress(dll, "cnc_not_in_fwlib32")'
+        direct = "int main(){ cnc_also_not_in_fwlib32(handle); }"
+
+        self.assertTrue(validate_all_focas_symbols_against_header(dynamic))
+        self.assertTrue(validate_all_focas_symbols_against_header(direct))
+
     def test_official_focas_abi_context_extracts_selected_prototypes_and_types(self) -> None:
         context = official_focas_abi_context(["cnc_absolute", "cnc_actf", "cnc_rdprogdir"])
 
@@ -131,6 +235,244 @@ class CodeGenerationAgentTests(unittest.TestCase):
 
         self.assertEqual(nc_program, "")
 
+    def test_milling_program_omits_unneeded_g97_spindle_mode(self) -> None:
+        from smart_traffic_agent.agents.code_generator import validate_nc_controller_modes
+
+        nc_program = normalize_llm_nc_program(
+            "O1234\nG90 G17 G54\nG97 S800 M03\nG01 X10 Y2 F100\nM30\n",
+            "O1234",
+        )
+        self.assertNotIn("G97", nc_program)
+        self.assertIn("S800 M03", nc_program)
+        self.assertEqual(
+            normalize_llm_nc_program("O1234\nG17\nG96 S100 M03\nM30\n", "O1234"), "",
+        )
+        self.assertNotIn("G97", normalize_llm_nc_program("O1234\nG97 S800 M03\nM30\n", "O1234"))
+        self.assertIn("G97", normalize_llm_nc_program("O1234\nG96 S100\nG97 S800 M03\nM30\n", "O1234"))
+        self.assertEqual(validate_nc_controller_modes("\nO1234\nG17\nG97 S800 M03\nM30\n%"),
+                         ["NC program must omit unneeded G97; use S with M03/M04 directly"])
+
+    def test_codegen_allocates_program_number_when_planner_leaves_it_blank(self) -> None:
+        plan = ExecutionPlan(
+            plan_id="plan-codegen-number",
+            task_id="codegen-number",
+            scenario_type="coordinate_motion",
+            scenario_goal="test",
+            target_environment="ncguide-generated-cpp",
+            nc_program_type="test",
+            nc_program_requirements=[],
+            nc_program_spec=NcProgramSpec(program_name=""),
+            steps=[
+                PlanStep("S001", "before", "upload", "UploadProgram", {}),
+                PlanStep("S002", "before", "select", "SelectProgram", {}),
+            ],
+            expected_outputs=[],
+        )
+
+        diagnostics = normalize_plan_nc_program_contract(plan)
+
+        self.assertRegex(plan.nc_program_spec.program_name, r"^O[1-7]\d{3}$")
+        self.assertEqual(
+            [step.parameters["program_name"] for step in plan.steps],
+            [plan.nc_program_spec.program_name, plan.nc_program_spec.program_name],
+        )
+        self.assertEqual(
+            plan.rag_context["code_generation_program_allocation"]["reason"],
+            "allocated_by_code_generation",
+        )
+        self.assertTrue(any("CodeGenerationAgent allocated" in item for item in diagnostics))
+
+    def test_normalize_plan_program_contract_updates_all_consumers(self) -> None:
+        plan = ExecutionPlan(
+            plan_id="plan-codegen001",
+            task_id="codegen001",
+            scenario_type="coordinate_motion",
+            scenario_goal="test",
+            target_environment="ncguide-generated-cpp",
+            nc_program_type="test",
+            nc_program_requirements=[],
+            nc_program_spec=NcProgramSpec(program_name="O8946"),
+            steps=[
+                PlanStep("S001", "before", "upload", "UploadProgram", {"program_name": "O8946"}),
+                PlanStep("S002", "before", "select", "SelectProgram", {"program_name": "O8946"}),
+            ],
+            expected_outputs=[],
+            code_spec=object(),
+        )
+
+        diagnostics = normalize_plan_nc_program_contract(plan)
+
+        self.assertEqual(plan.nc_program_spec.program_name, "O6646")
+        self.assertEqual([step.parameters["program_name"] for step in plan.steps], ["O6646", "O6646"])
+        self.assertIsNone(plan.code_spec)
+        self.assertEqual(
+            plan.rag_context["nc_program_name_normalization"],
+            {
+                "requested": "O8946",
+                "effective": "O6646",
+                "reason": "protected_or_invalid_program_number",
+            },
+        )
+        self.assertIn("O8946 to O6646", diagnostics[0])
+
+    def test_normalize_odbpos_axis_access_uses_one_object_per_axis(self) -> None:
+        source = (
+            "void dump(const ODBPOS& pos) { "
+            "use(pos.abs.data[0], pos.mach.data[1], pos.dist.data[2]); } "
+            "int main() { ODBPOS pos[3]{}; dump(pos); }"
+        )
+
+        normalized = normalize_official_odbpos_axis_access(source)
+
+        self.assertIn("const ODBPOS* pos", normalized)
+        self.assertIn("pos[0].abs.data", normalized)
+        self.assertIn("pos[1].mach.data", normalized)
+        self.assertIn("pos[2].dist.data", normalized)
+        self.assertIn("dump(pos)", normalized)
+
+    def test_validate_focas_loader_rejects_one_fixed_type_for_all_symbols(self) -> None:
+        source = (
+            "auto load = [&](auto& fn, const char* name) { "
+            "using Fn = decltype(&::cnc_allclibhndl3); "
+            "fn = reinterpret_cast<Fn>(GetProcAddress(module, name)); }; "
+            "load(api.cnc_allclibhndl3, \"cnc_allclibhndl3\"); "
+            "load(api.cnc_actf, \"cnc_actf\");"
+        )
+
+        diagnostics = validate_focas_loader_type_safety(source)
+
+        self.assertEqual(len(diagnostics), 1)
+        self.assertIn("fixed type", diagnostics[0])
+
+    def test_validate_focas_loader_accepts_destination_derived_type(self) -> None:
+        source = (
+            "auto load = [&](auto& fn, const char* name) { "
+            "using Fn = std::remove_reference_t<decltype(fn)>; "
+            "fn = reinterpret_cast<Fn>(GetProcAddress(module, name)); }; "
+            "load(api.cnc_allclibhndl3, \"cnc_allclibhndl3\"); "
+            "load(api.cnc_actf, \"cnc_actf\");"
+        )
+
+        self.assertEqual(validate_focas_loader_type_safety(source), [])
+
+    def test_code_only_template_quotes_nc_payload_and_inserts_core(self) -> None:
+        class CoreLlm:
+            enabled = True
+
+            def invoke_json(self, system_prompt: str, user_prompt: str) -> dict:
+                return {"core_cpp": "ret = api.cnc_actf(handle, &actual_feed); ok = check_rc(ret, \"cnc_actf\") && ok;"}
+
+        from smart_traffic_agent.agents.code_generator import render_code_only_cpp_artifacts
+
+        state = WorkflowState(
+            request=TaskRequest(
+                description="read actual feed",
+                task_id="template001",
+                permissions={"code_only_evaluation": True, "representative_scenario": True},
+            )
+        )
+        state.plan = ExecutionPlan(
+            plan_id="plan-template001",
+            task_id="template001",
+            scenario_type="coordinate_motion",
+            scenario_goal="read feed",
+            target_environment="ncguide-generated-cpp",
+            nc_program_type="test",
+            nc_program_requirements=[],
+            nc_program_spec=NcProgramSpec(program_name="O1234"),
+            steps=[PlanStep("S001", "during", "feed", "ReadFeedSpeed", {}, protocol_function="cnc_actf")],
+            expected_outputs=[],
+        )
+
+        source, fragment = render_code_only_cpp_artifacts(state, state.plan.steps, "O1234\nM30\n", CoreLlm())
+
+        self.assertIn("#include <chrono>", source)
+        self.assertIn("#include <thread>", source)
+        self.assertIn("SCENARIO_CORE_BEGIN", fragment)
+        self.assertIn("api.cnc_actf(handle, &actual_feed)", fragment)
+
+    def test_scenario_fragment_rejects_main_and_loader_ownership_leaks(self) -> None:
+        fragment = build_scenario_fragment(
+            'int main(){ return 0; }\nLoadLibraryW(L"Fwlib32.dll");'
+        )
+
+        diagnostics = validate_scenario_fragment(fragment)
+
+        self.assertTrue(any("main()" in item for item in diagnostics))
+        self.assertTrue(any("LoadLibraryW" in item for item in diagnostics))
+
+    def test_scenario_fragment_accepts_minimal_business_function(self) -> None:
+        fragment = build_scenario_fragment(
+            'ret = api.cnc_actf(handle, &actual_feed); ok = check_rc(ret, "cnc_actf") && ok;'
+        )
+
+        self.assertEqual(validate_scenario_fragment(fragment), [])
+
+    def test_validate_official_output_usage_accepts_api_alias_for_rdposition(self) -> None:
+        code_spec = CodeSpec(
+            scenario="coordinate_motion",
+            api_contracts=[
+                ApiContract(
+                    call_id="test-call",
+                    phase="during",
+                    operation_id="test-operation",
+                    tool_name="cnc_rdposition",
+                    prototype="short cnc_rdposition(unsigned short, short, short*, ODBPOS*)",
+                    parameter_types=["unsigned short", "short", "short*", "ODBPOS*"],
+                    output_fields=["abs", "mach", "rel", "dist"],
+                )
+            ]
+        )
+        source = "ODBPOS positions[3]{}; api.rdposition(handle, -1, &count, positions);"
+
+        self.assertEqual(validate_official_output_usage(source, code_spec), [])
+
+    def test_normalize_nc_download_payload_handles_array_declaration(self) -> None:
+        source = (
+            'const char program[] = "O1234\\n" "M30\\n" "%\\n"; '
+            'api.download3(handle, &length, program);'
+        )
+
+        normalized = normalize_nc_download_payload(source)
+
+        self.assertIn('"\\n"\n        "O1234', normalized)
+        self.assertIn('"M30\\n" "%"', normalized)
+
+    def test_validate_poselem_scalar_access_rejects_subscripted_data(self) -> None:
+        source = (
+            "static void dumpPosEl(const char* label, const POSELM& p) { "
+            "use(p.data[0], p.data[1], p.data[2]); }"
+        )
+
+        diagnostics = validate_poselem_scalar_access(source)
+
+        self.assertEqual(len(diagnostics), 1)
+        self.assertIn("POSELM.data is a scalar long", diagnostics[0])
+        self.assertIn("p.data[0]", diagnostics[0])
+
+    def test_validate_poselem_scalar_access_accepts_odbpos_axis_array(self) -> None:
+        source = (
+            "ODBPOS positions[3]{}; "
+            "use(positions[0].abs.data, positions[1].mach.data, "
+            "positions[2].rel.data, positions[2].dist.data);"
+        )
+
+        self.assertEqual(validate_poselem_scalar_access(source), [])
+
+    def test_validate_generated_blocks_poselem_array_misuse(self) -> None:
+        diagnostics = validate_generated(
+            (
+                "FOCAS_DLL_DIR GetEnvironmentVariableW SetDllDirectoryW "
+                "LoadLibraryW GetProcAddress cnc_allclibhndl3 cnc_freelibhndl "
+                "struct POSELM { long data; }; "
+                "void dump(const POSELM& p) { use(p.data[0]); }"
+            ),
+            "O1234\nM30\n",
+        )
+
+        blocking = [item for item in diagnostics if "POSELM.data is a scalar long" in item]
+        self.assertEqual(len(blocking), 1)
+
     def test_select_codegen_executable_steps_keeps_api_steps_for_llm(self) -> None:
         selected, skipped = select_codegen_executable_steps(
             [
@@ -154,11 +496,41 @@ class CodeGenerationAgentTests(unittest.TestCase):
         self.assertEqual(len(skipped), 1)
         self.assertIn("analysis/evaluation", skipped[0])
 
+    def test_select_codegen_executable_steps_skips_npcap_lifecycle(self) -> None:
+        selected, skipped = select_codegen_executable_steps(
+            [
+                PlanStep(
+                    "S001", "before", "Start Npcap capture", "Npcap loopback capture",
+                    protocol_function="N/A (capture preflight)",
+                ),
+                PlanStep("S002", "during", "read CNC status", "cnc_statinfo", protocol_function="cnc_statinfo"),
+            ]
+        )
+
+        self.assertEqual([step.step_id for step in selected], ["S002"])
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("deterministic runner", skipped[0])
+
     def test_preflight_compile_keeps_success_before_cleanup(self) -> None:
         class FakeCompileTool:
+            name = "compile_generated_cpp"
+            description = "test compiler"
+
             def invoke(self, tool_input):
                 tool_input.executable_path.write_text("", encoding="utf-8")
                 return CompileCppOutput(0, "api_script.cpp\n", "", tool_input.executable_path)
+
+            def input_summary(self, tool_input):
+                return {"source_path": str(tool_input.source_path)}
+
+            def output_summary(self, tool_output):
+                return {"return_code": tool_output.return_code}
+
+            def output_succeeded(self, tool_output):
+                return tool_output.success
+
+            def output_error(self, tool_output):
+                return None
 
         with tempfile.TemporaryDirectory() as temp_dir:
             work_dir = Path(temp_dir)
@@ -170,6 +542,40 @@ class CodeGenerationAgentTests(unittest.TestCase):
 
             self.assertEqual(error, "")
             self.assertFalse((work_dir / "preflight_api_script.exe").exists())
+
+    def test_preflight_compile_records_compile_tool_call(self) -> None:
+        from smart_traffic_agent.tool_runtime import ToolRegistry, ToolRuntime
+
+        class RecordingCompileTool:
+            name = "compile_generated_cpp"
+            description = "test compiler"
+
+            def invoke(self, tool_input):
+                tool_input.executable_path.write_text("", encoding="utf-8")
+                return CompileCppOutput(0, "", "", tool_input.executable_path)
+
+            def input_summary(self, tool_input):
+                return {"source_path": str(tool_input.source_path)}
+
+            def output_summary(self, tool_output):
+                return {"return_code": tool_output.return_code}
+
+            def output_succeeded(self, tool_output):
+                return tool_output.success
+
+            def output_error(self, tool_output):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            work_dir = Path(temp_dir)
+            source_path = work_dir / "api_script.cpp"
+            source_path.write_text("int main(){return 0;}", encoding="utf-8")
+            registry = ToolRegistry()
+            registry.register(RecordingCompileTool())
+            runtime = ToolRuntime(registry, history=[])
+
+            self.assertEqual(preflight_compile_generated_cpp(source_path, work_dir, tool_runtime=runtime), "")
+            self.assertEqual([record.tool_name for record in runtime.history], ["compile_generated_cpp"])
 
     def test_compile_error_repair_prompt_returns_corrected_cpp(self) -> None:
         llm = FakeCodegenLlm()
@@ -199,14 +605,70 @@ class CodeGenerationAgentTests(unittest.TestCase):
         self.assertEqual(repaired, "int main(){return 0;}")
         self.assertIn("error C2362", llm.prompts[-1])
 
-    def test_codegen_repairs_once_after_preflight_compile_failure(self) -> None:
-        repaired_cpp = hard_pcap_valid_cpp()
-        llm = FakeCodegenLlm(repair_cpp=repaired_cpp)
+    def test_compile_repair_revalidates_preserved_helper_abi(self) -> None:
+        llm = FakeCodegenLlm(repair_cpp=(
+            "#include <Fwlib32.h>\n"
+            "void dump(const ODBST& status) { use(status.aut, status.run); }\n"
+            "int main(){return 0;}"
+        ))
+        state = WorkflowState(
+            request=TaskRequest(
+                description="generate FOCAS traffic",
+                task_id="codegen001",
+                permissions={"code_only_evaluation": True},
+            )
+        )
+        state.plan = ExecutionPlan(
+            plan_id="plan-codegen001",
+            task_id="codegen001",
+            scenario_type="coordinate_motion",
+            scenario_goal="test",
+            target_environment="ncguide-generated-cpp",
+            nc_program_type="test",
+            nc_program_requirements=[],
+            nc_program_spec=NcProgramSpec(program_name="O1234"),
+            steps=[],
+            expected_outputs=[],
+        )
+        previous = (
+            "#include <Fwlib32.h>\n"
+            "void dump(const ODBST& status) { use(status.manual, status.warning); }\n"
+            "int main(){return 1;}"
+        )
+
+        repaired = repair_cpp_api_script_after_compile_error(
+            state,
+            [],
+            "O1234\nM30\n",
+            previous,
+            "error C2039: manual is not a member of odbst",
+            llm,
+            code_only=True,
+        )
+
+        self.assertNotIn("status.manual", repaired)
+        self.assertNotIn("status.warning", repaired)
+        self.assertIn("int main(){return 0;}", repaired)
+
+    def test_capture_core_deduplicates_harness_owned_state(self) -> None:
+        complete = ("short run_generated_scenario(FocasApi& api, unsigned short handle, CaptureContext& ctx)\n"
+                    "{\n    short ret = EW_OK;\n    bool ok = true;\n"
+                    "short ret = EW_OK;\nbool ok = true;\nreturn ret;\n}\n")
+        cleaned = normalize_capture_core(complete)
+        self.assertEqual(cleaned.count("short ret = EW_OK;"), 1)
+        self.assertEqual(cleaned.count("bool ok = true;"), 1)
+        body = normalize_capture_core("short ret = EW_OK;\nbool ok = true;\nret = EW_OK;\n")
+        self.assertEqual(body, "ret = EW_OK;\n")
+
+    def test_codegen_repairs_fragment_after_preflight_compile_failure(self) -> None:
+        repaired_fragment = "short run_generated_scenario(FocasApi& api, unsigned short handle){ return EW_OK; }\n"
+        llm = FakeCodegenLlm()
         state = WorkflowState(
             request=TaskRequest(
                 description="generate FOCAS traffic",
                 task_id="codegen001",
                 target_environment="ncguide-generated-cpp",
+                permissions={"code_only_evaluation": True},
             )
         )
         state.plan = ExecutionPlan(
@@ -227,7 +689,19 @@ class CodeGenerationAgentTests(unittest.TestCase):
                 patch("smart_traffic_agent.agents.code_generator.generate_nc_program", return_value=("O1234\nM30\n", [])),
                 patch(
                     "smart_traffic_agent.agents.code_generator.generate_cpp_api_script",
-                    return_value=(hard_pcap_valid_cpp("int compile_error_marker = ;"), []),
+                    side_effect=AssertionError("legacy full-source generator was called"),
+                ),
+                patch(
+                    "smart_traffic_agent.agents.code_generator.render_code_only_cpp_artifacts",
+                    return_value=('#include "scenario_fragment.inc"\nint main(){return 0;}\n', repaired_fragment),
+                ),
+                patch(
+                    "smart_traffic_agent.agents.code_generator.CodeGenerationAgent._validate_focas_cpp",
+                    return_value=type("ValidationOutput", (), {"errors": [], "warnings": []})(),
+                ),
+                patch(
+                    "smart_traffic_agent.agents.code_generator.repair_scenario_fragment_after_compile_error",
+                    return_value=repaired_fragment,
                 ),
                 patch(
                     "smart_traffic_agent.agents.code_generator.preflight_compile_generated_cpp",
@@ -235,9 +709,11 @@ class CodeGenerationAgentTests(unittest.TestCase):
                 ) as compile_mock,
             ):
                 result = CodeGenerationAgent(llm_client=llm).run(state, Path(temp_dir))
+            repaired_fragment_on_disk = result.artifacts.fragment_path.read_text(encoding="utf-8")
 
         self.assertEqual(result.stage, "execution")
-        self.assertEqual(result.artifacts.api_script, repaired_cpp)
+        self.assertIn("scenario_fragment.inc", result.artifacts.api_script)
+        self.assertEqual(repaired_fragment_on_disk, repaired_fragment)
         self.assertEqual(compile_mock.call_count, 2)
 
     def test_only_delete_permission_diagnostics_hard_block_codegen(self) -> None:
@@ -304,6 +780,22 @@ class CodeGenerationAgentTests(unittest.TestCase):
         """
         diagnostics = validate_real_packet_capture_usage(source)
         self.assertTrue(any("abort before any FOCAS call" in item for item in diagnostics))
+
+    def test_real_capture_rejects_continue_without_pcap(self) -> None:
+        source = '''
+        PacketSniffer sniffer(networkDevice, pcapFile);
+        pcap_open_live pcap_dump_open pcap_dispatch pcap_dump pcap_dump_flush
+        getenv("PCAP_NETWORK_DEVICE");
+        output << "pcap_capture_started=true";
+        output << "PCAP_UNAVAILABLE_CONTINUING";
+        '''
+        self.assertTrue(any("continues after Npcap failed" in issue for issue in validate_real_packet_capture_usage(source)))
+
+    def test_single_block_ready_gate_accepts_run_one_stationary(self) -> None:
+        bad = "bool ready = st.run == 0 && st.motion == 0;"
+        good = "bool ready = (st.run == 0 || st.run == 1) && st.motion == 0;"
+        self.assertTrue(validate_cycle_start_ready_states(bad))
+        self.assertEqual(validate_cycle_start_ready_states(good), [])
 
     def test_validate_generated_requires_packetsniffer_real_capture_api(self) -> None:
         diagnostics = validate_generated(
@@ -401,7 +893,7 @@ class CodeGenerationAgentTests(unittest.TestCase):
                 "NCGUIDE_CYCLE_START_X NCGUIDE_CYCLE_START_Y NCGUIDE_CLICK_MODE NCGUIDE_WINDOW_TITLE "
                 "cnc_statinfo SetCursorPos mouse_event cycle_start_ready_gate "
                 "cnc_rdposition pos[i].dist distance_to_go program_completion_gate "
-                "completed timeout waited_ms last_run last_motion run==0 motion==0 "
+                "completed timeout waited_ms last_run last_motion run==0 run==1 motion==0 "
                 "RunUploadedProgramToCompletion effective_nc_segment_count "
                 "expected_nc_segment_count cycle_start_click_count M30 "
                 "struct POSELM { long data; short dec; short unit; short disp; char name; char suff; }; "
@@ -466,7 +958,7 @@ class CodeGenerationAgentTests(unittest.TestCase):
                 "LoadLibraryW GetProcAddress cnc_allclibhndl3 cnc_freelibhndl "
                 "NCGUIDE_CYCLE_START_X NCGUIDE_CYCLE_START_Y NCGUIDE_CLICK_MODE NCGUIDE_WINDOW_TITLE "
                 "cnc_statinfo SetCursorPos mouse_event cycle_start_ready_gate "
-                "program_completion_gate completed timeout waited_ms last_run last_motion run==0 motion==0 "
+                "program_completion_gate completed timeout waited_ms last_run last_motion run==0 run==1 motion==0 "
                 "cnc_distance distance_to_go RunUploadedProgramToCompletion effective_nc_segment_count "
                 "expected_nc_segment_count cycle_start_click_count M30"
             ),
@@ -901,6 +1393,63 @@ class CodeGenerationAgentTests(unittest.TestCase):
 
         self.assertEqual(strategy[0]["kind"], "enum")
         self.assertEqual(strategy[1]["kind"], "range")
+
+    def test_code_generation_fast_path_uses_render_tool_before_compile(self) -> None:
+        from smart_traffic_agent.agent_tools import RenderFocasCppTool, WriteGeneratedArtifactTool
+        from smart_traffic_agent.tool_runtime import ToolRegistry, ToolRuntime
+
+        state = WorkflowState(
+            request=TaskRequest(
+                description="read CNC status",
+                task_id="render-flow001",
+                target_environment="ncguide-generated-cpp",
+                permissions={"code_only_evaluation": True},
+            )
+        )
+        state.plan = ExecutionPlan(
+            plan_id="plan-render-flow001",
+            task_id="render-flow001",
+            scenario_type="coordinate_motion",
+            scenario_goal="read status",
+            target_environment="ncguide-generated-cpp",
+            nc_program_type="test",
+            nc_program_requirements=[],
+            nc_program_spec=NcProgramSpec(program_name="O1234"),
+            steps=[PlanStep("S001", "during", "read status", "ReadRunStatus", {}, protocol_function="cnc_statinfo")],
+            expected_outputs=[],
+            code_spec=CodeSpec(scenario="coordinate_motion", api_contracts=[]),
+        )
+        harness = '#include "scenario_fragment.inc"\nint main(){return 0;}\n'
+        fragment = "short run_generated_scenario(FocasApi& api, unsigned short handle){ return EW_OK; }\n"
+        registry = ToolRegistry()
+        registry.register(WriteGeneratedArtifactTool())
+        registry.register(RenderFocasCppTool())
+        registry.register(ValidateFocasCppTool())
+        runtime = ToolRuntime(registry, history=[])
+        agent = CodeGenerationAgent(llm_client=FakeCodegenLlm())
+        agent.llm_client.enabled = False
+        agent.tool_runtime = runtime
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch("smart_traffic_agent.agents.code_generator.generate_nc_program", return_value=("O1234\nM30\n", [])),
+                patch(
+                    "smart_traffic_agent.agents.code_generator.generate_cpp_api_script",
+                    side_effect=AssertionError("legacy full-source generator was called"),
+                ),
+                patch("smart_traffic_agent.agents.code_generator.render_code_only_cpp_artifacts", return_value=(harness, fragment)),
+                patch("smart_traffic_agent.agents.code_generator.validate_generated", return_value=[]),
+                patch("smart_traffic_agent.agents.code_generator.preflight_compile_generated_cpp", return_value=""),
+            ):
+                result = agent.run(state, Path(temp_dir))
+
+            generated = Path(temp_dir) / "generated"
+            self.assertEqual(result.stage, "execution")
+            self.assertEqual((generated / "api_script.cpp").read_text(encoding="utf-8"), harness)
+            self.assertTrue((generated / "scenario_fragment.inc").exists())
+            render_records = [item for item in runtime.history if item.tool_name == "render_focas_cpp"]
+            self.assertEqual(len(render_records), 1)
+            self.assertTrue(render_records[0].success)
 
 
 if __name__ == "__main__":

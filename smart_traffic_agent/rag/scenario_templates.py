@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,88 @@ from .scenario_clusterer import (
 
 
 DEFAULT_FINAL_SCENARIO_TEMPLATES_PATH = Path("rag_indexes/focas/final_scenario_templates.json")
+
+# The source file contains automatically clustered candidates, not 15 distinct
+# manufacturing scenes. Keep cluster provenance, but expose one selectable scene
+# per operation context. Mislabelled program/file clusters belong to program
+# management rather than PMC monitoring.
+SCENE_REASSIGNMENTS = {
+    "cluster_10_pmc_signal_machine_status_cnc_rdmdiprg_operation": "program_lifecycle",
+    "cluster_11_pmc_signal_machine_status_cnc_rdpmcrng_abnormal": "program_lifecycle",
+    "cluster_12_pmc_signal_tool_offset_cnc_dwnstart_motion": "program_lifecycle",
+}
+
+SCENE_DEVICE_STATES = {
+    "coordinate_feed_motion": ["idle", "cycle_ready", "moving", "completed"],
+    "alarm_diagnosis": ["normal", "alarm_present", "alarm_cleared"],
+    "parameter_macro_access": ["idle", "readback", "restored"],
+    "ethernet_connection_exception": ["disconnected", "connected", "request_error"],
+    "pmc_signal_monitoring": ["idle", "running", "signal_changed"],
+    "program_lifecycle": ["not_started", "selected", "running", "completed"],
+    "tool_offset_management": ["idle", "readback", "restored"],
+    "work_coordinate_setting": ["idle", "readback", "restored"],
+}
+
+
+def consolidate_scenario_templates(templates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse source clusters into operation scenes without losing API targets."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for template in templates:
+        if not isinstance(template, dict):
+            continue
+        source_id = str(template.get("scenario_id", ""))
+        scene_name = SCENE_REASSIGNMENTS.get(source_id, str(template.get("scenario_name", "")))
+        if scene_name:
+            grouped.setdefault(scene_name, []).append(template)
+
+    scenes = []
+    for scene_name, sources in grouped.items():
+        # Prefer an originally correctly labelled cluster as the lifecycle
+        # prototype; other clusters contribute target APIs and provenance.
+        primary = next((row for row in sources if row.get("scenario_name") == scene_name), sources[0])
+        scene = dict(primary)
+        scene["template_id"] = f"focas-{scene_name}"
+        scene["scenario_id"] = f"scene_{scene_name}"
+        scene["scenario_name"] = scene_name
+        scene["goal"] = SCENE_GOALS.get(scene_name, scene.get("goal", ""))
+        scene["source_cluster_ids"] = [str(row.get("scenario_id", "")) for row in sources]
+        scene["cluster_member_count"] = sum(int(row.get("cluster_member_count", 0)) for row in sources)
+        scene["device_states"] = list(SCENE_DEVICE_STATES.get(scene_name, ["idle", "running", "completed"]))
+        scene["operation_variants"] = [
+            {
+                "source_cluster_id": str(row.get("scenario_id", "")),
+                "target_apis": atomic_template_apis(row.get("main_apis", [])),
+                "operation_template": row.get("operation_template", []),
+            }
+            for row in sources
+        ]
+        scene["target_apis"] = list(dict.fromkeys(
+            api for row in sources for api in atomic_template_apis(row.get("main_apis", []))
+        ))
+        # Retain the existing field for the planner and older prompt templates.
+        scene["main_apis"] = scene["target_apis"]
+        scene["support_apis"] = list(dict.fromkeys(
+            str(step.get("protocol_function", ""))
+            for step in scene.get("operation_template", [])
+            if isinstance(step, dict) and step.get("protocol_function")
+            and str(step["protocol_function"]) not in scene["target_apis"]
+        ))
+        for field in ("main_objects", "main_nc_or_operation_features", "expected_signals", "required_rule_types"):
+            scene[field] = list(dict.fromkeys(
+                str(value) for row in sources for value in row.get(field, []) if str(value).strip()
+            ))
+        scenes.append(scene)
+    return scenes
+
+
+def atomic_template_apis(entries: Any) -> list[str]:
+    names = []
+    for entry in entries if isinstance(entries, list) else []:
+        for token in re.split(r"[,/;+]+", str(entry)):
+            name = token.strip()
+            if re.fullmatch(r"(?:cnc|pmc)_[A-Za-z0-9_]+", name) and name not in names:
+                names.append(name)
+    return names
 
 
 SCENE_GOALS = {

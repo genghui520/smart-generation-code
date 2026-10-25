@@ -11,6 +11,19 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    from scripts.responses_transport import messages_to_responses_input, responses_request
+except ModuleNotFoundError:
+    from responses_transport import messages_to_responses_input, responses_request
+
+try:
+    from scripts.rq1_scenario_tasks import RQ1_SCENARIO_TASKS, baseline_prompt_for_scenario
+except ModuleNotFoundError:  # Supports ``python scripts/run_gpt_engineer_baseline.py``.
+    from rq1_scenario_tasks import RQ1_SCENARIO_TASKS, baseline_prompt_for_scenario
+try:
+    from scripts.baseline_sdk import stage_sdk
+except ModuleNotFoundError:
+    from baseline_sdk import stage_sdk
 
 def _load_dotenv(path: Path) -> None:
     if not path.exists():
@@ -25,10 +38,12 @@ def _load_dotenv(path: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, required=True)
-    parser.add_argument("--prompt", type=Path, required=True)
+    parser.add_argument("--scenario", choices=RQ1_SCENARIO_TASKS, required=True)
+    parser.add_argument("--prompt", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--model", default="gpt-5.6-sol")
+    parser.add_argument("--model", default="gpt-5.5")
     parser.add_argument("--base-url", default="https://fast.smartaipro.cn/v1")
+    parser.add_argument("--api-key-env", default="MY_LLM_API_KEY2")
     parser.add_argument("--temperature", type=float, default=0.1)
     args = parser.parse_args()
 
@@ -37,12 +52,21 @@ def main() -> None:
     generated = output / "generated"
     output.mkdir(parents=True, exist_ok=True)
     generated.mkdir(parents=True, exist_ok=True)
-    prompt_text = args.prompt.read_text(encoding="utf-8")
+    sdk_manifest = stage_sdk(output / "sdk")
+    prompt_text = baseline_prompt_for_scenario(args.scenario, args.prompt)
     (output / "prompt.txt").write_text(prompt_text, encoding="utf-8")
 
-    sys.path.insert(0, str(repo))
+    # Load the pinned checkout bundled with this project, rather than relying
+    # on a separately installed package or the project root itself.
+    framework_repo = repo / "baselines" / "gpt-engineer"
+    if not framework_repo.is_dir():
+        raise SystemExit(f"Pinned GPT-Engineer checkout not found: {framework_repo}")
+    sys.path.insert(0, str(framework_repo))
     _load_dotenv(Path.cwd() / ".env")
-    os.environ["OPENAI_API_KEY"] = os.environ["SMARTAIPRO_API_KEY"]
+    key = os.environ.get(args.api_key_env)
+    if not key:
+        raise SystemExit(f"{args.api_key_env} is required")
+    os.environ["OPENAI_API_KEY"] = key
     os.environ["OPENAI_API_BASE"] = args.base_url
     os.environ["OPENAI_BASE_URL"] = args.base_url
 
@@ -57,10 +81,25 @@ def main() -> None:
 
     class MeasuredAI(AI):
         def backoff_inference(self, messages):
-            response = super().backoff_inference(messages)
-            usage = getattr(response, "usage_metadata", None) or {}
-            usage_rows.append(dict(usage))
-            return response
+            from langchain_core.messages import AIMessage
+
+            instructions, input_text = messages_to_responses_input(messages)
+            result = responses_request(
+                api_key=key,
+                base_url=args.base_url,
+                model=args.model,
+                instructions=instructions,
+                input_text=input_text,
+                reasoning_effort="low",
+            )
+            usage_rows.append(
+                {
+                    "input_tokens": result.usage.get("input_tokens", 0),
+                    "output_tokens": result.usage.get("output_tokens", 0),
+                    "total_tokens": result.usage.get("total_tokens", 0),
+                }
+            )
+            return AIMessage(content=result.text, response_metadata={"usage": result.usage})
 
     started = time.perf_counter()
     started_at = datetime.now(timezone.utc).isoformat()
@@ -85,13 +124,10 @@ def main() -> None:
             target = generated / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
-        estimated = ai.token_usage_log.log()
-        estimated_usage = {
-            "prompt_tokens": sum(x.in_step_prompt_tokens for x in estimated),
-            "completion_tokens": sum(x.in_step_completion_tokens for x in estimated),
-            "total_tokens": sum(x.in_step_total_tokens for x in estimated),
-        }
-    except Exception as exc:
+        # Do not use GPT-Engineer's local tiktoken estimate for this fair
+        # comparison.  Token counts must come only from provider responses.
+        estimated_usage = None
+    except (Exception, SystemExit) as exc:
         error = f"{type(exc).__name__}: {exc}"
         estimated_usage = None
 
@@ -111,14 +147,16 @@ def main() -> None:
         "python": sys.version,
         "model": args.model,
         "base_url": args.base_url,
+        "api_key_env": args.api_key_env,
+        "sdk": sdk_manifest,
         "temperature": args.temperature,
         "code_only": True,
         "simulator_started": False,
         "started_at": started_at,
         "duration_seconds": duration,
         "generated_files": sorted(files),
-        "usage": actual_usage if actual_usage["total_tokens"] else estimated_usage,
-        "usage_source": "provider_response" if actual_usage["total_tokens"] else "gpt_engineer_tiktoken_estimate",
+        "usage": actual_usage if actual_usage["total_tokens"] else None,
+        "usage_source": "provider_response" if actual_usage["total_tokens"] else "unavailable",
         "success": error is None and bool(files),
         "error": error,
     }

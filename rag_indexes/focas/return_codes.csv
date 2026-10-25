@@ -1,0 +1,70 @@
+﻿value,name,same_value_names,cnc_meaning,cnc_handling,pmc_meaning,pmc_handling,api_count,site_url
+-17,EW_PROTOCOL,EW_PROTOCOL,Protocol error (Ethernet version only),"Data from Ethernet Board is incorrect.
+Contact with the service section or the section in charge.",Protocol error (Ethernet version only),"Data from Ethernet Board is incorrect.
+Contact with the service section or the section in charge.",0,https://www.woody.vip/fanuc/errcode.htm
+-16,EW_SOCKET,EW_SOCKET,Socket error (Ethernet version only),"Investigate CNC power supply, Ethernet cable and I/F board.",Socket error (Ethernet version only),"Investigate CNC power supply, Ethernet cable and I/F board.",1,https://www.woody.vip/fanuc/errcode.htm
+-15,EW_NODLL,EW_NODLL,DLL file error,There is no DLL file for each CNC series corresponding to specified node.,DLL file error,There is no DLL file for each CNC series corresponding to specified node.,2,https://www.woody.vip/fanuc/errcode.htm
+-14,EW_INIERR,EW_INIERR,,,,,0,
+-13,EW_ITLOW,EW_ITLOW,,,,,0,
+-12,EW_ITHIGHT,EW_ITHIGHT,,,,,0,
+-11,EW_BUS,EW_BUS,Bus error (HSSB version only),"A bus error of CNC system occurred.
+Contact with the service section or the section in charge.",Bus error (HSSB version only),"A bus error of CNC system occurred.
+Contact with the service section or the section in charge.",0,https://www.woody.vip/fanuc/errcode.htm
+-10,EW_SYSTEM2,EW_SYSTEM2,System error (2) (HSSB version only),"A system error of CNC system occurred.
+Contact with the service section or the section in charge.",System error (2) (HSSB version only),"A system error of CNC system occurred.
+Contact with the service section or the section in charge.",0,https://www.woody.vip/fanuc/errcode.htm
+-9,EW_HSSB,EW_HSSB,Communication error of HSSB (HSSB version only),Investigate the serial line or I/F board of HSSB.,Communication error of HSSB (HSSB version only),Investigate the serial line or I/F board of HSSB.,2,https://www.woody.vip/fanuc/errcode.htm
+-8,EW_HANDLE,EW_HANDLE,Handle number error,Get the library handle number.,Handle number error,Get the library handle number.,4,https://www.woody.vip/fanuc/errcode.htm
+-7,EW_VERSION,EW_VERSION,Version mismatch between the CNC/PMC and library,"The CNC/PMC version does not match that of the library.
+Replace the library or the CNC/PMC control software.",Version mismatch between the CNC/PMC and library,"The CNC/PMC version does not match that of the library.
+Replace the library or the CNC/PMC control software.",14,https://www.woody.vip/fanuc/errcode.htm
+-6,EW_UNEXP,EW_UNEXP,Abnormal library state,"An unanticipated error occurred.
+Contact with the section in charge.",Abnormal library state,"An unanticipated error occurred.
+Contact with the section in charge.",0,https://www.woody.vip/fanuc/errcode.htm
+-5,EW_SYSTEM,EW_SYSTEM,System error (HSSB version only),"A system error of CNC occurred.
+Contact with the service section or the section in charge.",System error (HSSB version only),"A system error of CNC occurred.
+Contact with the service section or the section in charge.",0,https://www.woody.vip/fanuc/errcode.htm
+-4,EW_PARITY,EW_PARITY,Shared RAM parity error (HSSB version only),"A hardware error occurred.
+Contact with the service section.",Shared RAM parity error (HSSB version only),"A hardware error occurred.
+Contact with the service section.",0,https://www.woody.vip/fanuc/errcode.htm
+-3,EW_MMCSYS,EW_MMCSYS,FANUC drivers installation error (HSSB version only),The drivers required for execution are not installed.,FANUC drivers installation error (HSSB version only),The drivers required for execution are not installed.,4,https://www.woody.vip/fanuc/errcode.htm
+-2,EW_RESET,EW_RESET,Reset or stop request,"The RESET or STOP button was pressed.
+Call the termination function.",,,24,https://www.woody.vip/fanuc/errcode.htm
+-1,EW_BUSY,EW_BUSY,Busy,"Wait until the completion of CNC processing, or retry.",,,111,https://www.woody.vip/fanuc/errcode.htm
+0,EW_OK,EW_OK,Normal termination,,Normal termination,,0,https://www.woody.vip/fanuc/errcode.htm
+1,EW_FUNC,EW_FUNC; EW_NOPMC,"Error(function is not executed, or not available)","Specific function which must be executed beforehand has not been executed.
+Otherwise that function is not available.",,,228,https://www.woody.vip/fanuc/errcode.htm
+1,EW_NOPMC,EW_FUNC; EW_NOPMC,,,Error(No PMC),The PMC does not exist.,15,https://www.woody.vip/fanuc/errcode.htm
+2,EW_LENGTH,EW_LENGTH,"Error(data block length error, error of number of data)",Check and correct the data block length or number of data.,Error(data block length error),Check and correct the data block length.,200,https://www.woody.vip/fanuc/errcode.htm
+3,EW_NUMBER,EW_NUMBER; EW_RANGE,Error(data number error),Check and correct the data number.,,,208,https://www.woody.vip/fanuc/errcode.htm
+3,EW_RANGE,EW_NUMBER; EW_RANGE,,,Error(address range error),Check and correct the address range.,18,https://www.woody.vip/fanuc/errcode.htm
+4,EW_ATTRIB,EW_ATTRIB; EW_TYPE,Error(data attribute error),Check and correct the data attribute.,,,144,https://www.woody.vip/fanuc/errcode.htm
+4,EW_TYPE,EW_ATTRIB; EW_TYPE,,,Error(address type/data type error),Check and correct the address type/data type,0,https://www.woody.vip/fanuc/errcode.htm
+5,EW_DATA,EW_DATA,Error(data error),"Check and correct the data.
+For the following operations, this code indicates that the specified program cannot be found.
+Delete specified program
+Search specified program
+Start uploading NC program",Error(data error),Check and correct the data.,230,https://www.woody.vip/fanuc/errcode.htm
+6,EW_NOOPT,EW_NOOPT,Error(no option),There is no corresponding CNC option.,Error(no option),There is no corresponding CNC option.,521,https://www.woody.vip/fanuc/errcode.htm
+7,EW_PROT,EW_PROT,Error(write protection),Write operation is prohibited.,,,85,https://www.woody.vip/fanuc/errcode.htm
+8,EW_OVRFLOW,EW_OVRFLOW,Error(memory overflow),CNC tape memory is overflowed.,,,24,https://www.woody.vip/fanuc/errcode.htm
+9,EW_PARAM,EW_PARAM,Error(CNC parameter error),CNC parameter is set incorrectly.,,,93,https://www.woody.vip/fanuc/errcode.htm
+10,EW_BUFFER,EW_BUFFER,Error(buffer empty/full),"The buffer is empty or full.
+Wait until completion of CNC processing, or retry.",Error(buffer empty/full),"The buffer is empty or full.
+Wait until completion of PMC processing, or retry.
+Alternatively, add the required processing for the PMC.",21,https://www.woody.vip/fanuc/errcode.htm
+11,EW_PATH,EW_PATH,Error(path number error),A path number is incorrect.,,,11,https://www.woody.vip/fanuc/errcode.htm
+12,EW_MODE,EW_MODE,Error(CNC mode error),"The CNC mode is incorrect.
+Correct the CNC mode.",,,46,https://www.woody.vip/fanuc/errcode.htm
+13,EW_REJECT,EW_REJECT,Error(CNC execution rejection),"The execution at the CNC is rejected.
+Check the condition of execution.",,,168,https://www.woody.vip/fanuc/errcode.htm
+14,EW_DTSRVR,EW_DTSRVR,Error(Data server error),Some errors occur at the data server.,,,66,https://www.woody.vip/fanuc/errcode.htm
+15,EW_ALARM,EW_ALARM,Error(alarm),"The function cannot be executed due to an alarm in CNC.
+Remove the cause of alarm.",,,15,https://www.woody.vip/fanuc/errcode.htm
+16,EW_STOP,EW_STOP,Error(stop),CNC status is stop or emergency.,,,2,https://www.woody.vip/fanuc/errcode.htm
+17,EW_PASSWD,EW_PASSWD,Error(State of data protection),Data is protected by the CNC data protection function.,Error(State of data protection),Data is protected by the CNC data protection function.,20,https://www.woody.vip/fanuc/errcode.htm
+18,EW_PMC,EW_PMC,,,,,0,
+19,EW_PMCHANDLE,EW_PMCHANDLE,,,,,0,
+20,EW_RD_OVWSTP,EW_RD_OVWSTP,,,,,0,
+21,EW_RD_RSTFIN,EW_RD_RSTFIN,,,,,0,
+,EW_OVERFLOW,,,,,,1,

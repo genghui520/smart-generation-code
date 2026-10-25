@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from pathlib import Path
 from typing import Any
+import threading
 
 import chromadb
+import numpy as np
 from sentence_transformers import SentenceTransformer
 
 from .models import KnowledgeChunk, RetrievedChunk
@@ -15,11 +19,40 @@ from .utils import tokenize, write_json
 EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
 
 
+_EMBEDDING_MODEL_CACHE: dict[str, SentenceTransformer] = {}
+_EMBEDDING_MODEL_LOCK = threading.Lock()
+
+
+def _shared_sentence_transformer(model_name: str) -> SentenceTransformer:
+    """Load one embedding model per process and share it across RAG stores."""
+    model = _EMBEDDING_MODEL_CACHE.get(model_name)
+    if model is not None:
+        return model
+    with _EMBEDDING_MODEL_LOCK:
+        model = _EMBEDDING_MODEL_CACHE.get(model_name)
+        if model is None:
+            cache_root = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+            safe_name = "models--" + model_name.replace("/", "--")
+            snapshots = cache_root / "hub" / safe_name / "snapshots"
+            local_candidates = [
+                item for item in snapshots.iterdir()
+                if item.is_dir() and (item / "config.json").is_file()
+            ] if snapshots.is_dir() else []
+            resolved_model = str(max(local_candidates, key=lambda item: item.stat().st_mtime)) if local_candidates else model_name
+            model = SentenceTransformer(
+                resolved_model,
+                trust_remote_code=True,
+                local_files_only=resolved_model != model_name,
+            )
+            _EMBEDDING_MODEL_CACHE[model_name] = model
+        return model
+
+
 class _BGEEmbedding:
     """封装 sentence-transformers 用于查询时 embedding。"""
 
     def __init__(self, model_name: str = EMBEDDING_MODEL) -> None:
-        self.model = SentenceTransformer(model_name, trust_remote_code=True)
+        self.model = _shared_sentence_transformer(model_name)
         self.name = model_name
 
     def __call__(self, texts: list[str]) -> list[list[float]]:
@@ -27,6 +60,12 @@ class _BGEEmbedding:
             texts, show_progress_bar=False, normalize_embeddings=True
         )
         return embeddings.tolist()
+
+
+def _metadata_matches(metadata: dict[str, Any], where: dict[str, Any]) -> bool:
+    if "$and" in where:
+        return all(_metadata_matches(metadata, item) for item in where["$and"])
+    return all(metadata.get(key) == value for key, value in where.items())
 
 
 class KnowledgeBase:
@@ -42,6 +81,9 @@ class KnowledgeBase:
         self._collection = None
         self._chroma_client = None
         self._embed_fn = None
+        self._stable_embeddings: np.ndarray | None = None
+        self._stable_records: list[dict[str, Any]] = []
+        self._query_cache: dict[tuple[str, int, str], list[RetrievedChunk]] = {}
 
         if vector_db_dir:
             self._load_vector_db(vector_db_dir)
@@ -54,6 +96,22 @@ class KnowledgeBase:
         if not path.exists():
             print(f"[KnowledgeBase] vector DB not found: {path}")
             return
+        stable_embeddings = path / "stable_embeddings.npy"
+        stable_records = path / "stable_records.jsonl"
+        if stable_embeddings.exists() and stable_records.exists():
+            try:
+                self._stable_embeddings = np.load(stable_embeddings, mmap_mode="r")
+                with stable_records.open("r", encoding="utf-8") as file:
+                    self._stable_records = [json.loads(line) for line in file if line.strip()]
+                self._embed_fn = _BGEEmbedding(EMBEDDING_MODEL)
+                if len(self._stable_records) != len(self._stable_embeddings):
+                    raise ValueError("stable vector/metadata count mismatch")
+                print(f"[KnowledgeBase] loaded stable vector index: {path} ({len(self._stable_records)} docs)")
+                return
+            except Exception as e:
+                print(f"[KnowledgeBase] stable vector index load failed: {e}")
+                self._stable_embeddings = None
+                self._stable_records = []
         self._chroma_client = chromadb.PersistentClient(path=str(path))
         try:
             self._collection = self._chroma_client.get_collection("focas_knowledge")
@@ -66,7 +124,7 @@ class KnowledgeBase:
 
     @property
     def vector_search_available(self) -> bool:
-        return self._collection is not None
+        return self._collection is not None or self._stable_embeddings is not None
 
     # ── 序列化 ────────────────────────────────────────────
 
@@ -116,7 +174,7 @@ class KnowledgeBase:
 
         优先使用 Chroma 向量检索；若不可用则降级到词项匹配。
         """
-        if self._collection is not None:
+        if self.vector_search_available:
             return self._vector_search(query, top_k=top_k)
         return self._term_search(query, top_k=top_k)
 
@@ -124,7 +182,7 @@ class KnowledgeBase:
         self, query: str, scenario: str, *, top_k: int = 3
     ) -> list[RetrievedChunk]:
         """按场景过滤 + 向量检索。"""
-        if self._collection is not None:
+        if self.vector_search_available:
             return self._vector_search(
                 query, top_k=top_k, where={"scenario": scenario}
             )
@@ -140,7 +198,7 @@ class KnowledgeBase:
         self, query: str, rule_type: str, *, top_k: int = 3
     ) -> list[RetrievedChunk]:
         """仅在指定规则类型中检索。"""
-        if self._collection is not None:
+        if self.vector_search_available:
             return self._vector_search(
                 query, top_k=top_k, where={"rule_type": rule_type}
             )
@@ -155,27 +213,124 @@ class KnowledgeBase:
         self, query: str, *, top_k: int = 5
     ) -> list[RetrievedChunk]:
         """仅在 API 函数中检索。"""
-        if self._collection is not None:
+        if self.vector_search_available:
             return self._vector_search(
                 query, top_k=top_k, where={"source_type": "api"}
             )
         return self._term_search(query, top_k=top_k)
 
+    def lookup_api_exact(
+        self,
+        functions: list[str] | tuple[str, ...] | set[str],
+        *,
+        chunk_types: set[str] | None = None,
+    ) -> list[RetrievedChunk]:
+        """Return API documentation only for exact function metadata matches."""
+        wanted = {str(name).strip().casefold() for name in functions if str(name).strip()}
+        if not wanted:
+            return []
+        records: list[dict[str, Any]] = []
+        records.extend({
+            "id": chunk.chunk_id, "text": chunk.text, "metadata": chunk.metadata,
+        } for chunk in self.chunks)
+        records.extend(self._stable_records)
+        if not records and self._collection is not None:
+            for function in sorted(wanted):
+                try:
+                    result = self._collection.get(where={"function": function})
+                except Exception:
+                    continue
+                ids = result.get("ids", [])
+                documents = result.get("documents", [])
+                metadatas = result.get("metadatas", [])
+                records.extend({"id": ids[i], "text": documents[i], "metadata": metadatas[i] or {}}
+                               for i in range(min(len(ids), len(documents), len(metadatas))))
+        found: dict[str, RetrievedChunk] = {}
+        for record in records:
+            metadata = dict(record.get("metadata", {}))
+            if str(metadata.get("function", "")).strip().casefold() not in wanted:
+                continue
+            chunk_type = str(metadata.get("chunk_type", "")).strip()
+            if chunk_types is not None and chunk_type not in chunk_types:
+                continue
+            chunk_id = str(metadata.get("chunk_id", metadata.get("source_chunk_id", record.get("id", ""))))
+            if not chunk_id:
+                continue
+            found.setdefault(chunk_id, RetrievedChunk(
+                KnowledgeChunk(chunk_id=chunk_id, text=str(record.get("text", "")), metadata=metadata),
+                score=1.0,
+            ))
+        return sorted(found.values(), key=lambda item: (
+            str(item.chunk.metadata.get("function", "")).casefold(),
+            str(item.chunk.metadata.get("chunk_type", "")), item.chunk.chunk_id,
+        ))
+
+    def lookup_api_prerequisites_exact(
+        self, functions: list[str] | tuple[str, ...] | set[str],
+    ) -> list[RetrievedChunk]:
+        """Return prerequisite rules whose applies_to contains an exact API name."""
+        wanted = {str(name).strip().casefold() for name in functions if str(name).strip()}
+        if not wanted:
+            return []
+        records: list[dict[str, Any]] = []
+        records.extend({"id": chunk.chunk_id, "text": chunk.text, "metadata": chunk.metadata}
+                       for chunk in self.chunks)
+        records.extend(self._stable_records)
+        if not records and self._collection is not None:
+            try:
+                result = self._collection.get(where={"rule_type": "api_prerequisite"})
+                ids = result.get("ids", [])
+                documents = result.get("documents", [])
+                metadatas = result.get("metadatas", [])
+                records.extend({"id": ids[i], "text": documents[i], "metadata": metadatas[i] or {}}
+                               for i in range(min(len(ids), len(documents), len(metadatas))))
+            except Exception:
+                pass
+        found: dict[str, RetrievedChunk] = {}
+        for record in records:
+            metadata = dict(record.get("metadata", {}))
+            if metadata.get("rule_type") != "api_prerequisite":
+                continue
+            applies = metadata.get("applies_to", [])
+            if isinstance(applies, str):
+                try:
+                    applies = json.loads(applies)
+                except json.JSONDecodeError:
+                    applies = [part.strip() for part in applies.split(",") if part.strip()]
+            if not isinstance(applies, list) or not wanted.intersection(str(name).strip().casefold() for name in applies):
+                continue
+            chunk_id = str(metadata.get("chunk_id", metadata.get("source_chunk_id", record.get("id", ""))))
+            if chunk_id:
+                found.setdefault(chunk_id, RetrievedChunk(
+                    KnowledgeChunk(chunk_id=chunk_id, text=str(record.get("text", "")), metadata=metadata),
+                    score=1.0,
+                ))
+        return sorted(found.values(), key=lambda item: item.chunk.chunk_id)
+
     def search_rules(
         self, query: str, *, top_k: int = 5
     ) -> list[RetrievedChunk]:
         """仅在规则中检索。"""
-        if self._collection is not None:
+        if self.vector_search_available:
             return self._vector_search(
                 query, top_k=top_k, where={"source_type": "rule"}
             )
         return self._term_search(query, top_k=top_k)
 
+    def search_alarms(self, query: str, *, top_k: int = 5) -> list[RetrievedChunk]:
+        """仅检索报警号、报警位和恢复条件知识。"""
+        if self.vector_search_available:
+            return self._vector_search(query, top_k=top_k, where={"source_type": "alarm"})
+        return [
+            item for item in self._term_search(query, top_k=top_k * 4)
+            if item.chunk.metadata.get("source_type") == "alarm"
+        ][:top_k]
+
     def search_scenario_organization(
         self, query: str, scenario: str, *, top_k: int = 2
     ) -> list[RetrievedChunk]:
         """检索场景中心知识组织结果。"""
-        if self._collection is not None:
+        if self.vector_search_available:
             return self._vector_search(
                 query,
                 top_k=top_k,
@@ -192,11 +347,77 @@ class KnowledgeBase:
         top_k: int = 5,
         where: dict[str, Any] | None = None,
     ) -> list[RetrievedChunk]:
-        if self._collection is None or self._embed_fn is None:
+        if self._embed_fn is None:
             return []
+
+        cache_key = (query, min(top_k, 50), json.dumps(where or {}, sort_keys=True, ensure_ascii=False))
+        cached = self._query_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
 
         # 先用模型对 query 做 embedding
         query_emb = self._embed_fn([query])
+
+        if self._stable_embeddings is not None:
+            query_vector = np.asarray(query_emb[0], dtype=np.float32)
+            matrix = np.asarray(self._stable_embeddings)
+            mask = np.ones(len(self._stable_records), dtype=bool)
+            for index, record in enumerate(self._stable_records):
+                metadata = record.get("metadata", {})
+                if where and not _metadata_matches(metadata, where):
+                    mask[index] = False
+            candidate_indices = np.flatnonzero(mask)
+            if not len(candidate_indices):
+                return []
+            scores = matrix[candidate_indices] @ query_vector
+            # Alarm identifiers are exact structured keys; semantic similarity
+            # alone can rank a neighboring alarm higher than the requested one.
+            if where and where.get("source_type") == "alarm":
+                query_tokens = set(re.findall(r"[A-Za-z]+\d{4}|[A-Za-z]+", query))
+                for position, candidate_index in enumerate(candidate_indices):
+                    metadata = self._stable_records[int(candidate_index)].get("metadata", {})
+                    code = str(metadata.get("alarm_code", "")).upper()
+                    prefix = str(metadata.get("alarm_prefix", "")).upper()
+                    if code and code in {token.upper() for token in query_tokens}:
+                        scores[position] += 2.0
+                    elif prefix and prefix in {token.upper() for token in query_tokens}:
+                        scores[position] += 0.5
+            # Per-function prerequisite rules are indexed by exact FOCAS
+            # function name; semantic similarity alone cannot discriminate
+            # "cnc_rdgrpid" from its subword-neighbors, so boost rules whose
+            # applies_to contains a function named verbatim in the query.
+            if where and where.get("rule_type") == "api_prerequisite":
+                query_tokens = {t.lower() for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", query)}
+                for position, candidate_index in enumerate(candidate_indices):
+                    metadata = self._stable_records[int(candidate_index)].get("metadata", {})
+                    applies_raw = metadata.get("applies_to", "")
+                    if isinstance(applies_raw, str):
+                        try:
+                            applies = json.loads(applies_raw)
+                        except json.JSONDecodeError:
+                            applies = []
+                    else:
+                        applies = applies_raw or []
+                    if isinstance(applies, list) and any(
+                        str(item).strip().lower() in query_tokens for item in applies
+                    ):
+                        scores[position] += 2.0
+            order = np.argsort(-scores)[: min(top_k, 50)]
+            retrieved = []
+            for position in order:
+                record = self._stable_records[int(candidate_indices[position])]
+                metadata = dict(record.get("metadata", {}))
+                chunk = KnowledgeChunk(
+                    chunk_id=metadata.get("chunk_id", metadata.get("source_chunk_id", record.get("id", ""))),
+                    text=str(record.get("text", "")),
+                    metadata=metadata,
+                )
+                retrieved.append(RetrievedChunk(chunk=chunk, score=round(float(scores[position]), 4)))
+            self._query_cache[cache_key] = list(retrieved)
+            return retrieved
+
+        if self._collection is None:
+            return []
 
         params: dict[str, Any] = {
             "query_embeddings": query_emb,
@@ -229,7 +450,11 @@ class KnowledgeBase:
             score = max(0.0, 1.0 - dist / 2.0)
             retrieved.append(RetrievedChunk(chunk=chunk, score=round(score, 4)))
 
+        if len(self._query_cache) >= 256:
+            self._query_cache.pop(next(iter(self._query_cache)))
+        self._query_cache[cache_key] = list(retrieved)
         return retrieved
+
 
     # ── 词项匹配降级 ──────────────────────────────────────
 

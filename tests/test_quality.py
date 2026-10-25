@@ -40,6 +40,22 @@ def plan_requiring_feed_variation() -> ExecutionPlan:
 
 
 class TrafficQualityTests(unittest.TestCase):
+    def test_paused_state_and_failed_outputs_are_not_motion_evidence(self) -> None:
+        def log(status, data, interface="ReadRunStatus"):
+            return ApiCallLog(timestamp="t", task_id="q", step_id="S", phase="during",
+                              interface_name=interface, input_parameters={}, status_code=status,
+                              response={"data": data})
+        metrics = collect_quality_metrics([
+            log(0, "run=1;motion=0"),
+            log(12, "run=3;motion=1"),
+            log(5, "actual_feed=100", "ReadFeedSpeed"),
+        ])
+        self.assertEqual(metrics["run_active_count"], 0)
+        self.assertEqual(metrics["motion_active_count"], 0)
+        self.assertEqual(metrics["feed_sample_count"], 0)
+        active = collect_quality_metrics([log(0, "run=3;motion=1")])
+        self.assertEqual(active["run_active_count"], 1)
+
     def test_flags_constant_feed_and_position_as_replan_issue(self) -> None:
         logs = [
             ApiCallLog(
@@ -79,8 +95,8 @@ class TrafficQualityTests(unittest.TestCase):
 
         assessment = build_quality_observation(plan_requiring_feed_variation(), result)
 
-        self.assertTrue(assessment.passed)
-        self.assertEqual(assessment.issues, [])
+        self.assertFalse(assessment.passed)
+        self.assertTrue(any("position/feed/status" in issue for issue in assessment.issues))
         self.assertEqual(assessment.metrics["feed_sample_count"], 3)
         self.assertEqual(assessment.metrics["feed_unique_count"], 1)
         self.assertEqual(assessment.metrics["position_sample_count"], 3)

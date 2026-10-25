@@ -13,7 +13,7 @@ from smart_traffic_agent.agent_tools import (
     RunExecutableOutput,
     RunGeneratedExecutableTool,
 )
-from smart_traffic_agent.agents.executor import ExecutionAgent
+from smart_traffic_agent.agents.executor import ExecutionAgent, generated_cpp_log_is_nonfatal
 from smart_traffic_agent.models import (
     ApiCallLog,
     ExecutionPlan,
@@ -82,6 +82,18 @@ class RecordingCollectTool(CollectExecutionArtifactsTool):
 
 
 class ExecutionToolOrchestrationTests(unittest.TestCase):
+    def test_matched_unsupported_api_response_is_evidence_not_fatal(self) -> None:
+        log = ApiCallLog(
+            timestamp="t", task_id="batch", step_id="S001", phase="during",
+            interface_name="cnc_cdownload", protocol_function="cnc_cdownload",
+            input_parameters={}, status_code=1,
+            response={"return_text": "EW_FUNC"}, error="EW_FUNC",
+            traffic_status="matched",
+        )
+        self.assertTrue(generated_cpp_log_is_nonfatal(log))
+        log.traffic_status = "no_corresponding_traffic"
+        self.assertFalse(generated_cpp_log_is_nonfatal(log))
+
     def make_state(self, root: Path) -> WorkflowState:
         source = root / "generated" / "api_script.cpp"
         source.parent.mkdir(parents=True, exist_ok=True)
@@ -149,6 +161,47 @@ class ExecutionToolOrchestrationTests(unittest.TestCase):
             self.assertIn("compilation failed", state.result.errors[0])
             self.assertEqual(len(state.result.tool_calls), 1)
 
+    def test_fragment_is_copied_into_execution_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = self.make_state(root)
+            fragment = root / "generated" / "scenario_fragment.inc"
+            fragment.write_text("// scenario\n", encoding="utf-8")
+            state.artifacts.fragment_path = fragment
+            calls: list[str] = []
+
+            ExecutionAgent(
+                compile_tool=RecordingCompileTool(calls),
+                run_tool=RecordingRunTool(calls),
+                collect_tool=RecordingCollectTool(calls),
+            ).run(state, root / "run")
+
+            copied = root / "run" / "execution" / "scenario_fragment.inc"
+            self.assertTrue(copied.exists())
+            self.assertEqual(copied.read_text(encoding="utf-8"), "// scenario\n")
+
+    def test_compile_tool_sees_fragment_include_in_execution_workdir(self) -> None:
+        class IncludeCheckingCompileTool(RecordingCompileTool):
+            def invoke(self, tool_input):
+                if not (tool_input.work_dir / "scenario_fragment.inc").exists():
+                    return CompileCppOutput(2, "", "scenario_fragment.inc: include file not found", tool_input.executable_path)
+                return super().invoke(tool_input)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = self.make_state(root)
+            fragment = root / "generated" / "scenario_fragment.inc"
+            fragment.write_text("// scenario\n", encoding="utf-8")
+            state.artifacts.fragment_path = fragment
+            calls: list[str] = []
+            state = ExecutionAgent(
+                compile_tool=IncludeCheckingCompileTool(calls),
+                run_tool=RecordingRunTool(calls),
+                collect_tool=RecordingCollectTool(calls),
+            ).run(state, root / "run")
+
+            self.assertTrue(state.result.success)
+
 
 class CppToolchainPathTests(unittest.TestCase):
     def test_env_path_list_parses_visual_studio_style_semicolon_paths(self) -> None:
@@ -181,7 +234,7 @@ class CppToolchainPathTests(unittest.TestCase):
 
             errors = validate_pcap_artifacts(data_dir)
 
-        self.assertTrue(any("24 bytes or smaller" in item for item in errors))
+        self.assertTrue(any("no valid packet records or classic PCAP headers" in item for item in errors))
 
     def test_pcap_validation_accepts_packet_records_beyond_global_header(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -279,18 +332,21 @@ class CppToolchainPathTests(unittest.TestCase):
 
             read_cpp_csv_logs("task", execution_dir)
 
-            actf_csv = data_dir / "by_api" / "20260716_cnc_actf.csv"
-            stat_csv = data_dir / "by_api" / "20260716_cnc_statinfo.csv"
+            actf_input_csv = data_dir / "by_api" / "20260716_focas_actf_input.csv"
+            actf_output_csv = data_dir / "by_api" / "20260716_focas_actf_output.csv"
+            stat_input_csv = data_dir / "by_api" / "20260716_focas_statinfo_input.csv"
+            stat_output_csv = data_dir / "by_api" / "20260716_focas_statinfo_output.csv"
             descriptive_input_csv = data_dir / "20260716_input.csv"
             descriptive_output_csv = data_dir / "20260716_output.csv"
-            self.assertTrue(actf_csv.exists())
-            self.assertTrue(stat_csv.exists())
+            self.assertTrue(actf_input_csv.exists())
+            self.assertTrue(actf_output_csv.exists())
+            self.assertTrue(stat_input_csv.exists())
+            self.assertTrue(stat_output_csv.exists())
             self.assertTrue(descriptive_input_csv.exists())
             self.assertTrue(descriptive_output_csv.exists())
-            actf_text = actf_csv.read_text(encoding="utf-8-sig")
-            self.assertIn("handle=1", actf_text)
-            self.assertIn("actual_feed=120", actf_text)
-            self.assertIn(",2,", actf_text)
+            self.assertIn("handle=1", actf_input_csv.read_text(encoding="utf-8-sig"))
+            self.assertIn("actual_feed=120", actf_output_csv.read_text(encoding="utf-8-sig"))
+            self.assertIn(",2,", actf_input_csv.read_text(encoding="utf-8-sig"))
 
     def test_collect_removes_stale_per_api_csvs_from_previous_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -316,7 +372,8 @@ class CppToolchainPathTests(unittest.TestCase):
             read_cpp_csv_logs("task", execution_dir)
 
             self.assertFalse(stale.exists())
-            self.assertTrue(list(by_api_dir.glob("*_cnc_statinfo.csv")))
+            self.assertTrue(list(by_api_dir.glob("*_focas_statinfo_input.csv")))
+            self.assertTrue(list(by_api_dir.glob("*_focas_statinfo_output.csv")))
 
     def test_safe_csv_filename_truncates_long_aggregate_api_names(self) -> None:
         name = "cnc_exaxisname -> cnc_exaxisname2 -> cnc_rdspdlname -> cnc_rdmdiprgstat -> cnc_rdmdipntr"

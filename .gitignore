@@ -9,6 +9,8 @@ __pycache__/
 *.exe
 
 .pytest_cache/
+.pytest-tmp*/
+.test_tmp/
 .mypy_cache/
 .ruff_cache/
 
@@ -21,10 +23,17 @@ nc_programs/
 tmp/
 tools/
 rag_indexes/focas/repair_memory_vector_db/
+rag_indexes/focas/vector_db_pdf*/
+rag_indexes/focas/vector_db_stale_*/
+inventcom_output/
+smart_traffic_agent/_focas_capture_runtime_legacy.dat
+*.csv.lock
 
 # Generated RAG artifacts. Rebuild them with the CLI commands in README.md.
 rag_indexes/focas/*.jsonl
 !rag_indexes/focas/*.sample.jsonl
+!rag_indexes/focas/api_return_codes.jsonl
+!rag_indexes/focas/return_code_chunks.jsonl
 rag_indexes/focas/rule_extraction_batches/
 rag_indexes/focas/rule_extraction_results/
 rag_indexes/focas/vector_db/

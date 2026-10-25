@@ -19,6 +19,19 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    from scripts.responses_transport import messages_to_responses_input, responses_request
+except ModuleNotFoundError:
+    from responses_transport import messages_to_responses_input, responses_request
+
+try:
+    from scripts.rq1_scenario_tasks import RQ1_SCENARIO_TASKS, baseline_prompt_for_scenario
+except ModuleNotFoundError:  # Supports ``python scripts/run_chatdev1_baseline.py``.
+    from rq1_scenario_tasks import RQ1_SCENARIO_TASKS, baseline_prompt_for_scenario
+try:
+    from scripts.baseline_sdk import stage_sdk
+except ModuleNotFoundError:
+    from baseline_sdk import stage_sdk
 
 def _load_dotenv(path: Path) -> None:
     if not path.exists():
@@ -46,22 +59,25 @@ def _usage_from_log(path: Path) -> dict[str, int]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, required=True)
-    parser.add_argument("--prompt", type=Path, required=True)
+    parser.add_argument("--scenario", choices=RQ1_SCENARIO_TASKS, required=True)
+    parser.add_argument("--prompt", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--model", default="gpt-5.6-sol")
+    parser.add_argument("--model", default="gpt-5.5")
     parser.add_argument("--base-url", default="https://fast.smartaipro.cn/v1")
+    parser.add_argument("--api-key-env", default="MY_LLM_API_KEY2")
     parser.add_argument("--temperature", type=float, default=0.1)
     args = parser.parse_args()
 
     repo = args.repo.resolve()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    prompt_text = args.prompt.read_text(encoding="utf-8")
+    prompt_text = baseline_prompt_for_scenario(args.scenario, args.prompt)
     (output / "prompt.txt").write_text(prompt_text, encoding="utf-8")
+    sdk_manifest = stage_sdk(output / "sdk")
     _load_dotenv(Path.cwd() / ".env")
-    key = os.environ.get("SMARTAIPRO_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    key = os.environ.get(args.api_key_env)
     if not key:
-        raise SystemExit("SMARTAIPRO_API_KEY or OPENAI_API_KEY is required")
+        raise SystemExit(f"{args.api_key_env} is required")
     os.environ["OPENAI_API_KEY"] = key
     os.environ["BASE_URL"] = args.base_url
     sys.path.insert(0, str(repo))
@@ -86,14 +102,23 @@ def main() -> None:
         config = dict(self.model_config_dict)
         config["temperature"] = args.temperature
         config.pop("max_tokens", None)
-        response = openai.OpenAI(api_key=key, base_url=args.base_url).chat.completions.create(
-            *call_args, **kwargs, model=args.model, **config
+        messages = kwargs.get("messages")
+        if messages is None and call_args:
+            messages = call_args[0]
+        instructions, input_text = messages_to_responses_input(messages or [])
+        result = responses_request(
+            api_key=key,
+            base_url=args.base_url,
+            model=args.model,
+            instructions=instructions,
+            input_text=input_text,
+            reasoning_effort="low",
         )
-        usage = response.usage
+        usage = result.usage
         row = {
-            "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
-            "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
-            "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+            "prompt_tokens": int(usage.get("input_tokens", 0) or 0),
+            "completion_tokens": int(usage.get("output_tokens", 0) or 0),
+            "total_tokens": int(usage.get("total_tokens", 0) or 0),
         }
         usage_rows.append(row)
         from chatdev.utils import log_visualize
@@ -106,15 +131,31 @@ def main() -> None:
         # openai>=1.35 adds ``refusal`` to ChatCompletionMessage.  ChatDev
         # 1.0 expands the message into its older dataclass, which does not
         # accept that field, so expose the exact legacy four-field mapping.
-        for choice in response.choices:
-            message = choice.message
-            choice.message = {
-                "role": message.role,
-                "content": message.content or "",
-                "function_call": message.function_call,
-                "tool_calls": message.tool_calls,
+        from openai.types.chat import ChatCompletion
+
+        return ChatCompletion.model_validate(
+            {
+                "id": result.response_id or "responses-baseline",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": args.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": result.text,
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": row["prompt_tokens"],
+                    "completion_tokens": row["completion_tokens"],
+                    "total_tokens": row["total_tokens"],
+                },
             }
-        return response
+        )
 
     model_backend.OpenAIModel.run = compatible_run
     # The old wrapper retries all exceptions, including deterministic schema
@@ -151,6 +192,10 @@ def main() -> None:
         )
         chain.pre_processing()
         project_path = Path(chain.chat_env.env_dict["directory"])
+        # Stage only the shared official SDK before the first phase/model call.
+        # Historical WareHouse projects and project-level FOCAS examples are
+        # never copied into this fresh workspace.
+        sdk_manifest = stage_sdk(project_path / "sdk")
         chain.make_recruitment()
         chain.execute_chain()
         try:
@@ -172,6 +217,8 @@ def main() -> None:
     }
     if not usage["total_tokens"] and chain is not None:
         usage = _usage_from_log(Path(chain.log_filepath))
+    if not usage["total_tokens"]:
+        usage = None
     generated_sources = []
     if generated.exists():
         generated_sources = [
@@ -189,6 +236,8 @@ def main() -> None:
         "model": args.model,
         "transport_adapter": "OpenAI-compatible runtime adapter; ChatDev roles/phases unchanged",
         "base_url": args.base_url,
+        "api_key_env": args.api_key_env,
+        "sdk": sdk_manifest,
         "temperature": args.temperature,
         "code_only": True,
         "simulator_started": False,
@@ -196,7 +245,7 @@ def main() -> None:
         "duration_seconds": time.perf_counter() - started,
         "generated_root": str(project_path) if project_path else None,
         "usage": usage,
-        "usage_source": "provider_response",
+        "usage_source": "provider_response" if usage is not None else "unavailable",
         "success": error is None and bool(generated_sources),
         "generated_files": generated_sources,
         "error": error,

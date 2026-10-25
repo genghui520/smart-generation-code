@@ -9,29 +9,12 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    from scripts.rq1_scenario_tasks import RQ1_SCENARIO_TASKS
+except ModuleNotFoundError:  # Supports ``python scripts/run_rq1_smpagent.py``.
+    from rq1_scenario_tasks import RQ1_SCENARIO_TASKS
 
-SCENARIOS = {
-    "coordinate_motion": (
-        "Generate a complete FOCAS client for the Coordinate Motion scenario. "
-        "The client must connect to 127.0.0.1:8193, read CNC run status, actual feed, "
-        "and absolute X/Y/Z position, and include a documented bounded NC program "
-        "with G90, G54, G00, multiple G01 blocks with multiple feed values, and M30."
-    ),
-    "program_management": (
-        "Generate a complete FOCAS client for the Program Management scenario. "
-        "The client must connect to 127.0.0.1:8193, safely upload or document a bounded "
-        "NC program, select and verify its O-number, read CNC run status and program "
-        "number, and include complete return-code handling and cleanup. Use only documented "
-        "FANUC FOCAS APIs and a valid NC program payload ending in M30."
-    ),
-    "tool_management": (
-        "Generate a complete FOCAS client for the Tool Management scenario. "
-        "The client must connect to 127.0.0.1:8193, read relevant CNC status and tool or "
-        "offset information using documented FANUC FOCAS APIs, perform only bounded and "
-        "explicitly safe operations, check every return code, and cleanly release the "
-        "FOCAS handle. Include a complete documented NC context when required by the API."
-    ),
-}
+SCENARIOS = RQ1_SCENARIO_TASKS
 
 
 def run_one(
@@ -44,6 +27,7 @@ def run_one(
     base_url: str,
     api_key_env: str,
     timeout_seconds: float,
+    temperature: float,
 ) -> dict[str, object]:
     scenario_dir = output_root / "SMPAgent" / scenario
     scenario_dir.mkdir(parents=True, exist_ok=True)
@@ -64,6 +48,7 @@ def run_one(
         "--no-quality-gate",
         "--representative-scenario",
         "--no-allow-delete-all-programs",
+        "--no-historical-memory",
         "--llm-provider",
         "openai_compatible",
         "--llm-model",
@@ -80,6 +65,8 @@ def run_one(
         "low",
         "--llm-timeout-seconds",
         str(timeout_seconds),
+        "--temperature",
+        str(temperature),
     ]
     started = time.perf_counter()
     started_at = datetime.now(timezone.utc).isoformat()
@@ -125,9 +112,10 @@ def main() -> int:
     parser.add_argument("--scenario", choices=["all", *SCENARIOS], default="all")
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--model", default="gpt-5.5")
-    parser.add_argument("--base-url", default="https://iiegpt.gentelmen.cn")
-    parser.add_argument("--api-key-env", default="MY_LLM_API_KEY")
+    parser.add_argument("--base-url", default="https://fast.smartaipro.cn/v1")
+    parser.add_argument("--api-key-env", default="MY_LLM_API_KEY2")
     parser.add_argument("--timeout-seconds", type=float, default=300.0)
+    parser.add_argument("--temperature", type=float, default=0.1)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     scenarios = list(SCENARIOS) if args.scenario == "all" else [args.scenario]
@@ -146,6 +134,7 @@ def main() -> int:
                 base_url=args.base_url,
                 api_key_env=args.api_key_env,
                 timeout_seconds=args.timeout_seconds,
+                temperature=args.temperature,
             )
             records.append(record)
             print(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -12,7 +13,14 @@ from pathlib import Path
 from typing import Any
 
 from ..integrations.ncguide import default_focas_header_dir
+from ..dataset_export import export_legacy_dataset, remove_previous_export_files
 from ..models import ApiCallLog, CaptureEvent, utc_now
+from ..traffic_transactions import (
+    FOCAS_API,
+    build_protocol_transactions,
+    read_classic_pcap_tcp_payloads,
+    write_jsonl as write_transaction_jsonl,
+)
 from ..tools import semantic_label_for
 from .base import AgentTool
 
@@ -417,12 +425,13 @@ def read_cpp_csv_logs(task_id: str, execution_dir: Path) -> CollectExecutionArti
     if schema_errors:
         remove_derived_api_csvs(combined_path, per_api_dir)
     else:
+        remove_derived_api_csvs(combined_path, per_api_dir)
         write_combined_api_csv(inputs, outputs, combined_path)
         remove_stale_descriptive_raw_csv_copies(execution_dir / "data")
         write_descriptive_raw_csv_copies(input_path, output_path, execution_dir / "data", export_prefix)
-        write_per_api_csvs(inputs, outputs, per_api_dir, export_prefix=export_prefix)
     api_logs: list[ApiCallLog] = []
     capture_events: list[CaptureEvent] = []
+    invocation_rows: list[dict[str, Any]] = []
     for index, out_row in sorted(outputs.items(), key=lambda item: int(item[0])):
         in_row = inputs.get(index, {})
         api_name = (
@@ -434,7 +443,7 @@ def read_cpp_csv_logs(task_id: str, execution_dir: Path) -> CollectExecutionArti
         )
         interface_name = interface_from_focas(api_name)
         step_id = out_row.get("step_id") or in_row.get("step_id") or f"CPP-{index}"
-        phase = in_row.get("phase", "during")
+        phase = normalize_phase(in_row.get("phase", "during"))
         params = {
             "raw": in_row.get("parameters", ""),
             "api_parameter_count": safe_status_code(
@@ -446,6 +455,15 @@ def read_cpp_csv_logs(task_id: str, execution_dir: Path) -> CollectExecutionArti
         }
         status_code = safe_status_code(out_row.get("return_code") or out_row.get("status_code"))
         timestamp = out_row.get("timestamp") or in_row.get("timestamp") or utc_now()
+        invocation_id = (
+            in_row.get("invocation_id")
+            or out_row.get("invocation_id")
+            or f"{task_id}-invocation-{int(index):06d}"
+        )
+        candidate_transaction_id = in_row.get("transaction_id") or out_row.get("transaction_id") or ""
+        start_timestamp_ns = safe_int(in_row.get("start_timestamp_ns"))
+        end_timestamp_ns = safe_int(out_row.get("end_timestamp_ns"))
+        device_context = parse_device_context(in_row.get("device_context", ""), phase)
         request_payload = {
             "api_name": api_name,
             "step_id": step_id,
@@ -498,8 +516,72 @@ def read_cpp_csv_logs(task_id: str, execution_dir: Path) -> CollectExecutionArti
                 protocol_function=api_name,
                 semantic_label=semantic_label_for(interface_name),
                 error=None if status_code == 0 else response_payload["return_text"],
+                invocation_id=invocation_id,
+                transaction_id=None,
+                start_timestamp_ns=start_timestamp_ns or None,
+                end_timestamp_ns=end_timestamp_ns or None,
+                device_context=device_context,
+                traffic_status="pending_transaction_mapping" if FOCAS_API.fullmatch(api_name) else "not_applicable",
             )
         )
+        if FOCAS_API.fullmatch(api_name):
+            invocation_rows.append({
+                "invocation_id": invocation_id,
+                "transaction_id": candidate_transaction_id,
+                "api": api_name,
+                "input_parameters": parameter_payload_only(in_row.get("parameters", "")),
+                "api_parameter_count": params["api_parameter_count"],
+                "output_data": parameter_payload_only(out_row.get("data") or out_row.get("response", "")),
+                "return_code": status_code,
+                "phase": phase,
+                "log_timestamp": timestamp,
+                "start_timestamp_ns": start_timestamp_ns,
+                "end_timestamp_ns": end_timestamp_ns,
+                "device_context": device_context,
+                "annotation": semantic_label_for(interface_name),
+            })
+    pcap_path, pcap_discovery_errors = discover_capture_pcap(execution_dir / "data", outputs)
+    schema_errors.extend(pcap_discovery_errors)
+    tcp_payloads = read_classic_pcap_tcp_payloads(pcap_path) if pcap_path else []
+    focas_port = infer_focas_port(invocation_rows)
+    transactions, transaction_by_invocation = build_protocol_transactions(
+        invocation_rows, tcp_payloads, focas_port=focas_port
+    )
+    write_transaction_jsonl(execution_dir / "protocol_transactions.jsonl", transactions)
+    if not schema_errors:
+        export_legacy_dataset(
+            execution_dir, invocation_rows, transactions, pcap_path,
+            output_root=per_api_dir,
+            focas_port=focas_port,
+        )
+    for log in api_logs:
+        transaction = transaction_by_invocation.get(log.invocation_id)
+        if transaction is None:
+            continue
+        log.transaction_id = transaction.get("transaction_id")
+        log.traffic_status = str(transaction.get("traffic_status", "no_corresponding_traffic"))
+        if transaction.get("traffic_analysis"):
+            log.response["traffic_analysis"] = transaction["traffic_analysis"]
+        if transaction.get("session_traffic"):
+            log.response["session_traffic"] = transaction["session_traffic"]
+    for index, in_row in inputs.items():
+        if index in outputs:
+            continue
+        api_name = in_row.get("protocol_function") or in_row.get("api_name") or ""
+        if not FOCAS_API.fullmatch(api_name):
+            continue
+        api_logs.append(ApiCallLog(
+            timestamp=in_row.get("timestamp") or utc_now(), task_id=task_id,
+            step_id=in_row.get("step_id") or f"CPP-{index}", phase="during",
+            interface_name=interface_from_focas(api_name), protocol_function=api_name,
+            input_parameters={"raw": in_row.get("parameters", "")}, status_code=500,
+            response={"executor": "generated_cpp", "output_valid": False, "incomplete_call": True},
+            semantic_label=semantic_label_for(interface_from_focas(api_name)),
+            error=f"API_CALL_INCOMPLETE: {api_name} input recorded but no return row; process crashed or was interrupted",
+            invocation_id=in_row.get("invocation_id") or f"{task_id}-incomplete-{index}",
+            start_timestamp_ns=safe_int(in_row.get("start_timestamp_ns")) or None,
+            traffic_status="incomplete_call",
+        ))
     if schema_errors:
         api_logs.append(
             ApiCallLog(
@@ -517,6 +599,63 @@ def read_cpp_csv_logs(task_id: str, execution_dir: Path) -> CollectExecutionArti
             )
         )
     return CollectExecutionArtifactsOutput(api_logs, capture_events, schema_errors)
+
+
+def discover_capture_pcap(data_dir: Path, outputs: dict[str, dict[str, str]]) -> tuple[Path | None, list[str]]:
+    """Follow the explicit capture artifact; reject traversal and ambiguous files."""
+    available = [path for path in data_dir.glob("*.pcap") if path.is_file() and path.stat().st_size > 24]
+    declared: set[Path] = set()
+    for row in outputs.values():
+        for name in re.findall(r"(?:pcap_file|pcap_path)=([^;\r\n]+)", row.get("data", "") or row.get("response", "")):
+            path = Path(name.strip())
+            candidate = path if path.is_absolute() else (data_dir / path if len(path.parts) == 1 else data_dir.parent / path)
+            candidate = candidate.resolve()
+            if not candidate.is_relative_to(data_dir.resolve()):
+                return None, ["PCAP capture validation: declared capture path escapes execution data directory."]
+            if candidate in {path.resolve() for path in available}:
+                declared.add(candidate)
+    candidates = sorted(declared) if declared else available
+    if len(candidates) == 1:
+        return candidates[0], []
+    if len(candidates) > 1:
+        return None, ["PCAP capture validation: multiple capture files without one unambiguous declared artifact."]
+    return None, []
+
+
+def safe_int(value: Any) -> int:
+    try:
+        return int(str(value or "0"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalize_phase(value: Any) -> str:
+    lowered = str(value or "during").strip().lower()
+    return {"before": "Before", "after": "After"}.get(lowered, "During")
+
+
+def parse_device_context(value: Any, phase: str) -> dict[str, Any]:
+    if isinstance(value, dict):
+        context = dict(value)
+    else:
+        context = {}
+        for item in str(value or "").split(";"):
+            if "=" in item:
+                key, raw = item.split("=", 1)
+                context[key.strip()] = raw.strip()
+    context.setdefault("target", "NCGuide")
+    context.setdefault("phase", phase)
+    return context
+
+
+def infer_focas_port(rows: list[dict[str, Any]]) -> int:
+    for row in rows:
+        parameters = row.get("input_parameters", "")
+        raw = str(parameters.get("raw", "")) if isinstance(parameters, dict) else str(parameters)
+        match = re.search(r"(?:^|;)port=(\d+)(?:;|$)", raw)
+        if match:
+            return int(match.group(1))
+    return 8193
 
 
 def write_combined_api_csv(
@@ -585,6 +724,7 @@ def remove_derived_api_csvs(combined_path: Path, per_api_dir: Path) -> None:
         pass
     if not per_api_dir.exists():
         return
+    remove_previous_export_files(per_api_dir, per_api_dir / "dataset")
     for path in per_api_dir.glob("*.csv"):
         try:
             path.unlink()
@@ -592,84 +732,10 @@ def remove_derived_api_csvs(combined_path: Path, per_api_dir: Path) -> None:
             pass
 
 
-def write_per_api_csvs(
-    inputs: dict[str, dict[str, str]],
-    outputs: dict[str, dict[str, str]],
-    output_dir: Path,
-    *,
-    export_prefix: str = "",
-) -> None:
-    """Write one CSV per API/helper name, with input and output side-by-side."""
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for stale_csv in output_dir.glob("*.csv"):
-        try:
-            stale_csv.unlink()
-        except OSError:
-            pass
-    rows_by_api: dict[str, list[dict[str, str]]] = {}
-    indexes = sorted(
-        set(inputs) | set(outputs),
-        key=lambda value: int(value) if str(value).isdigit() else 10**9,
-    )
-    for index in indexes:
-        in_row = inputs.get(index, {})
-        out_row = outputs.get(index, {})
-        api_name = (
-            out_row.get("api_name")
-            or out_row.get("protocol_function")
-            or in_row.get("protocol_function")
-            or in_row.get("interface_name")
-            or "unknown_api"
-        )
-        row = {
-            "index": index,
-            "timestamp": out_row.get("timestamp") or in_row.get("timestamp") or "",
-            "step_id": out_row.get("step_id") or in_row.get("step_id") or "",
-            "interface_name": in_row.get("interface_name") or interface_from_focas(api_name),
-            "protocol_function": api_name,
-            "api_parameter_count": (
-                in_row.get("api_parameter_count")
-                or out_row.get("api_parameter_count")
-                or in_row.get("parameter_count")
-                or str(api_parameter_count_for_name(api_name))
-            ),
-            "input_parameters": parameter_payload_only(in_row.get("parameters", "")),
-            "return_code": out_row.get("return_code") or out_row.get("status_code") or "",
-            "return_text": out_row.get("return_text") or out_row.get("error", ""),
-            "output_data": parameter_payload_only(out_row.get("data") or out_row.get("response", "")),
-        }
-        rows_by_api.setdefault(api_name, []).append(row)
-
-    fieldnames = [
-        "index",
-        "timestamp",
-        "step_id",
-        "interface_name",
-        "protocol_function",
-        "api_parameter_count",
-        "input_parameters",
-        "return_code",
-        "return_text",
-        "output_data",
-    ]
-    for api_name, rows in rows_by_api.items():
-        filename = f"{safe_csv_filename(export_prefix + '_' if export_prefix else '')}{safe_csv_filename(api_name)}.csv"
-        path = output_dir / filename
-        try:
-            with path.open("w", encoding="utf-8-sig", newline="") as file:
-                writer = csv.DictWriter(file, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(rows)
-        except PermissionError:
-            # Windows commonly keeps CSVs locked while they are open in an
-            # editor/Excel preview.  Do not let one locked derived file
-            # prevent the rest of the per-API dataset from being written.
-            continue
-
-
 CSV_PARAMETER_METADATA_KEYS = {
     "coverage_role",
+    "pcap_capture_enabled",
+    "pcap_capture_started",
     "phase",
     "planner_selected_api",
     "sample_role",
@@ -812,10 +878,10 @@ def validate_pcap_artifacts(data_dir: Path, output_path: Path | None = None) -> 
     if not pcap_files:
         return ["PCAP capture validation: no .pcap artifacts were produced."]
     nonempty_packet_files = [path for path in pcap_files if path.stat().st_size > 24]
-    if not nonempty_packet_files:
+    header_only_files = [path for path in pcap_files if _is_classic_pcap_header(path)]
+    if not nonempty_packet_files and not header_only_files:
         return [
-            "PCAP capture validation: all .pcap artifacts are 24 bytes or smaller, "
-            "which indicates empty header-only marker files rather than captured packets."
+            "PCAP capture validation: no valid packet records or classic PCAP headers were saved."
         ]
     if output_path is not None and output_path.exists():
         csv_text = output_path.read_text(encoding="utf-8-sig", errors="replace").casefold()
@@ -830,15 +896,36 @@ def validate_pcap_artifacts(data_dir: Path, output_path: Path | None = None) -> 
                 "or pcap_capture_started=true for this execution."
             ]
         output_mtime = output_path.stat().st_mtime
-        fresh_packet_files = [
-            path for path in nonempty_packet_files if abs(output_mtime - path.stat().st_mtime) <= 180
-        ]
-        if not fresh_packet_files:
+        fresh_packet_files = [path for path in nonempty_packet_files
+                              if abs(output_mtime - path.stat().st_mtime) <= 180]
+        fresh_headers = [path for path in header_only_files
+                         if abs(output_mtime - path.stat().st_mtime) <= 180]
+        if nonempty_packet_files and not fresh_packet_files:
             return [
                 "PCAP capture validation: non-empty .pcap files exist, but none were modified near the "
                 "current focas_api_output.csv timestamp; refusing to reuse stale capture files."
             ]
+        if not nonempty_packet_files and (not fresh_headers or
+                "pcap_capture_enabled=true" not in csv_text and "pcap_capture_started=true" not in csv_text):
+            return [
+                "PCAP capture validation: header-only capture requires a fresh valid PCAP file and a logged capture start."
+            ]
     return []
+
+
+def _is_classic_pcap_header(path: Path) -> bool:
+    try:
+        raw = path.read_bytes()
+        if len(raw) != 24 or raw[:4] not in {
+            b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4",
+            b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d",
+        }:
+            return False
+        endian = "<" if raw[:4] in {b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1"} else ">"
+        import struct
+        return struct.unpack(endian + "HH", raw[4:8]) == (2, 4)
+    except OSError:
+        return False
 
 
 def validate_cpp_csv_schema(input_path: Path, output_path: Path) -> list[str]:
@@ -908,7 +995,10 @@ def validate_cpp_csv_schema(input_path: Path, output_path: Path) -> list[str]:
 def csv_header(path: Path) -> list[str]:
     if not path.exists():
         return []
-    with path.open("r", encoding="utf-8-sig", newline="") as file:
+    # Npcap formats localized adapter errors with the active Windows code
+    # page.  Those bytes can appear inside an otherwise UTF-8 CSV, so retain
+    # the row and replace only undecodable diagnostic characters.
+    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as file:
         reader = csv.reader(file)
         try:
             return [cell.strip() for cell in next(reader)]
@@ -919,7 +1009,7 @@ def csv_header(path: Path) -> list[str]:
 def read_csv_by_index(path: Path) -> dict[str, dict[str, str]]:
     if not path.exists():
         return {}
-    with path.open("r", encoding="utf-8-sig", newline="") as file:
+    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as file:
         rows: dict[str, dict[str, str]] = {}
         for row_number, row in enumerate(csv.DictReader(file), 1):
             index = row.get("index") or row.get("row_index") or str(row_number)

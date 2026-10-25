@@ -12,15 +12,40 @@ AXIS_INDEX_RE = re.compile(r"axis[_-]?(\d+)", re.IGNORECASE)
 
 
 def build_quality_observation(plan: ExecutionPlan, result: ExecutionResult) -> QualityAssessment:
+    from .parameter_coverage import audit_parameter_coverage
+    parameter_report = audit_parameter_coverage(plan, result.api_logs)
     metrics = collect_quality_metrics(result.api_logs)
+    metrics["parameter_coverage"] = parameter_report
+    motion_required = plan_requires_motion_quality(plan)
+    motion_passed = not motion_required or output_variation_is_sufficient(metrics)
+    issues = list(parameter_report["errors"])
+    if not result.success:
+        issues.append("Execution or required traffic capture failed.")
+    if result.success and not motion_passed:
+        issues.append("Required NC motion did not produce complete position/feed/status variation.")
     return QualityAssessment(
-        passed=True,
-        issues=[],
+        passed=result.success and motion_passed and parameter_report["passed"],
+        issues=issues,
         metrics=metrics,
         recommendations=[
             "RouterAgent must evaluate these objective metrics against the PlannerAgent quality targets."
         ],
     )
+
+
+def plan_requires_motion_quality(plan: ExecutionPlan) -> bool:
+    """Apply motion evidence only to a batch that actually requires motion."""
+    contract = plan.rag_context.get("execution_contract")
+    if isinstance(contract, dict) and "motion" in contract:
+        return bool(contract["motion"])
+    manifest = plan.rag_context.get("function_coverage_manifest")
+    if isinstance(manifest, dict) and manifest.get("enabled"):
+        return any(
+            segment.get("cycle_start_required") and segment.get("target_batch")
+            for segment in manifest.get("segments", [])
+            if isinstance(segment, dict)
+        )
+    return plan.scenario_type == "coordinate_motion" or any(step.interface_name == "StartProgram" for step in plan.steps)
 
 
 def output_variation_is_sufficient(metrics: dict[str, Any]) -> bool:
@@ -63,6 +88,10 @@ def collect_quality_metrics(api_logs: list[ApiCallLog]) -> dict[str, Any]:
         data = response_data_text(log)
         fields = parse_semicolon_fields(data)
         record_parameter_names(input_parameter_names, log.interface_name, parse_semicolon_pairs(input_text))
+        # Failed FOCAS output buffers have no valid device values. Keep error
+        # evidence in the logs without using it to manufacture variation.
+        if log.status_code != 0 or fields.get("output_valid", "").lower() == "false":
+            continue
         output_pairs = parse_semicolon_pairs(data)
         record_parameter_names(return_parameter_names, log.interface_name, output_pairs)
         record_output_values(output_values, log.interface_name, output_pairs)
@@ -79,7 +108,7 @@ def collect_quality_metrics(api_logs: list[ApiCallLog]) -> dict[str, Any]:
             motion = numeric_field(fields, "motion")
             if run is None:
                 status = fields.get("run_status", "").lower()
-                run = 1.0 if status in {"running", "active", "run"} else (0.0 if status in {"idle", "completed", "complete", "stopped"} else None)
+                run = 3.0 if status in {"running", "active", "run"} else (0.0 if status in {"idle", "completed", "complete", "stopped"} else None)
             if run is not None:
                 run_values.append(run)
             if motion is not None:
@@ -99,8 +128,8 @@ def collect_quality_metrics(api_logs: list[ApiCallLog]) -> dict[str, Any]:
         "position_sample_count": len(positions),
         "position_unique_count": len(set(positions)),
         "position_values_preview": positions[:5],
-        "run_active_count": sum(1 for value in run_values if value != 0),
-        "motion_active_count": sum(1 for value in motion_values if value != 0),
+        "run_active_count": sum(1 for value in run_values if value == 3),
+        "motion_active_count": sum(1 for value in motion_values if value == 1),
         "program_completion_gate_count": program_completion_gate_count,
         "program_completed": program_completed,
         "input_parameter_names": input_parameter_names,

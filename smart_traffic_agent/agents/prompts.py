@@ -58,6 +58,7 @@ FOCAS_CPP_GENERATION_SYSTEM_PROMPT = """
 - 生成的 C++ 必须连接 FANUC FOCAS，调用具体 API，并记录输入、输出和返回码。
 - 如果包含 `windows.h` 且使用 `std::min`/`std::max`，必须在 `#include <windows.h>` 前定义 `NOMINMAX`，或完全避免使用 `std::min`/`std::max`，否则 MSVC 会因 Windows `min/max` 宏污染而编译失败。
 - 必须包含控制器对应的官方 `Fwlib32.h`，使用其中的结构体、常量和函数原型；当前 FS0i-D 环境使用 `Fwlib\\0iD\\Fwlib32.h`。
+- 结构体和联合体字段只能来自本地实际 `Fwlib32.h` 的 SDK 类型索引；不要把 CNC 状态名称、其他系列文档字段或 RAG 文字说明当成成员。生成前逐个核对对象声明类型和字段。若 ODBST 或其他结构体没有所需字段，先检索当前 SDK 原型和官方 API 文档，选已存在的字段或适用读取接口；没有证据时报告无法读取，不能伪造字段或擅自增删目标 API。
 - 仍使用 `LoadLibraryW` 和 `GetProcAddress` 动态加载 `Fwlib32.dll`。头文件负责 ABI 类型，动态加载负责运行时解析，因此不要求链接 `Fwlib32.lib`。
 - FOCAS 连接必须参考 `cpp/focas_connect_demo.cpp` 的已验证方式：使用 `GetEnvironmentVariableW(L"FOCAS_DLL_DIR")` 读取 DLL 目录，调用 `SetDllDirectoryW`，再 `LoadLibraryW(dll_dir + L"\\Fwlib32.dll")`，解析 `cnc_allclibhndl3` / `cnc_freelibhndl`，连接 `127.0.0.1:8193`，timeout=10。
 - 禁止在生成代码中硬编码乱码/转码损坏的中文 DLL 路径；DLL 目录由 ExecutionAgent 通过 `FOCAS_DLL_DIR` 环境变量传入。

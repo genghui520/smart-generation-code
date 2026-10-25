@@ -1,5 +1,34 @@
 # Smart Traffic Agent
 
+## SMPAgent 桌面采集入口
+
+选择需要运行 NC 程序的 API 或场景后，启动前必须完成 Cycle Start 定位并启用。未完成时会提示并切到定位页面，不会启动采集进程；全部 API 模式也执行此检查。仅数据读写类目标不强制要求定位。
+
+连接页提供 FANUC FOCAS、三菱 EZSocket、西门子 S7Comm、海德汉 LSV/2 协议入口。当前 FOCAS 已接入真实采集；其余三种协议首次选择时继承当前 FOCAS 的完整配置、API 清单、场景、提示词及 Cycle Start 设置，全部显示并可编辑；之后各协议在本次会话中独立保留修改。继承内容明确标记为 FOCAS 模板，真实协议采集与连接测试仍待接入，不会误启动 FOCAS 后端。
+
+双击项目根目录的 `run_desktop.cmd` 启动原生 Windows 窗口，无需浏览器。
+也可执行 `.\.venv\Scripts\python.exe -m smart_traffic_agent.desktop`。
+
+连接页显示“SDK 自动识别型号”，无需手动选择。读取所配置 SDK 目录中的 Fwlib32.h 型号宏（例如 FS0IDD → 0i-D），按 [FOCAS 函数表](https://www.woody.vip/fanuc/flist_com.htm) 的 Ethernet 适用矩阵筛选：不适用 API 保留在列表中但变灰且不可选，鼠标或键盘尝试选择会提示原因；更换 SDK 目录后自动识别型号，并清除不再适用的已选项。数量、提示词与“全部 API”实际采集范围均只计算可选函数。缺少适用记录的函数单独提示“缺少适用记录，暂不可选”，不等同于文档明确不支持。完整场景含不可选目标时启动校验会提示并阻止执行。头文件缺失或通用 SDK 无法唯一识别型号时，明确显示“SDK 无法唯一识别型号（显示全部）”，不猜测型号。
+
+适用数据离线保存在 `rag_indexes/focas/api_compatibility.json`，包含来源与获取日期；可运行 `python scripts/build_api_compatibility.py` 更新。型号按网站分组展示；当前采集使用 Ethernet，所以 HSSB 专用 API 也不可选。文档适用不代表仿真器已启用相应选件，实际采集仍会验证返回结果。
+
+1. 在“连接配置”填写或选择 NCGuide 地址、端口、抓包网卡及 SDK 路径，点击“测试 FOCAS 连接”。测试会真正读取 CNC 状态，而非仅检查 TCP 端口。
+2. 模型地址、模型名沿用 `main.py` 当前默认值；API Key 自动从环境变量或项目 `.env` 的 `DEEPSEEK_API_KEY` 读取，密码形式显示，不保存到运行配置文件。支持 Chat Completions / Responses。
+3. 在“采集模式与提示词”选择“单个 API”或“全部 API”。单个 API 模式支持分类、搜索并单选函数；全部 API 模式按函数清单逐个采集，不受搜索筛选影响。已有覆盖成功的 API 会跳过；单个目标失败时保留证据并继续下一个目标，本轮不重复尝试该 API。首次验证可设置 FOCAS_MAX_CAPTURE_BATCHES=1，只执行一个目标并保留结果。场景与 API 提示词分别保存编辑内容，切换模式不会丢失。只有调用与真实 PCAP 请求/响应匹配才计入采集数，不可用项不计入实采覆盖率。
+4. 完成两项连接测试后，使用窗口顶部始终可见的“▶ 开始采集”按钮；API 页右下方也有“▶ 开始采集所选内容”。启动时会重新检查连接、模型、编译器、SDK、Npcap 网卡和输出目录；失败会给出原因。修改连接参数后必须重新测试。
+5. 所选 API 自动分批执行，每批单独输出。监控页显示后端事件、耗时、API 实采进度、PCAP/CSV 文件数量和大小；详细日志写入本次目录的 `desktop.log`。未产生包含数据的 PCAP 不会报告成功。
+
+每个场景的 `execution/data/by_api/` 按 API 名称整理抓包和参数日志。例如 `cnc_actf` 的重复调用会放在 `20261009_focas_actf.pcap`、`20261009_focas_actf_input.csv`、`20261009_focas_actf_output.csv`。两张 CSV 使用相同的 `index` 和 `invocation_id` 对应一次调用；`traffic_status=matched` 表示该调用有可靠的请求/响应流量关联。没有匹配报文的调用仍保留输入、输出记录，但不会生成空 PCAP。总抓包和总输入/输出日志仍位于 `execution/data/`。
+
+桌面入口直接调用 `TrafficGenerationWorkflow`，关闭流量质量评分门控，不运行评估、基线和消融脚本；仍保留 API 返回码、代码编译及采集失败检查。已有实验文件保留以便追溯。
+
+Cycle Start 坐标不再使用不可靠的固定默认值。在场景页点击“开始定位 Cycle Start”，窗口会隐藏并显示覆盖所有显示器的半透明定位遮罩；点击 NCGuide 的 Cycle Start 位置后，遮罩拦截此次点击（不会实际启动程序），界面自动识别下方窗口、填入屏幕 X/Y 和窗口标题并确认。未定位时不能开始需要自动启动的采集。停止按钮终止本次工作进程和编译/采集子进程，保留部分文件；它不等同于停止仿真器内已启动的 NC 程序，必要时在 NCGuide 内停止程序。
+
+规划完成后直接进入代码生成，不设置独立的规划审批/反复修复关卡。后续生成、编译、执行或结果验证失败时，再依据实际错误判断是否需要修代码、调整执行或重新规划；保留代码校验与运行安全检查。
+
+主要实现：`smart_traffic_agent/desktop.py`（原生界面）、`smart_traffic_agent/desktop_backend.py`（连接测试、模板和采集服务）。
+
 This repository contains a runnable first version of the CNC protocol traffic
 generation workflow described in the design documents.
 
@@ -35,8 +64,8 @@ Each run writes to a new numbered subdirectory such as
 
 The workflow is orchestrated with LangGraph. Router, planning, code generation,
 execution, and repair are graph nodes that share a workflow state. LangChain
-is used as the chat-model abstraction. The default run uses the OpenAI-compatible
-SmartAIPro endpoint with `gpt-5.6-sol` and project-local `.env` configuration. Agent decisions require a configured
+is used as the chat-model abstraction. The default run uses the official OpenAI-compatible
+DeepSeek endpoint with `deepseek-flash`, high reasoning effort, and project-local `.env` configuration. Agent decisions require a configured
 LLM. Unit tests cover local validation and state contracts without pretending to
 produce agent decisions; LLM integration tests require real provider credentials.
 
@@ -130,13 +159,15 @@ Run a RAG-driven LangGraph workflow. The default run configuration is:
 - target: `simulator`
 - vector DB: `rag_indexes/focas/vector_db`
 - LLM provider: `openai_compatible`
-- model: `gpt-5.6-sol`
-- base URL: `https://fast.smartaipro.cn/v1`
+- model: `deepseek-flash`
+- base URL: `https://api.deepseek.com`
+- transport: direct HTTP (`/chat/completions`)
+- thinking: enabled, `reasoning_effort=high`
 
 Put the project-local API key in `.env`:
 
 ```env
-SMARTAIPRO_API_KEY=your_smartaipro_key
+DEEPSEEK_API_KEY=your_api_key
 ```
 
 Then run directly. If no task text is provided, the default task is to generate
@@ -151,14 +182,11 @@ Override defaults only when needed:
 ```powershell
 python -m smart_traffic_agent run "生成主轴转速变化流量，采集主轴速度和运行状态"
 python -m smart_traffic_agent run "生成坐标运动流量" --out runs/coordinate_demo
-python -m smart_traffic_agent run "生成坐标运动流量" --llm-provider openai_compatible --llm-model "gpt-5.6-sol" --llm-base-url "https://fast.smartaipro.cn/v1" --llm-api-key-env SMARTAIPRO_API_KEY
-
-For OpenAI-compatible gateways that block OpenAI SDK headers, use the direct HTTP transport:
-
-```powershell
-python -m smart_traffic_agent run "生成坐标运动流量" --llm-provider openai_compatible --llm-model "gpt-5.5" --llm-base-url "https://zzz.11223300.top/v1" --llm-api-key-env SMARTAIPRO_API_KEY --llm-transport http
+python -m smart_traffic_agent run "生成坐标运动流量" --llm-provider openai_compatible --llm-model "deepseek-flash" --llm-base-url "https://api.deepseek.com" --llm-api-key-env DEEPSEEK_API_KEY --llm-transport http --llm-reasoning-effort high
 ```
-```
+
+The defaults already match the command above; explicit options are only needed to override them.
+
 
 ## FANUC NCGuide Probe
 
@@ -286,3 +314,5 @@ To run the agent through the bridge later:
 $env:FOCAS_BRIDGE_PYTHON="C:\Python32\python.exe"
 python -m smart_traffic_agent run "读取 NCGuide 运行状态" --target ncguide-bridge
 ```
+
+
