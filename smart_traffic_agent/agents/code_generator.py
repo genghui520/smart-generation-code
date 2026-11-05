@@ -315,6 +315,7 @@ class CodeGenerationAgent(AgentTemplate):
 
         diagnostics: list[str] = []
         max_internal_repair_attempts = 2
+        seen_repair_diagnostics: set[str] = set()
         for compile_attempt in range(max_internal_repair_attempts + 1):
             validation_output = self._validate_focas_cpp(
                 api_script_path,
@@ -347,6 +348,13 @@ class CodeGenerationAgent(AgentTemplate):
             )
             validation_errors = validation_output.errors
             if validation_errors:
+                validation_fingerprint = re.sub(r"\s+", " ", "; ".join(validation_errors)).strip()
+                if validation_fingerprint in seen_repair_diagnostics:
+                    raise ValueError(
+                        "CODEGEN_REPAIR_STALLED: repeated validation diagnostic; "
+                        + validation_fingerprint
+                    )
+                seen_repair_diagnostics.add(validation_fingerprint)
                 if compile_attempt < max_internal_repair_attempts and generated_runtime_capture and self.llm_client.enabled:
                     fragment_text = generate_capture_fragment(
                         state, executable_steps, nc_program, self.llm_client,
@@ -379,6 +387,13 @@ class CodeGenerationAgent(AgentTemplate):
                 if compile_attempt:
                     diagnostics.append(f"CodeGenerationAgent fixed MSVC preflight compilation after {compile_attempt} internal repair attempt(s).")
                 break
+            compile_fingerprint = re.sub(r"\s+", " ", compile_error).strip()
+            if compile_fingerprint in seen_repair_diagnostics:
+                raise ValueError(
+                    "CODEGEN_REPAIR_STALLED: repeated compiler diagnostic; "
+                    + compile_fingerprint
+                )
+            seen_repair_diagnostics.add(compile_fingerprint)
             diagnostics.append(f"MSVC preflight compilation failed on CodeGenerationAgent internal attempt {compile_attempt + 1}: {compile_error}")
             state.artifacts.diagnostics = diagnostics
             if compile_attempt >= max_internal_repair_attempts or not self.llm_client.enabled or fixed_runtime_capture or not generated_runtime_capture:
@@ -1494,6 +1509,8 @@ def generate_capture_fragment(
     missing-recipe error is never used when the model is available.
     """
     assert state.plan is not None
+    if not diagnostics and state.errors and state.repair_history and state.repair_history[-1].get("repair_stage") == "repair_code":
+        diagnostics = "; ".join(str(item) for item in state.errors[-10:])
     contract = execution_contract(state.plan, state.request.permissions.get("coverage_current_batch_functions")
                                   or state.request.permissions.get("required_api_functions") or ())
     targets = set(contract.targets)
@@ -1562,6 +1579,163 @@ def validate_scenario_fragment(fragment: str) -> list[str]:
     ]
 
 
+def _split_cpp_call_arguments(source: str, open_index: int) -> tuple[list[str], int] | None:
+    """Split one C++ call at top-level commas, preserving lambda/map bodies."""
+    args: list[str] = []
+    start = open_index + 1
+    paren = brace = bracket = 0
+    i = start
+    state = "code"
+    while i < len(source):
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < len(source) else ""
+        if state == "line_comment":
+            if ch in "\r\n":
+                state = "code"
+            i += 1
+            continue
+        if state == "block_comment":
+            if ch == "*" and nxt == "/":
+                state = "code"
+                i += 2
+            else:
+                i += 1
+            continue
+        if state in {"string", "char"}:
+            if ch == "\\":
+                i += 2
+                continue
+            if (state == "string" and ch == '"') or (state == "char" and ch == "'"):
+                state = "code"
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            state = "line_comment"
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            state = "block_comment"
+            i += 2
+            continue
+        if ch == '"':
+            state = "string"
+            i += 1
+            continue
+        if ch == "'":
+            state = "char"
+            i += 1
+            continue
+        if ch == "(":
+            paren += 1
+        elif ch == ")":
+            if paren == 0 and brace == 0 and bracket == 0:
+                args.append(source[start:i].strip())
+                return args, i
+            paren = max(0, paren - 1)
+        elif ch == "{":
+            brace += 1
+        elif ch == "}":
+            brace = max(0, brace - 1)
+        elif ch == "[":
+            bracket += 1
+        elif ch == "]":
+            bracket = max(0, bracket - 1)
+        elif ch == "," and paren == 0 and brace == 0 and bracket == 0:
+            args.append(source[start:i].strip())
+            start = i + 1
+        i += 1
+    return None
+
+
+def validate_capture_context_call_contract(fragment: str) -> list[str]:
+    """Check the fixed six-argument CaptureContext::call contract before MSVC."""
+    diagnostics: list[str] = []
+    masked = strip_cpp_comments_and_literals(fragment)
+    call_pattern = re.compile(r"\bctx\s*\.\s*call\s*\(")
+    for match in call_pattern.finditer(masked):
+        open_index = match.end() - 1
+        parsed = _split_cpp_call_arguments(fragment, open_index)
+        line = fragment.count("\n", 0, match.start()) + 1
+        if parsed is None:
+            diagnostics.append(
+                "BLOCKING: CAPTURE_CALL_SIGNATURE_PARSE_ERROR: "
+                f"line={line}; could not find the closing parenthesis for ctx.call"
+            )
+            continue
+        args, _close_index = parsed
+        api_match = re.search(r"\b((?:cnc|pmc|ds|ncguide)_\w+)\b", " ".join(args[:3]))
+        api_name = api_match.group(1) if api_match else "unknown"
+        step_arg = args[0].strip() if args else ""
+        step_literal = re.fullmatch(r'"([^"\\]*(?:\\.[^"\\]*)*)"', step_arg)
+        step_id = step_literal.group(1) if step_literal else (step_arg or "unknown")
+        if len(args) != 6:
+            diagnostics.append(
+                "BLOCKING: CAPTURE_CALL_SIGNATURE_MISMATCH: "
+                f"api={api_name}; step_id={step_id}; expected=6; actual={len(args)}; line={line}"
+            )
+            continue
+        function_match = re.fullmatch(r"\s*api\s*\.\s*((?:cnc|pmc|ds)_\w+)\s*", args[3])
+        if not function_match:
+            diagnostics.append(
+                "BLOCKING: CAPTURE_CALL_FUNCTION_ARGUMENT_INVALID: "
+                f"api={api_name}; step_id={step_id}; line={line}; "
+                "argument_4 must be the loaded api.<function> member"
+            )
+        invoked = re.search(r"\breturn\s+api\s*\.\s*((?:cnc|pmc|ds)_\w+)\s*\(", args[4])
+        if not invoked:
+            diagnostics.append(
+                "BLOCKING: CAPTURE_CALL_INVOKER_INVALID: "
+                f"api={api_name}; step_id={step_id}; line={line}; "
+                "argument_5 must invoke the real SDK function"
+            )
+        if function_match and invoked:
+            function_name = function_match.group(1)
+            invoked_name = invoked.group(1)
+            if function_name != invoked_name:
+                diagnostics.append(
+                    "BLOCKING: CAPTURE_CALL_API_NAME_MISMATCH: "
+                    f"api={api_name}; step_id={step_id}; line={line}; "
+                    f"argument_4={function_name}; argument_5={invoked_name}"
+                )
+            api_literal = re.fullmatch(r'\s*"((?:cnc|pmc|ds)_\w+)"\s*', args[1])
+            if api_literal and api_literal.group(1) != function_name:
+                diagnostics.append(
+                    "BLOCKING: CAPTURE_CALL_API_NAME_MISMATCH: "
+                    f"api={api_literal.group(1)}; step_id={step_id}; line={line}; "
+                    f"argument_4={function_name}"
+                )
+    return diagnostics
+
+
+def _validate_api_fragment_statements(fragment: str) -> list[str]:
+    """Reject wrapper and ownership leaks before rendering or compiling."""
+    source = str(fragment or "")
+    masked = strip_cpp_comments_and_literals(source)
+    forbidden: list[str] = []
+    checks = {
+        r"(?m)^\s*#\s*(?:include|define|pragma)\b": "preprocessor directive",
+        r"\bmain\s*\(": "main() wrapper",
+        r"\b(?:LoadLibraryW|GetProcAddress)\s*\(": "loader ownership",
+        r"\b(?:cnc_allclibhndl3|cnc_freelibhndl)\b": "connection lifecycle",
+        r"\b(?:typedef\s+struct|struct\s+FocasApi|class\s+FocasApi)\b": "type definition",
+    }
+    for pattern, label in checks.items():
+        if re.search(pattern, masked, re.IGNORECASE):
+            forbidden.append(label)
+    if re.search(
+        r"\b(?:static\s+)?(?:short|int|long|bool|void|std::string)\s+[A-Za-z_]\w*\s*\([^;{}]*\)\s*\{",
+        masked,
+    ):
+        forbidden.append("additional function definition")
+    if not forbidden:
+        return []
+    return [
+        "BLOCKING: API_FRAGMENT_STATEMENTS_ONLY: "
+        + ", ".join(sorted(set(forbidden)))
+        + "."
+    ]
+
+
 def generate_scenario_core_with_llm(
     state: WorkflowState,
     executable_steps: list[PlanStep],
@@ -1621,6 +1795,8 @@ def generate_scenario_core_with_llm(
         "and actual_feed.data. For cnc_download3, use nc_buffer.data() and nc_length; the fixed template already "
         "provides the correctly framed NC payload. Every Planner semantic operation is mandatory and must have a "
         "real executable call in this fragment, never a comment, dead branch, or declaration-only reference. "
+        "When using CaptureContext, call it only as ctx.call(step_id, api_name, parameter_text, api.<function>, "
+        "invoker_lambda, output_lambda); the four-argument legacy form is forbidden. "
         "Resolve every selected API to its concrete api.<function_name> member from the supplied Fwlib32.h prototype; "
         "api.function, target_api, TODO and ellipsis are forbidden output tokens. "
         "Keep the fragment concise and compilable."
@@ -1668,7 +1844,14 @@ def generate_scenario_core_with_llm(
 
 def _validate_api_fragment_call(fragment: str, functions: list[str]) -> None:
     """Require each requested API fragment to contain a real SDK call."""
-    source = re.sub(r"//[^\n]*|/\*.*?\*/", "", fragment, flags=re.DOTALL)
+    normalized = _normalize_model_core(fragment)
+    boundary_errors = _validate_api_fragment_statements(normalized)
+    contract_errors = validate_capture_context_call_contract(normalized)
+    if boundary_errors:
+        raise ValueError("; ".join(boundary_errors))
+    if contract_errors:
+        raise ValueError("; ".join(contract_errors))
+    source = re.sub(r"//[^\n]*|/\*.*?\*/", "", normalized, flags=re.DOTALL)
     missing = [
         name for name in functions
         if not re.search(rf"\b(?:api\.)?{re.escape(name)}(?:_fn|_p)?\s*\(", source)
@@ -1678,6 +1861,29 @@ def _validate_api_fragment_call(fragment: str, functions: list[str]) -> None:
             "API_FRAGMENT_MISSING_CALL: " + ", ".join(missing)
             + "; generated fragment must call the requested SDK API"
         )
+    # Apply the same SDK declaration checks used by ValidateFocasCppTool while
+    # this fragment is still isolated. The final validator remains mandatory;
+    # this early check only prevents invalid code from being rendered/compiled.
+    try:
+        from ..integrations.ncguide import default_focas_header_dir
+        from ..sdk_type_index import (
+            load_or_build_sdk_type_index,
+            validate_sdk_type_declarations,
+            validate_struct_member_access,
+        )
+        header = default_focas_header_dir() / "Fwlib32.h"
+        if header.is_file():
+            index = load_or_build_sdk_type_index(
+                header, Path("rag_indexes/focas/sdk_type_index_0iD.json")
+            )
+            sdk_errors = validate_struct_member_access(normalized, index)
+            sdk_errors.extend(validate_sdk_type_declarations(normalized, index))
+            if sdk_errors:
+                raise ValueError("; ".join(sdk_errors))
+    except ImportError:
+        # The final production validator remains authoritative if the optional
+        # SDK index module is unavailable in a stripped-down test installation.
+        pass
 
 
 def generate_api_fragments_with_llm(
@@ -1712,7 +1918,9 @@ def generate_api_fragments_with_llm(
     if not isinstance(cache, dict):
         cache = {}
         state.plan.rag_context["codegen_api_fragments"] = cache
-    elif not previous and not diagnostics:
+    elif not previous and not diagnostics and not (
+        state.repair_history and state.repair_history[-1].get("repair_stage") == "repair_code"
+    ):
         # A fresh generation must not reuse fragments left by an earlier run
         # that happened to reuse the same in-memory ExecutionPlan.
         cache.clear()
@@ -1756,6 +1964,7 @@ def generate_api_fragments_with_llm(
         if not diagnostics or step.step_id in repair_step_ids or not cache.get(str(step.step_id))
     ]
     if requested_rows:
+        requested_ids = {str(step.step_id) for step, _names in requested_rows}
         try:
             generated = generate_api_fragment_bundle_with_llm(
                 state,
@@ -1767,7 +1976,9 @@ def generate_api_fragments_with_llm(
                 existing_fragments={
                     str(key): str(value.get("core_cpp", ""))
                     for key, value in cache.items()
-                    if isinstance(value, dict) and str(value.get("core_cpp", "")).strip()
+                    if isinstance(value, dict)
+                    and str(key) in requested_ids
+                    and str(value.get("core_cpp", "")).strip()
                 },
             )
         except Exception as exc:
@@ -1775,15 +1986,25 @@ def generate_api_fragments_with_llm(
                 name for _step, names in requested_rows for name in names
             )
             raise ValueError(f"API_FRAGMENT_GENERATION_FAILED[{api_label}]: {exc}") from exc
+        fragment_errors: list[str] = []
         for step, names in requested_rows:
             key = str(step.step_id)
             core = generated.get(key, "")
             if not core:
-                raise ValueError(
+                fragment_errors.append(
                     f"API_FRAGMENT_MISSING_FRAGMENT[{','.join(names)}]: model did not return step_id={key}"
                 )
-            _validate_api_fragment_call(core, names)
+                continue
+            try:
+                _validate_api_fragment_call(core, names)
+            except Exception as exc:
+                fragment_errors.append(
+                    f"API_FRAGMENT_GENERATION_FAILED[{','.join(names)}]: {exc}"
+                )
+                continue
             cache[key] = {"step_id": key, "functions": names, "core_cpp": core}
+        if fragment_errors:
+            raise ValueError("; ".join(fragment_errors))
 
     rows: list[str] = []
     for step, names in fragment_rows:
@@ -1858,8 +2079,19 @@ def generate_api_fragment_bundle_with_llm(
         "nc_payload/nc_buffer/nc_length and the SDK dynamic bindings. Use only official Fwlib32.h types, fields and "
         "api.<function> members. Preserve the complete ExecutionPlan order and use real variables produced by earlier "
         "steps for runtime dependencies; never invent an upstream output or replace it with a guessed literal. "
-        "Each requested API must have a real ctx.call invocation with the exact return code, input parameters and output "
-        "logging. Do not emit api.function(...), target_api(...), TODO or ellipsis. Avoid duplicate local declarations "
+        "The exact harness signature is template<class Fn, class Invoke, class Output> short call("
+        "const std::string& step, const std::string& name, const std::string& parameters, Fn symbol, "
+        "Invoke invoke, Output build_output). A legal example is: "
+        "ret = ctx.call(\"S001\", \"cnc_statinfo\", \"FlibHndl=\" + std::to_string(handle), "
+        "api.cnc_statinfo, [&]() -> short { return api.cnc_statinfo(handle, &status); }, "
+        "[&](short) -> std::string { return \"run=\" + std::to_string(status.run); });. "
+        "Each requested API must use exactly the six-argument CaptureContext contract: "
+        "ctx.call(step_id, api_name, parameter_text, api.<function>, "
+        "[&]() -> short { return api.<function>(...); }, "
+        "[&](short) -> std::string { return ...; }). "
+        "The four-argument form ctx.call(api_name, lambda, input_map, output_map) is forbidden. "
+        "Each call must record the exact return code, input parameters and output logging. "
+        "Do not emit api.function(...), target_api(...), TODO or ellipsis. Avoid duplicate local declarations "
         "across fragments by prefixing new locals with the step_id. Repair only requested fragments when diagnostics are "
         "present; leave unrelated cached fragments unchanged."
     )
@@ -1973,6 +2205,8 @@ def repair_scenario_fragment(
         "Do not return main(), FocasApi, LoadLibraryW, GetProcAddress, cnc_allclibhndl3, cnc_freelibhndl, #include, typedefs, "
         "or any official structure redefinition. The fixed harness owns connection, dynamic API binding, cleanup, and exception handling. "
         "Use only official Fwlib32.h types and the Planner APIs. POSELM.data is scalar; use positions[i].abs.data, never data[i]. "
+        "Every generated ctx.call must use exactly six arguments: step_id, api_name, parameter_text, api.<function>, "
+        "an invoker lambda returning api.<function>(...), and an output lambda. Never use the legacy four-argument form. "
         "For ToolDataAccess/tool_management, preserve or add a real call to one accepted official tool-data API "
         "(prefer the Planner-selected API, and for cnc_rdtool use IODBTLMNG); never satisfy it with a comment or dead code. "
         "Do not change the Planner API set. Keep NC payload local to the fragment if needed.\n\n"

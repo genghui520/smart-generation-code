@@ -127,6 +127,16 @@ class ValidateFocasCppToolTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertTrue(compile_called)
 
+    def test_capture_call_arity_is_rejected_before_compile(self) -> None:
+        result = run_validator(
+            "short run_generated_scenario(FocasApi& api, unsigned short handle, CaptureContext& ctx) { "
+            "return ctx.call(\"cnc_statinfo\", [&]() { return api.cnc_statinfo(handle, nullptr); }, "
+            "{{\"FlibHndl\", std::to_string(handle)}}, {{\"run\", \"0\"}}); }"
+        )
+        self.assertFalse(result.success)
+        self.assertTrue(any("CAPTURE_CALL_SIGNATURE_MISMATCH" in error for error in result.errors))
+        self.assertIn("CaptureContext::call six-argument contract", result.checked_rules)
+
 
 if __name__ == "__main__":
     unittest.main()

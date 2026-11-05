@@ -235,6 +235,21 @@ class ParameterCoverageTests(unittest.TestCase):
         self.assertIn("api.cnc_rdopmsg", fragment)
         self.assertEqual(client.invoke_json.call_count, 1)
 
+    def test_batch_generation_rejects_legacy_capture_call_before_compile(self):
+        from smart_traffic_agent.agents.code_generator import generate_capture_fragment
+        p = plan_for("cnc_statinfo")
+        state = WorkflowState(request=TaskRequest("capture", "t"), plan=p)
+        client = Mock(); client.enabled = True
+        client.invoke_json.return_value = {"api_fragments": [{
+            "step_id": "sample",
+            "apis": ["cnc_statinfo"],
+            "core_cpp": 'ret = ctx.call("cnc_statinfo", [&]() { return api.cnc_statinfo(handle, &status); }, '
+                         '{{"FlibHndl", std::to_string(handle)}}, {{"run", "0"}});',
+        }]}
+        with self.assertRaisesRegex(ValueError, "CAPTURE_CALL_SIGNATURE_MISMATCH"):
+            generate_capture_fragment(state, p.steps, "", client)
+        self.assertEqual(client.invoke_json.call_count, 1)
+
     def test_repair_regenerates_only_named_api_fragment(self):
         from smart_traffic_agent.agents.code_generator import generate_capture_fragment
         p = plan_for("cnc_statinfo")
@@ -255,6 +270,35 @@ class ParameterCoverageTests(unittest.TestCase):
         self.assertIn('"S1"', second)
         self.assertIn('"S2_REPAIRED"', second)
         self.assertNotIn('"S2"', second)
+        self.assertEqual(client.invoke_json.call_count, 2)
+
+    def test_failed_fragment_keeps_valid_cached_fragments_for_code_repair(self):
+        from smart_traffic_agent.agents.code_generator import generate_capture_fragment
+        p = plan_for("cnc_statinfo")
+        p.steps.append(PlanStep("S2", "during", "read message", "cnc_rdopmsg", {}, protocol_function="cnc_rdopmsg"))
+        state = WorkflowState(request=TaskRequest("capture", "t"), plan=p)
+        client = Mock(); client.enabled = True
+        client.invoke_json.side_effect = [
+            {"api_fragments": [
+                {"step_id": "sample", "apis": ["cnc_statinfo"], "core_cpp":
+                    'ret = ctx.call("S1", "cnc_statinfo", "", api.cnc_statinfo, [&]() -> short { return api.cnc_statinfo(handle, &status); }, [&](short) -> std::string { return ""; });'},
+                {"step_id": "S2", "apis": ["cnc_rdopmsg"], "core_cpp":
+                    'ret = ctx.call("cnc_rdopmsg", [&]() { return api.cnc_rdopmsg(handle, &msg); }, {{""}}, {{""}});'},
+            ]},
+            {"api_fragments": [
+                {"step_id": "S2", "apis": ["cnc_rdopmsg"], "core_cpp":
+                    'ret = ctx.call("S2", "cnc_rdopmsg", "", api.cnc_rdopmsg, [&]() -> short { return api.cnc_rdopmsg(handle, &msg); }, [&](short) -> std::string { return ""; });'},
+            ]},
+        ]
+        with self.assertRaisesRegex(ValueError, "CAPTURE_CALL_SIGNATURE_MISMATCH"):
+            generate_capture_fragment(state, p.steps, "", client)
+        self.assertIn("sample", state.plan.rag_context["codegen_api_fragments"])
+        self.assertNotIn("S2", state.plan.rag_context["codegen_api_fragments"])
+        state.errors = ["CodeGenerationAgent failed: CAPTURE_CALL_SIGNATURE_MISMATCH api=cnc_rdopmsg"]
+        state.repair_history = [{"repair_stage": "repair_code"}]
+        repaired = generate_capture_fragment(state, p.steps, "", client)
+        self.assertIn('"S1"', repaired)
+        self.assertIn('"S2"', repaired)
         self.assertEqual(client.invoke_json.call_count, 2)
 
 

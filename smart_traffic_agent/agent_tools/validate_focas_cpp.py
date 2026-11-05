@@ -69,6 +69,7 @@ class ValidateFocasCppTool(AgentTool[ValidateFocasCppInput, ValidateFocasCppOutp
             validate_download_payload,
             validate_generated,
             validate_focas_argument_semantics,
+            validate_capture_context_call_contract,
             validate_official_output_usage,
             validate_programmatic_abi_binding,
             validate_scenario_fragment,
@@ -125,6 +126,7 @@ class ValidateFocasCppTool(AgentTool[ValidateFocasCppInput, ValidateFocasCppOutp
             )
         if tool_input.fragment_path is not None:
             diagnostics.extend(validate_scenario_fragment(fragment))
+            diagnostics.extend(validate_capture_context_call_contract(fragment))
         diagnostics.extend(type_diagnostics)
         if tool_input.code_only_evaluation:
             diagnostics.extend(validate_code_only_source(source))
@@ -149,6 +151,7 @@ class ValidateFocasCppTool(AgentTool[ValidateFocasCppInput, ValidateFocasCppOutp
                 "SDK type declaration existence against active Fwlib32.h",
                 "planned API coverage and semantic bindings",
                 "scenario fragment boundary",
+                "CaptureContext::call six-argument contract",
                 "NC payload framing",
             ],
         )

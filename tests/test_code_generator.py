@@ -34,6 +34,8 @@ from smart_traffic_agent.agents.code_generator import (
     build_scenario_fragment,
     cpp_step_block,
     normalize_capture_core,
+    _validate_api_fragment_call,
+    validate_capture_context_call_contract,
     validate_scenario_fragment,
     validate_semantic_api_bindings,
     _ensure_parameter_combinations,
@@ -512,6 +514,62 @@ int main() { return cnc_statinfo_fn(handle, nullptr); }
         )
 
         self.assertEqual(validate_scenario_fragment(fragment), [])
+
+    def test_capture_call_contract_rejects_legacy_four_argument_form(self) -> None:
+        fragment = '''
+ret = ctx.call("cnc_statinfo",
+    [&]() { return api.cnc_statinfo(handle, &status); },
+    {{"FlibHndl", std::to_string(handle)}},
+    {{"run", std::to_string(status.run)}});
+'''
+        diagnostics = validate_capture_context_call_contract(fragment)
+        self.assertEqual(len(diagnostics), 1)
+        self.assertIn("CAPTURE_CALL_SIGNATURE_MISMATCH", diagnostics[0])
+        self.assertIn("api=cnc_statinfo", diagnostics[0])
+        self.assertIn("expected=6", diagnostics[0])
+        self.assertIn("actual=4", diagnostics[0])
+        self.assertIn("line=2", diagnostics[0])
+
+    def test_capture_call_contract_accepts_nested_six_argument_form(self) -> None:
+        fragment = '''
+ret = ctx.call("S002", "cnc_statinfo", "FlibHndl=" + std::to_string(handle),
+    api.cnc_statinfo,
+    [&]() -> short { return api.cnc_statinfo(handle, &status); },
+    [&](short) -> std::string {
+        return "run=" + std::to_string(status.run) +
+               ";data=" + std::to_string(status.data[0]);
+    });
+'''
+        self.assertEqual(validate_capture_context_call_contract(fragment), [])
+
+    def test_capture_call_contract_ignores_comments_and_string_literals(self) -> None:
+        fragment = r'''
+// ctx.call("cnc_fake", one, two, three);
+const char* text = "ctx.call(\\\"cnc_fake\\\", one, two, three)";
+ret = ctx.call("S003", "cnc_statinfo", "note=(a,b)", api.cnc_statinfo,
+    [&]() -> short { return api.cnc_statinfo(handle, &status); },
+    [&](short) -> std::string { return "run=" + std::to_string(status.run); });
+'''
+        self.assertEqual(validate_capture_context_call_contract(fragment), [])
+
+    def test_capture_call_contract_rejects_crossed_api_names(self) -> None:
+        fragment = (
+            'ret = ctx.call("S004", "cnc_statinfo", "", api.cnc_alarm2, '
+            '[&]() -> short { return api.cnc_alarm2(handle, &alarm); }, '
+            '[&](short) -> std::string { return ""; });'
+        )
+        diagnostics = validate_capture_context_call_contract(fragment)
+        self.assertTrue(any("CAPTURE_CALL_API_NAME_MISMATCH" in item for item in diagnostics))
+
+    def test_api_fragment_rejects_extra_main_before_render(self) -> None:
+        fragment = (
+            'int main() { return 0; }\n'
+            'ret = ctx.call("S005", "cnc_statinfo", "", api.cnc_statinfo, '
+            '[&]() -> short { return api.cnc_statinfo(handle, &status); }, '
+            '[&](short) -> std::string { return ""; });'
+        )
+        with self.assertRaisesRegex(ValueError, "API_FRAGMENT_STATEMENTS_ONLY"):
+            _validate_api_fragment_call(fragment, ["cnc_statinfo"])
 
     def test_validate_official_output_usage_accepts_api_alias_for_rdposition(self) -> None:
         code_spec = CodeSpec(
