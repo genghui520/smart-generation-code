@@ -10,6 +10,7 @@ from smart_traffic_agent.sdk_type_index import (
     build_sdk_type_index,
     load_or_build_sdk_type_index,
     sdk_environment_identity,
+    validate_sdk_type_declarations,
     validate_struct_member_access,
 )
 
@@ -42,6 +43,37 @@ def test_accepts_active_sdk_members_and_arrays() -> None:
     assert validate_struct_member_access(source, index) == []
     assert index.structs["ODBACT"]["fields"]["dummy"]["array"] == "2"
     assert index.functions["cnc_statinfo"].startswith("FWLIBAPI short WINAPI cnc_statinfo(")
+
+
+def test_rejects_invented_sdk_payload_type_before_compile() -> None:
+    index = build_sdk_type_index(SDK_HEADER)
+    errors = validate_sdk_type_declarations("ODBPARAINFO value{};", index)
+    assert len(errors) == 1
+    assert "SDK_TYPE_UNKNOWN" in errors[0]
+    assert "ODBPARAINFO" in errors[0]
+
+
+def test_type_scan_does_not_treat_return_codes_comments_or_strings_as_declarations() -> None:
+    index = build_sdk_type_index(SDK_HEADER)
+    source = (
+        "short ret = EW_OK; if (ret == EW_OK) return EW_FUNC;\n"
+        "// EW_OK K ODBPARAINFO fake{};\n"
+        "const char* text = \"EW_FUNC ODBPARAINFO fake{};\";\n"
+        "ODBST status{};\n"
+        "ODBAXIS* axis = nullptr;\n"
+    )
+    assert validate_sdk_type_declarations(source, index) == []
+
+
+def test_unknown_type_reports_exact_source_line_and_snippet() -> None:
+    index = build_sdk_type_index(SDK_HEADER)
+    errors = validate_sdk_type_declarations(
+        "short ret = EW_OK;\nODBPARAINFO value{};\n", index,
+        source_name="scenario_fragment.inc",
+    )
+    assert len(errors) == 1
+    assert "scenario_fragment.inc:2" in errors[0]
+    assert "code='ODBPARAINFO value{};'" in errors[0]
 
 
 def test_other_sdk_type_uses_same_validation(tmp_path: Path) -> None:

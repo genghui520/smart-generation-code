@@ -7,6 +7,7 @@ meaning; both pieces of evidence are needed before generating a call.
 
 from __future__ import annotations
 
+from datetime import date
 from functools import lru_cache
 import json
 from pathlib import Path
@@ -155,6 +156,84 @@ def resolve_api_return_code(function_name: str, code: int) -> dict[str, object]:
         "documented_for_api": bool(matches),
         "known_globally": bool(global_rows),
     }
+
+
+def validate_cnc_settimer_value(value: object, *, device_scope: str = "fanuc:0i-D") -> dict[str, object]:
+    """Validate one ``IODBTIMER`` value using the documented 0i-D contract.
+
+    This is an API parameter constraint, not a graph dependency.  The caller
+    may pass either the flattened execution-plan representation or a nested
+    mapping.  Only the selected union branch is inspected, so a generator
+    cannot accidentally combine date and time members or send an impossible
+    calendar date.
+    """
+    if not isinstance(value, dict):
+        return {"valid": False, "code": "invalid_type", "error": "IODBTIMER value must be an object"}
+
+    def _get(name: str, default: object = None) -> object:
+        if name in value:
+            return value[name]
+        buf = value.get("buf")
+        if isinstance(buf, dict) and name in buf:
+            return buf[name]
+        return default
+
+    def _branch(name: str, field: str) -> object:
+        direct = value.get(f"data.{name}.{field}")
+        if direct is not None:
+            return direct
+        direct = value.get(f"buf.data.{name}.{field}")
+        if direct is not None:
+            return direct
+        data = value.get("data")
+        if isinstance(data, dict) and isinstance(data.get(name), dict):
+            return data[name].get(field)
+        buf = value.get("buf")
+        if isinstance(buf, dict):
+            data = buf.get("data")
+            if isinstance(data, dict) and isinstance(data.get(name), dict):
+                return data[name].get(field)
+        return None
+
+    raw_type = _get("type")
+    try:
+        timer_type = int(raw_type)
+    except (TypeError, ValueError):
+        return {"valid": False, "code": "invalid_type_selector", "error": "buf.type must be 0 (date) or 1 (time)"}
+    if timer_type not in (0, 1):
+        return {"valid": False, "code": "invalid_type_selector", "error": "buf.type must be 0 (date) or 1 (time)"}
+
+    scope = str(device_scope or "").lower()
+    if timer_type == 0:
+        try:
+            year = int(_branch("date", "year"))
+            month = int(_branch("date", "month"))
+            day = int(_branch("date", "date"))
+        except (TypeError, ValueError):
+            return {"valid": False, "code": "missing_date_field", "error": "date branch requires year, month and date"}
+        # The indexed cnc_settimer documentation specifies this range for
+        # Series 30i/31i/32i and 0i-D/F (the configured project scope).
+        if "0i-d" in scope or "0i-f" in scope or "30i" in scope or "31i" in scope or "32i" in scope:
+            lower, upper = 1997, 2096
+        else:
+            return {"valid": False, "code": "unknown_device_scope", "error": "no documented cnc_settimer date range for device scope"}
+        if not lower <= year <= upper:
+            return {"valid": False, "code": "date_out_of_range", "error": f"date year must be {lower}..{upper} for {device_scope}"}
+        try:
+            date(year, month, day)
+        except ValueError:
+            return {"valid": False, "code": "invalid_calendar_date", "error": "date is not a valid calendar date"}
+        return {"valid": True, "branch": "date", "normalized": {"type": 0, "year": year, "month": month, "date": day}}
+
+    try:
+        hour = int(_branch("time", "hour"))
+        minute = int(_branch("time", "minute"))
+        second = int(_branch("time", "second"))
+    except (TypeError, ValueError):
+        return {"valid": False, "code": "missing_time_field", "error": "time branch requires hour, minute and second"}
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59 or not 0 <= second <= 59:
+        return {"valid": False, "code": "time_out_of_range", "error": "time must be 00:00:00..23:59:59"}
+    return {"valid": True, "branch": "time", "normalized": {"type": 1, "hour": hour, "minute": minute, "second": second}}
 
 
 def header_error_codes(header: str) -> dict[int, set[str]]:

@@ -3,14 +3,17 @@ from __future__ import annotations
 import time
 import os
 import uuid
+import json
 from pathlib import Path
 from shutil import copy2
+from typing import Any, Iterable
 
 from ..agent_tools import (
     CollectExecutionArtifactsInput,
     CollectExecutionArtifactsTool,
     CompileCppInput,
     CompileGeneratedCppTool,
+    RecordTrafficRelationsInput,
     RunExecutableInput,
     RunGeneratedExecutableTool,
 )
@@ -39,8 +42,11 @@ from ..integrations.simulator_client import SimulatedCncClient
 from ..knowledge import KnowledgeBase
 from ..api_prerequisites import classify_prerequisite_failure
 from ..scenario_capabilities import assess_scene_execution
-from ..traffic_relationship_mining import mine_runtime_relations
-from ..models import ApiCallLog, CaptureEvent, ExecutionResult, GeneratedArtifacts, WorkflowState, utc_now
+from ..traffic_relationship_mining import build_runtime_relation_payload, mine_runtime_relations
+from ..models import ApiCallLog, CaptureEvent, ExecutionContext, ExecutionResult, GeneratedArtifacts, WorkflowState, utc_now
+from ..parameter_rules import bind_plan_runtime_parameters
+from ..execution_plan_schema import execution_plan_view, normalize_execution_plan, validate_execution_plan
+from ..function_coverage import is_planned_expected_error
 from ..tool_runtime import ToolRuntime, ToolRegistry
 from ..tool_runtime import ToolCallLoop
 from ..llm import LlmClient
@@ -71,6 +77,36 @@ def copy_generated_sources(
 
 
 SUPPORTED_READONLY_INTERFACES = supported_ncguide_readonly_interfaces()
+
+
+def execution_timeout_for_source(source: Path) -> int | None:
+    """Return the process timeout, preserving explicit operator waits.
+
+    The generated harness only uses an unbounded wait for the REMOTE gate.
+    An explicit environment override remains available for diagnostics and
+    test runs; ordinary API programs keep the existing bounded timeout.
+    """
+    try:
+        text = source.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    if ('wait_for_operator(api, handle' in text
+            or 'wait_for_cnc_mode(api, handle' in text):
+        return None
+    configured = os.environ.get("SMPAGENT_CPP_TIMEOUT_SECONDS")
+    if configured:
+        try:
+            return max(1, int(configured))
+        except ValueError:
+            pass
+    # Keep the process watchdog aligned with the deterministic NC preflight
+    # budget.  The extra minute covers connection, upload, logging and cleanup;
+    # it must not turn an overlong NC program into an unbounded wait.
+    try:
+        nc_budget = float(os.environ.get("SMP_MAX_NC_RUNTIME_SECONDS", "90"))
+    except ValueError:
+        nc_budget = 90.0
+    return max(120, min(3600, int(nc_budget + 60)))
 
 
 class ExecutionAgent(AgentTemplate):
@@ -110,6 +146,10 @@ class ExecutionAgent(AgentTemplate):
     def run(self, state: WorkflowState, output_dir: Path) -> WorkflowState:
         if state.plan is None or state.artifacts is None:
             raise ValueError("Cannot execute before plan and generated artifacts exist.")
+        normalize_execution_plan(state.plan, state.plan.rag_context.get("traffic_relationships"))
+        state.plan.rag_context["execution_plan"] = execution_plan_view(state.plan)
+        state.plan.rag_context["execution_plan_validation"] = validate_execution_plan(state.plan)
+        write_json(output_dir / "execution_plan.json", state.plan.rag_context["execution_plan"])
         if state.plan.code_spec is None or not getattr(state.plan.code_spec, "official_abi_context", ""):
             state.errors.append("ExecutionAgent received no Planner CodeSpec official ABI context.")
         if self.environment is not None:
@@ -163,7 +203,11 @@ class ExecutionAgent(AgentTemplate):
                         payload_summary=step.parameters,
                     )
                 )
-                response = client.call(step.interface_name, step.parameters)
+                api_name = str(step.api or step.protocol_function or step.interface_name).strip()
+                # Semantic interfaces remain the simulator/bridge dispatch
+                # key; the exact API is preserved in protocol_function and
+                # the structured execution evidence.
+                response = client.call(step.interface_name or api_name, step.parameters)
                 end_timestamp_ns = time.time_ns()
                 status_code = int(response.get("status_code", 500))
                 response_timestamp = utc_now()
@@ -187,7 +231,7 @@ class ExecutionAgent(AgentTemplate):
                         input_parameters=step.parameters,
                         status_code=status_code,
                         response=response,
-                        protocol_function=step.protocol_function,
+                        protocol_function=step.protocol_function or api_name,
                         semantic_label=semantic_label(step.interface_name),
                         error=response.get("error"),
                         invocation_id=invocation_id,
@@ -197,6 +241,8 @@ class ExecutionAgent(AgentTemplate):
                         device_context={
                             "target_environment": target_environment,
                             "phase": normalize_execution_phase(step.phase),
+                            "plan_step_role": step.role,
+                            "dependency_paths": [item.get("dependency_path") for item in step.dependencies if isinstance(item, dict)],
                         },
                         traffic_status="no_real_traffic_capture",
                     )
@@ -204,15 +250,25 @@ class ExecutionAgent(AgentTemplate):
                 if step.interval_seconds:
                     time.sleep(min(step.interval_seconds, 0.05))
 
-        errors = [log.error for log in api_logs if log.error]
+        errors = [
+            log.error
+            for log in api_logs
+            if log.error and not planned_expected_error_for_log(state.plan, log)
+        ]
         if skip_is_error:
             errors.extend(skipped_steps)
-        success = not errors and all(log.status_code == 0 for log in api_logs)
+        success = not errors and all(
+            log.status_code == 0
+            or planned_expected_error_for_log(state.plan, log)
+            for log in api_logs
+        )
         write_jsonl(execution_dir / "api_logs.jsonl", api_logs)
         write_jsonl(execution_dir / "capture_events.jsonl", capture_events)
         if skipped_steps:
             write_jsonl(execution_dir / "skipped_steps.jsonl", [{"message": item} for item in skipped_steps])
 
+        state.execution_context = build_execution_context(api_logs)
+        bind_plan_from_execution(state)
         state.result = ExecutionResult(
             task_id=state.request.task_id,
             success=success,
@@ -250,12 +306,33 @@ class ExecutionAgent(AgentTemplate):
             }
         else:
             try:
-                relations = mine_runtime_relations(service, state.plan, state.result)
+                payload = build_runtime_relation_payload(state.plan, state.result)
+                relation_tool = getattr(self, "tool_runtime", None)
+                if relation_tool is not None:
+                    recorded, _trace = relation_tool.call(
+                        self.role_name,
+                        "record_traffic_relations",
+                        RecordTrafficRelationsInput(payload),
+                    )
+                    relations = recorded.get("accepted", []) if isinstance(recorded, dict) else []
+                    rejected = recorded.get("rejected", []) if isinstance(recorded, dict) else []
+                else:
+                    relations = mine_runtime_relations(service, state.plan, state.result)
+                    rejected = []
                 feedback = {
                     "status": "recorded" if service.available else "unavailable",
                     "relation_count": len(relations),
+                    "discovered_relations": payload.get("discovered_relations", []),
                     "relations": relations,
+                    "structured_payload": payload,
+                    "rejected_relations": rejected,
                 }
+                if payload.get("discovered_relations"):
+                    print(
+                        "[TRCM] 新发现关系（待人工确认，未写入 Neo4j）："
+                        + str(payload["discovered_relations"]),
+                        flush=True,
+                    )
             except Exception as exc:  # pragma: no cover - defensive backend isolation
                 feedback = {
                     "status": "failed",
@@ -292,6 +369,108 @@ def semantic_label(interface_name: str) -> str:
     return semantic_label_for(interface_name)
 
 
+def build_execution_context(
+    api_logs: Iterable[ApiCallLog],
+    *,
+    parameter_rules_by_target: dict[str, Iterable[dict[str, Any]]] | None = None,
+) -> ExecutionContext:
+    """Convert real API logs into the shared runtime context for repairs."""
+    context = ExecutionContext()
+    for log in api_logs:
+        context.record(log)
+        session_id = str(log.device_context.get("session_id", "")) if isinstance(log.device_context, dict) else ""
+        if session_id:
+            session = context.sessions.setdefault(session_id, {"calls": [], "complete": False})
+            session["calls"].append({"api_name": log.protocol_function, "status_code": log.status_code, "invocation_id": log.invocation_id})
+            if str(log.device_context.get("session_completion_status", "")).lower() in {"complete", "completed", "success"}:
+                session["complete"] = True
+    # Resolve filters only after all calls have been recorded.  This keeps the
+    # operation deterministic and ensures a later API can consume real values
+    # from an earlier successful call without another LLM round trip.
+    if parameter_rules_by_target:
+        from ..parameter_rules import resolve_runtime_parameter_bindings
+        for target_api, rules in parameter_rules_by_target.items():
+            binding = resolve_runtime_parameter_bindings(str(target_api), context, rules)
+            if binding.get("selected_parameters"):
+                context.selected_parameters[str(target_api)] = dict(binding["selected_parameters"])
+    return context
+
+
+def parameter_rules_by_target_from_plan(plan: Any) -> dict[str, list[dict[str, Any]]]:
+    """Extract graph filters rules without making the executor query Neo4j."""
+    result: dict[str, list[dict[str, Any]]] = {}
+    context = getattr(plan, "rag_context", {}) if plan is not None else {}
+    graph = context.get("traffic_relationships", {}) if isinstance(context, dict) else {}
+    for target_api, facts in (graph.get("apis", {}) or {}).items() if isinstance(graph, dict) else ():
+        if not isinstance(facts, dict):
+            continue
+        payload = facts.get("parameter_rules", {})
+        rules = payload.get("rules", []) if isinstance(payload, dict) else []
+        if isinstance(rules, list) and rules:
+            result[str(target_api)] = [item for item in rules if isinstance(item, dict)]
+    # Normalized plans already carry the same graph facts in runtime_bindings;
+    # use them directly so execution never needs a second graph/LLM pass.
+    for binding in getattr(plan, "runtime_bindings", ()) or ():
+        if not isinstance(binding, dict) or binding.get("filter_mode") not in {"include", "exclude"}:
+            continue
+        target = str(binding.get("target_api", "")).strip()
+        if not target:
+            continue
+        result.setdefault(target, []).append(dict(binding))
+    return result
+
+
+def parameter_domains_by_target_from_plan(plan: Any) -> dict[str, dict[str, list[Any]]]:
+    """Read explicit legal domains from the plan/Neo4j API contracts only."""
+    output: dict[str, dict[str, list[Any]]] = {}
+    graph = getattr(plan, "rag_context", {}).get("traffic_relationships", {}) if plan is not None else {}
+    apis = graph.get("apis", {}) if isinstance(graph, dict) else {}
+    for api_name, facts in apis.items() if isinstance(apis, dict) else ():
+        facts = facts if isinstance(facts, dict) else {}
+        node = facts.get("node_contract") or (facts.get("api_info", {}) or {}).get("api") or {}
+        parameters = node.get("parameters", {}) if isinstance(node, dict) else {}
+        if isinstance(parameters, str):
+            try:
+                parameters = json.loads(parameters)
+            except (TypeError, ValueError):
+                parameters = {}
+        if not isinstance(parameters, dict):
+            continue
+        domains: dict[str, list[Any]] = {}
+        for name, metadata in parameters.items():
+            if not isinstance(metadata, dict):
+                continue
+            values = metadata.get("allowed_values", metadata.get("domain"))
+            if values is None and isinstance(metadata.get("constraints"), dict):
+                values = metadata["constraints"].get("allowed_values")
+            if isinstance(values, (list, tuple, set)):
+                domains[str(name)] = list(values)
+        if domains:
+            output[str(api_name)] = domains
+    for step in getattr(plan, "steps", ()) or ():
+        api = str(getattr(step, "api", "") or getattr(step, "protocol_function", "") or "").strip()
+        params = getattr(step, "parameters", {})
+        declared = params.get("parameter_domains") if isinstance(params, dict) else None
+        if isinstance(declared, dict):
+            output.setdefault(api, {}).update({str(key): list(value) for key, value in declared.items() if isinstance(value, (list, tuple, set))})
+    return output
+
+
+def bind_plan_from_execution(state: WorkflowState) -> dict[str, Any]:
+    """Bind filters from current execution evidence and persist the result."""
+    if state.plan is None or state.execution_context is None:
+        return {"success": False, "errors": [{"code": "execution_context_missing", "message": "current execution evidence is unavailable"}]}
+    result = bind_plan_runtime_parameters(
+        state.plan,
+        state.execution_context,
+        parameter_rules_by_target_from_plan(state.plan),
+        parameter_domains_by_target=parameter_domains_by_target_from_plan(state.plan),
+        update_plan=False,
+    )
+    state.plan.rag_context["runtime_parameter_bindings"] = result.get("results", {})
+    return result
+
+
 def normalize_execution_phase(value: str) -> str:
     lowered = str(value or "during").strip().lower()
     return {"before": "Before", "after": "After"}.get(lowered, "During")
@@ -307,6 +486,154 @@ def record_scene_evidence(state: WorkflowState) -> None:
     evidence = assess_scene_execution(scene_plan, state.result.api_logs)
     state.plan.rag_context["scene_execution_evidence"] = evidence
     write_json(state.result.output_dir / "scene_execution_evidence.json", evidence)
+
+
+def assess_plan_step_execution(plan: Any, api_logs: Iterable[ApiCallLog]) -> dict[str, Any]:
+    """Compare planned protocol steps with observed calls.
+
+    This is evidence reporting, not an online success gate.  In particular,
+    destructive cleanup steps are reported as authorization-blocked when they
+    were not executed; they are never inferred from a plan or run implicitly
+    by the fixed transfer harness.
+    """
+    logs = list(api_logs)
+    scene_plan = plan.rag_context.get("scene_plan", {}) if plan is not None else {}
+    target_api = str(scene_plan.get("target_api", ""))
+    if not target_api:
+        targets = plan.rag_context.get("execution_contract", {}).get("targets", []) if plan is not None else []
+        target_api = str(targets[0]) if targets else ""
+    observed_counts: dict[str, int] = {}
+    for log in logs:
+        name = str(log.protocol_function or log.interface_name or "").strip()
+        if name:
+            observed_counts[name] = observed_counts.get(name, 0) + 1
+
+    steps: list[dict[str, Any]] = []
+    missing_step_ids: list[str] = []
+    missing_protocol_functions: list[str] = []
+    conditional_skipped_steps: list[str] = []
+    authorization_blocked_steps: list[str] = []
+    planned_protocol_steps: dict[str, list[Any]] = {}
+    for planned_step in getattr(plan, "steps", []) or []:
+        protocol = str(getattr(planned_step, "protocol_function", "") or "").strip()
+        if protocol and not protocol.startswith("N/A"):
+            planned_protocol_steps.setdefault(protocol, []).append(planned_step)
+    # Assign duplicate protocol calls to duplicate planned steps. Generated
+    # harnesses carry the owning step in the log (for repeated calls this is
+    # usually ``S005-1`` ... ``S005-30``), so use that evidence first. The
+    # repeat-capacity fallback below is kept for older harnesses that emitted
+    # only the shared protocol name.
+    step_matches: dict[str, list[ApiCallLog]] = {}
+    for protocol, protocol_steps in planned_protocol_steps.items():
+        protocol_logs = [log for log in logs if str(log.protocol_function or "").strip() == protocol]
+        unassigned: list[ApiCallLog] = []
+        for log in protocol_logs:
+            log_step_id = str(getattr(log, "step_id", "") or "").strip()
+            owner = next(
+                (
+                    planned_step
+                    for planned_step in protocol_steps
+                    if log_step_id == str(getattr(planned_step, "step_id", ""))
+                    or log_step_id.startswith(f"{getattr(planned_step, 'step_id', '')}-")
+                ),
+                None,
+            )
+            if owner is None:
+                unassigned.append(log)
+            else:
+                step_matches.setdefault(str(getattr(owner, "step_id", "")), []).append(log)
+        # Older logs may have no useful step suffix. Allocate those calls to
+        # planned steps in order, respecting each step's repeat capacity.
+        for planned_step in protocol_steps:
+            step_id = str(getattr(planned_step, "step_id", ""))
+            capacity = max(1, int(getattr(planned_step, "repeat", 1) or 1))
+            already_assigned = len(step_matches.get(step_id, []))
+            take = max(0, capacity - already_assigned)
+            if take:
+                step_matches.setdefault(step_id, []).extend(unassigned[:take])
+                del unassigned[:take]
+        # If a legacy harness emitted more calls than the declared repeat,
+        # preserve them under the last planned step instead of dropping data.
+        if unassigned and protocol_steps:
+            last_id = str(getattr(protocol_steps[-1], "step_id", ""))
+            step_matches.setdefault(last_id, []).extend(unassigned)
+    for step in getattr(plan, "steps", []) or []:
+        protocol = str(getattr(step, "protocol_function", "") or "").strip()
+        interface_name = str(getattr(step, "interface_name", "") or "").strip()
+        step_id = str(getattr(step, "step_id", "") or "")
+        if not protocol or protocol.strip().casefold().startswith("n/a"):
+            steps.append({"step_id": step_id, "protocol_function": protocol, "status": "not_applicable", "observed_count": 0})
+            continue
+        matches = list(step_matches.get(step_id, []))
+        if not matches:
+            matches = [
+                log for log in logs
+                if not log.protocol_function and str(log.interface_name or "").strip() == interface_name
+            ]
+        destructive = (
+            protocol in {"cnc_delete", "cnc_wrparam", "cnc_wrmacro", "pmc_wrpmc"}
+            or protocol.startswith("pmc_wr")
+            or "delete" in (interface_name + " " + str(getattr(step, "action", ""))).lower()
+        )
+        conditional = protocol == "cnc_getdtailerr"
+        if not matches and conditional and not any(log.status_code != 0 or log.error for log in logs):
+            status = "conditional_skipped"
+            conditional_skipped_steps.append(step_id)
+        elif not matches and destructive:
+            status = "authorization_blocked"
+            authorization_blocked_steps.append(step_id)
+            missing_step_ids.append(step_id)
+            missing_protocol_functions.append(protocol)
+        elif not matches:
+            status = "not_executed"
+            missing_step_ids.append(step_id)
+            missing_protocol_functions.append(protocol)
+        else:
+            # repeat is a planning upper bound for data transfer steps.  A
+            # bounded session with fewer chunks is still an observed step.
+            status = "executed"
+        steps.append({
+            "step_id": step_id,
+            "phase": str(getattr(step, "phase", "")),
+            "protocol_function": protocol,
+            "interface_name": interface_name,
+            "planned_repeat": int(getattr(step, "repeat", 1) or 1),
+            "observed_count": len(matches),
+            "status": status,
+            "destructive": destructive,
+        })
+
+    successful_protocols = {
+        str(log.protocol_function): log
+        for log in logs
+        if log.status_code == 0 and not log.error and log.protocol_function
+    }
+    session_chain = [str(item) for item in scene_plan.get("session_chain", []) if str(item).strip()]
+    target_logs = [log for log in logs if log.protocol_function == target_api]
+    target_called = bool(target_logs)
+    target_succeeded = bool(target_logs) and all(log.status_code == 0 and not log.error for log in target_logs)
+    session_complete = bool(session_chain) and all(name in successful_protocols for name in session_chain)
+    if not session_chain:
+        session_complete = target_succeeded
+    nonconditional_missing = [
+        item for item in steps
+        if item["status"] in {"not_executed", "authorization_blocked"}
+        and item["protocol_function"] not in {"cnc_getdtailerr"}
+    ]
+    return {
+        "target_api": target_api,
+        "target_called": target_called,
+        "target_succeeded": target_succeeded,
+        "target_session_complete": session_complete,
+        "plan_execution_complete": not nonconditional_missing,
+        "observed_call_counts": observed_counts,
+        "steps": steps,
+        "missing_step_ids": list(dict.fromkeys(missing_step_ids)),
+        "missing_protocol_functions": list(dict.fromkeys(missing_protocol_functions)),
+        "conditional_skipped_steps": conditional_skipped_steps,
+        "authorization_blocked_steps": authorization_blocked_steps,
+        "note": "Plan completeness is diagnostic; target collection success is based on compile, execution, return codes and raw evidence.",
+    }
 
 
 def run_generated_cpp_api_script(
@@ -363,7 +690,9 @@ def run_generated_cpp_api_script(
     errors: list[str] = []
     if not compile_result.success:
         errors.append("C++ API script compilation failed.")
+        status_fields = collection_status_fields(state, [], False, "failed")
         write_jsonl(execution_dir / "tool_calls.jsonl", tool_calls)
+        state.execution_context = build_execution_context([])
         state.result = ExecutionResult(
             task_id=state.request.task_id,
             success=False,
@@ -377,6 +706,7 @@ def run_generated_cpp_api_script(
         write_json(execution_dir / "collection_result.json", {
             "execution_id": state.request.task_id,
             "status": "failed",
+            **status_fields,
             "errors": errors,
             "api_logs_saved": False,
         })
@@ -386,14 +716,18 @@ def run_generated_cpp_api_script(
         state.stage = "complete"
         return state
 
-    timeout_seconds = int(os.environ.get("SMPAGENT_CPP_TIMEOUT_SECONDS", "600"))
+    timeout_seconds = execution_timeout_for_source(local_source)
     run_result, run_trace = tool_runtime.call(
         "ExecutionRole",
         "run_generated_executable",
         RunExecutableInput(
             executable_path=exe_path,
             work_dir=execution_dir,
-            environment={"FOCAS_DLL_DIR": os.environ.get("FOCAS_DLL_DIR", str(default_focas_runtime_dir()))},
+            environment={
+                "FOCAS_DLL_DIR": os.environ.get("FOCAS_DLL_DIR", str(default_focas_runtime_dir())),
+                "SMPAGENT_BATCH_ID": state.request.task_id,
+                "SMP_MAX_NC_RUNTIME_SECONDS": os.environ.get("SMP_MAX_NC_RUNTIME_SECONDS", "90"),
+            },
             timeout_seconds=timeout_seconds,
         ),
     )
@@ -411,10 +745,18 @@ def run_generated_cpp_api_script(
     tool_calls.append(collect_trace)
     api_logs = collected.api_logs
     capture_events = collected.capture_events
+    plan_execution_evidence = assess_plan_step_execution(state.plan, api_logs)
+    state.plan.rag_context["plan_execution_evidence"] = plan_execution_evidence
+    write_json(execution_dir / "plan_execution_evidence.json", plan_execution_evidence)
     if collected.schema_errors:
         errors.extend(f"CAPTURE_ARTIFACT_ERROR: {item}" for item in collected.schema_errors)
     for log in api_logs:
-        if log.status_code != 0 and log.error and not generated_cpp_log_is_nonfatal(log):
+        if (
+            log.status_code != 0
+            and log.error
+            and not generated_cpp_log_is_nonfatal(log)
+            and not planned_expected_error_for_log(state.plan, log)
+        ):
             errors.append(log.error)
     prerequisite_failures = [
         {
@@ -456,6 +798,7 @@ def run_generated_cpp_api_script(
         except OSError:
             pass
     collection_status, collection_evidence = classify_collection_status(state, api_logs, success)
+    status_fields = collection_status_fields(state, api_logs, success, collection_status)
     collection_evidence.update({
         "execution_id": state.request.task_id,
         "api_return_codes": [
@@ -465,22 +808,47 @@ def run_generated_cpp_api_script(
         ],
         "pcap_files": [
             {"path": str(path), "size_bytes": path.stat().st_size}
-            for path in sorted((execution_dir / "data").glob("*.pcap"))
+            for path in sorted((execution_dir / "data").rglob("*.pcap"))
         ],
+        "pcap_mode": (
+            "runtime_per_api_dumper"
+            if (execution_dir / "data" / "by_api" / ".runtime_per_api_capture").is_file()
+            else "batch_total_or_fallback"
+        ),
+        "api_capture_summary": build_api_capture_summary(api_logs),
         "generated_code": str(local_source),
         "generated_code_sha256": __import__("hashlib").sha256(local_source.read_bytes()).hexdigest()
         if local_source.is_file() else None,
+        "plan_execution_evidence": plan_execution_evidence,
+        "status_fields": status_fields,
         "errors": [error for error in errors if error],
     })
+    collection_evidence["traffic_classification"] = write_api_traffic_classification(
+        execution_dir, api_logs
+    )
     try:
         write_json(execution_dir / "collection_result.json", {
             "status": collection_status,
+            **status_fields,
             "evidence": collection_evidence,
             "offline_audit_status": audit_status,
         })
     except OSError as exc:
         collection_evidence["collection_manifest_write_error"] = f"{type(exc).__name__}: {exc}"
 
+    state.execution_context = build_execution_context(
+        api_logs,
+        parameter_rules_by_target=parameter_rules_by_target_from_plan(state.plan),
+    )
+    binding_result = bind_plan_from_execution(state)
+    if not binding_result.get("success", True):
+        state.plan.rag_context["parameter_binding_errors"] = binding_result.get("results", {})
+    if state.execution_context.selected_parameters:
+        state.plan.rag_context["runtime_parameter_bindings"] = state.execution_context.selected_parameters
+        write_json(
+            execution_dir / "runtime_parameter_bindings.json",
+            state.execution_context.selected_parameters,
+        )
     state.result = ExecutionResult(
         task_id=state.request.task_id,
         success=success,
@@ -520,7 +888,7 @@ def run_generated_cpp_api_script_with_tool_loop(
     local_source = execution_dir / "api_script.cpp"
     exe_path = execution_dir / "api_script.exe"
     copy_generated_sources(state.artifacts, execution_dir, source_path, local_source)
-    timeout_seconds = int(os.environ.get("SMPAGENT_CPP_TIMEOUT_SECONDS", "600"))
+    timeout_seconds = execution_timeout_for_source(local_source)
 
     def input_factory(tool_name: str, arguments: dict[str, object]) -> object:
         if tool_name == "compile_generated_cpp":
@@ -529,7 +897,11 @@ def run_generated_cpp_api_script_with_tool_loop(
             return RunExecutableInput(
                 executable_path=exe_path,
                 work_dir=execution_dir,
-                environment={"FOCAS_DLL_DIR": os.environ.get("FOCAS_DLL_DIR", str(default_focas_runtime_dir()))},
+                environment={
+                    "FOCAS_DLL_DIR": os.environ.get("FOCAS_DLL_DIR", str(default_focas_runtime_dir())),
+                    "SMPAGENT_BATCH_ID": state.request.task_id,
+                    "SMP_MAX_NC_RUNTIME_SECONDS": os.environ.get("SMP_MAX_NC_RUNTIME_SECONDS", "90"),
+                },
                 timeout_seconds=timeout_seconds,
             )
         if tool_name == "collect_execution_artifacts":
@@ -576,12 +948,20 @@ def run_generated_cpp_api_script_with_tool_loop(
     collected = next((item[1] for item in ordered if item[0] == "collect_execution_artifacts"), None)
     api_logs = collected.api_logs if collected is not None else []
     capture_events = collected.capture_events if collected is not None else []
+    plan_execution_evidence = assess_plan_step_execution(state.plan, api_logs)
+    state.plan.rag_context["plan_execution_evidence"] = plan_execution_evidence
+    write_json(execution_dir / "plan_execution_evidence.json", plan_execution_evidence)
     if collected is None:
         errors.append("ExecutionAgent tool loop did not collect execution artifacts.")
     elif collected.schema_errors:
         errors.extend(f"CAPTURE_ARTIFACT_ERROR: {item}" for item in collected.schema_errors)
     for log in api_logs:
-        if log.status_code != 0 and log.error and not generated_cpp_log_is_nonfatal(log):
+        if (
+            log.status_code != 0
+            and log.error
+            and not generated_cpp_log_is_nonfatal(log)
+            and not planned_expected_error_for_log(state.plan, log)
+        ):
             errors.append(log.error)
     prerequisite_failures = [
         {
@@ -621,6 +1001,7 @@ def run_generated_cpp_api_script_with_tool_loop(
         except OSError:
             pass
     collection_status, collection_evidence = classify_collection_status(state, api_logs, success)
+    status_fields = collection_status_fields(state, api_logs, success, collection_status)
     collection_evidence.update({
         "execution_id": state.request.task_id,
         "api_return_codes": [
@@ -630,21 +1011,46 @@ def run_generated_cpp_api_script_with_tool_loop(
         ],
         "pcap_files": [
             {"path": str(path), "size_bytes": path.stat().st_size}
-            for path in sorted((execution_dir / "data").glob("*.pcap"))
+            for path in sorted((execution_dir / "data").rglob("*.pcap"))
         ],
+        "pcap_mode": (
+            "runtime_per_api_dumper"
+            if (execution_dir / "data" / "by_api" / ".runtime_per_api_capture").is_file()
+            else "batch_total_or_fallback"
+        ),
+        "api_capture_summary": build_api_capture_summary(api_logs),
         "generated_code": str(local_source),
         "generated_code_sha256": __import__("hashlib").sha256(local_source.read_bytes()).hexdigest()
         if local_source.is_file() else None,
+        "plan_execution_evidence": plan_execution_evidence,
+        "status_fields": status_fields,
         "errors": list(errors),
     })
+    collection_evidence["traffic_classification"] = write_api_traffic_classification(
+        execution_dir, api_logs
+    )
     try:
         write_json(execution_dir / "collection_result.json", {
             "status": collection_status,
+            **status_fields,
             "evidence": collection_evidence,
             "offline_audit_status": audit_status,
         })
     except OSError as exc:
         collection_evidence["collection_manifest_write_error"] = f"{type(exc).__name__}: {exc}"
+    state.execution_context = build_execution_context(
+        api_logs,
+        parameter_rules_by_target=parameter_rules_by_target_from_plan(state.plan),
+    )
+    binding_result = bind_plan_from_execution(state)
+    if not binding_result.get("success", True):
+        state.plan.rag_context["parameter_binding_errors"] = binding_result.get("results", {})
+    if state.execution_context.selected_parameters:
+        state.plan.rag_context["runtime_parameter_bindings"] = state.execution_context.selected_parameters
+        write_json(
+            execution_dir / "runtime_parameter_bindings.json",
+            state.execution_context.selected_parameters,
+        )
     state.result = ExecutionResult(
         task_id=state.request.task_id,
         success=success,
@@ -689,6 +1095,17 @@ def generated_cpp_log_is_nonfatal(log: ApiCallLog) -> bool:
     # captured*. It must not turn a missing-PCAP run into success.
     if log.traffic_status == "matched" and "ew_func" in text:
         return True
+    # cnc_dncstart2 is a documented observation of an already active
+    # DNC/M198 operation.  EW_REJECT means that no such operation is active;
+    # it is a valid negative observation when the real request/response was
+    # captured.  Keep the return code in the raw log, but do not route the
+    # completed observation into code repair.
+    if (
+        log.protocol_function == "cnc_dncstart2"
+        and log.traffic_status == "matched"
+        and any(code in text for code in ("ew_reject", "ew_busy", "ew_noopt", "ew_param"))
+    ):
+        return True
     return any(
         marker in text
         for marker in [
@@ -698,6 +1115,23 @@ def generated_cpp_log_is_nonfatal(log: ApiCallLog) -> bool:
             "ew_mode",
             "focas_return_-7",
         ]
+    )
+
+
+def planned_expected_error_for_log(plan: Any, log: ApiCallLog) -> bool:
+    """Return whether a nonzero log is the exact error branch in the plan."""
+    if plan is None:
+        return False
+    return is_planned_expected_error(
+        plan,
+        log.protocol_function,
+        {
+            "step_id": log.step_id,
+            "status_code": log.status_code,
+            "input_parameters": log.input_parameters,
+            "error": log.error,
+            "response": log.response,
+        },
     )
 
 
@@ -741,10 +1175,16 @@ def classify_collection_status(
         for name in sorted(targets)
     }
     called = {name: len(logs) for name, logs in by_target.items()}
+    def accepted(log: ApiCallLog) -> bool:
+        return (
+            log.status_code == 0
+            and not log.error
+        ) or planned_expected_error_for_log(state.plan, log)
+
     local_targets = {
         name for name, logs in by_target.items()
         if is_non_wire_observable(name) and logs
-        and all(log.status_code == 0 and not log.error for log in logs)
+        and all(accepted(log) for log in logs)
     }
     wire_targets = {
         name for name, logs in by_target.items()
@@ -788,6 +1228,213 @@ def classify_collection_status(
              "input_parameters": log.input_parameters, "error": log.error}
             for log in api_logs if log.protocol_function and log.protocol_function not in targets
         ],
+    }
+
+
+def collection_status_fields(
+    state: WorkflowState,
+    api_logs: list[ApiCallLog],
+    execution_succeeded: bool,
+    collection_status: str,
+) -> dict[str, str]:
+    """Expose independent workflow, API, capture, and annotation states.
+
+    A successful FOCAS return is deliberately independent from wire evidence:
+    a local/cache-served call can be ``api_execution_status=success`` while
+    its capture status remains ``partial``. This keeps the online result
+    truthful and gives the desktop monitor a concrete reason for partial runs.
+    """
+    targets = set(state.request.permissions.get("required_api_functions") or [])
+    targets.update(state.request.permissions.get("coverage_current_batch_functions") or [])
+    if state.plan is not None:
+        manifest = state.plan.rag_context.get("function_coverage_manifest", {})
+        targets.update(
+            str(row.get("function", ""))
+            for row in manifest.get("selected_batch", [])
+            if isinstance(row, dict) and row.get("coverage_role", "target") == "target"
+        )
+    targets.discard("")
+    target_logs = [log for log in api_logs if log.protocol_function in targets]
+    def accepted(log: ApiCallLog) -> bool:
+        return (
+            log.status_code == 0
+            and not log.error
+        ) or planned_expected_error_for_log(state.plan, log)
+
+    api_ok = bool(target_logs) and all(accepted(log) for log in target_logs)
+    from ..function_coverage import is_non_wire_observable
+    local_only = bool(target_logs) and bool(targets) and targets <= {
+        log.protocol_function for log in target_logs if is_non_wire_observable(log.protocol_function)
+        and accepted(log)
+    }
+    wire_ok = any(log.traffic_status in {"matched", "request_only_segment"} for log in target_logs)
+    all_raw_fields = bool(target_logs) and all(
+        log.invocation_id and log.protocol_function and log.traffic_status
+        and isinstance(log.response, dict)
+        for log in target_logs
+    )
+    if not execution_succeeded:
+        workflow_status = "failed"
+    else:
+        workflow_status = "completed"
+    if not target_logs:
+        api_execution_status = "target_not_called"
+    else:
+        api_execution_status = "success" if api_ok else "failed"
+    if not target_logs:
+        capture_status = "not_observed"
+        capture_reason = "没有目标 API 调用记录"
+    elif local_only:
+        capture_status = "not_required"
+        capture_reason = (
+            "目标 API 是 FOCAS 句柄本地路径选择操作；本批次已真实调用并返回 EW_OK，"
+            "该函数本身不要求独立 CNC 网络请求，已保留无报文 PCAP 和调用时间证据"
+        )
+    elif wire_ok:
+        capture_status = "matched"
+        capture_reason = "至少一条目标调用已关联真实 PCAP 证据"
+    else:
+        capture_status = "partial"
+        capture_reason = (
+            "目标 API 已执行，但没有目标调用在严格调用时间窗口内关联到真实 PCAP 请求/响应；"
+            "不得使用相邻辅助调用补配 transaction_id"
+        )
+    annotation_status = "complete" if all_raw_fields else "partial"
+    return {
+        "workflow_status": workflow_status,
+        "api_execution_status": api_execution_status,
+        "capture_status": capture_status,
+        "annotation_status": annotation_status,
+        "capture_reason": capture_reason,
+        "collection_status": collection_status,
+    }
+
+
+def build_api_capture_summary(api_logs: list[ApiCallLog]) -> dict[str, dict[str, Any]]:
+    """Aggregate all calls for each API without treating file ownership as a match."""
+    summary: dict[str, dict[str, Any]] = {}
+    for log in api_logs:
+        api = str(log.protocol_function or "").strip()
+        if not api or not api.startswith(("cnc_", "pmc_")):
+            continue
+        item = summary.setdefault(api, {
+            "call_count": 0,
+            "success_count": 0,
+            "traffic_matched_count": 0,
+            "request_only_segment_count": 0,
+            "unmatched_call_count": 0,
+            "parameter_configurations": [],
+            "pcap_files": [],
+            "pcap_call_count": 0,
+        })
+        item["call_count"] += 1
+        if log.status_code == 0 and not log.error:
+            item["success_count"] += 1
+        if log.traffic_status == "matched":
+            item["traffic_matched_count"] += 1
+        elif log.traffic_status == "request_only_segment":
+            # A segment is real call-linked traffic, but it is not an
+            # independent request/response transaction.
+            item["request_only_segment_count"] += 1
+        elif log.traffic_status not in {"not_applicable", "pending_transaction_mapping"}:
+            item["unmatched_call_count"] += 1
+        configuration = json.dumps(log.input_parameters, ensure_ascii=False, sort_keys=True, default=str)
+        if configuration not in item["parameter_configurations"]:
+            item["parameter_configurations"].append(configuration)
+        pcap_file = log.response.get("api_pcap_file") if isinstance(log.response, dict) else None
+        if pcap_file and pcap_file not in item["pcap_files"]:
+            item["pcap_files"].append(pcap_file)
+        if pcap_file:
+            item["pcap_call_count"] += 1
+    for item in summary.values():
+        item["distinct_parameter_configurations"] = len(item["parameter_configurations"])
+    return summary
+
+
+def write_api_traffic_classification(
+    execution_dir: Path,
+    api_logs: list[ApiCallLog],
+) -> dict[str, Any]:
+    """Persist explicit with-traffic and without-traffic API manifests.
+
+    Network evidence is intentionally independent from API execution status.
+    A successful local FOCAS handle operation belongs in the no-traffic file
+    with ``local_success``; a failed call remains visible there with its real
+    execution status and is not converted into a success.
+    """
+    from ..function_coverage import is_non_wire_observable
+
+    grouped: dict[str, list[ApiCallLog]] = {}
+    for log in api_logs:
+        api = str(log.protocol_function or "").strip()
+        if api.startswith(("cnc_", "pmc_")):
+            grouped.setdefault(api, []).append(log)
+
+    with_traffic: list[dict[str, Any]] = []
+    without_traffic: list[dict[str, Any]] = []
+    for api, logs in sorted(grouped.items()):
+        matched_count = sum(log.traffic_status == "matched" for log in logs)
+        segment_count = sum(log.traffic_status == "request_only_segment" for log in logs)
+        success_count = sum(log.status_code == 0 and not log.error for log in logs)
+        pcap_files = sorted({
+            str(log.response.get("api_pcap_file"))
+            for log in logs
+            if isinstance(log.response, dict) and log.response.get("api_pcap_file")
+        })
+        calls = [
+            {
+                "invocation_id": log.invocation_id,
+                "step_id": log.step_id,
+                "return_code": log.status_code,
+                "traffic_status": log.traffic_status,
+                "transaction_id": log.transaction_id,
+            }
+            for log in logs
+        ]
+        item = {
+            "api_name": api,
+            "call_count": len(logs),
+            "success_count": success_count,
+            "failed_count": len(logs) - success_count,
+            "traffic_matched_count": matched_count,
+            "request_only_segment_count": segment_count,
+            "no_traffic_call_count": len(logs) - matched_count - segment_count,
+            "pcap_files": pcap_files,
+            "calls": calls,
+        }
+        if matched_count or segment_count:
+            item["classification"] = "with_traffic"
+            item["traffic_evidence"] = "matched_or_request_only_segment"
+            with_traffic.append(item)
+        else:
+            item["classification"] = "without_traffic"
+            item["traffic_evidence"] = "not_required_local_operation" if is_non_wire_observable(api) else "no_wire_evidence"
+            item["execution_classification"] = (
+                "local_success" if success_count == len(logs) and is_non_wire_observable(api)
+                else "api_execution_success_without_wire_evidence" if success_count == len(logs)
+                else "api_execution_failed"
+            )
+            without_traffic.append(item)
+
+    with_path = execution_dir / "apis_with_traffic.json"
+    without_path = execution_dir / "apis_without_traffic.json"
+    write_json(with_path, {
+        "schema_version": "api-traffic-classification-v1",
+        "classification": "with_traffic",
+        "api_count": len(with_traffic),
+        "apis": with_traffic,
+    })
+    write_json(without_path, {
+        "schema_version": "api-traffic-classification-v1",
+        "classification": "without_traffic",
+        "api_count": len(without_traffic),
+        "apis": without_traffic,
+    })
+    return {
+        "with_traffic_file": str(with_path),
+        "without_traffic_file": str(without_path),
+        "with_traffic_api_count": len(with_traffic),
+        "without_traffic_api_count": len(without_traffic),
     }
 
 

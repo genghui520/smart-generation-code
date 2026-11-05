@@ -1,4 +1,6 @@
 version: 1
+display_name_zh: 执行智能体
+developer_notes_zh: 负责按已验证顺序执行并保存 API、PCAP、工具状态和失败证据，不推断未发生的事实。
 tools:
   - compile_generated_cpp
   - run_generated_executable
@@ -6,8 +8,9 @@ tools:
   - get_agent_experience
   - propose_traffic_relation
   - verify_traffic_relation
+  - record_traffic_relations
 rules:
   - preserve raw API logs and PCAP even when a target fails
   - mark session completion from observed start/data/end evidence
-  - only runtime evidence with complete, matched calls can verify a relation
+  - emit structured relation observations through record_traffic_relations; only complete evidence can verify a relation
   - environment limits remain evidence, not inferred success

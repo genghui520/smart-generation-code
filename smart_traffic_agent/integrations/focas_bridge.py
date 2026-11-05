@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_INSTALL_DIR = Path(r"D:\Program Files (x86)\FANUC\NCGuide FS0i-F")
+DEFAULT_INSTALL_DIR = Path(r"D:\Program Files (x86)\FANUC\NCGuide FS0i-D")
 
 
 @dataclass(slots=True)

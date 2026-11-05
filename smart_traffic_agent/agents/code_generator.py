@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import json
 from pathlib import Path
 import os
 import re
@@ -12,9 +13,9 @@ from ..focas_harness import render_focas_harness_template
 from ..focas_contracts import named_contract_context, validate_return_code_labels
 from ..focas_capture_runtime import (
     capture_functions, guarded_core, render_capture_harness, validate_capture_fragment,
-    wrap_capture_fragment, motion_read_core, skip_read_core, download4_core,
+    wrap_capture_fragment,
 )
-from ..execution_contracts import execution_contract
+from ..execution_contracts import SESSION_APIS, execution_contract
 from ..orchestration.roles import ActionSpec, AgentTemplate, message_to_dict
 from ..agent_roles import CodeArtifactSpec, CodeSpec, ReviewReport
 from ..knowledge import KnowledgeBase
@@ -27,15 +28,19 @@ from ..agent_tools.validate_focas_cpp import (
     ValidateFocasCppTool,
 )
 from ..agent_tools.knowledge import KnowledgeSearchInput, KnowledgeSearchOutput
+from ..agent_tools.sdk_type_contract import SdkTypeContractInput
 from ..tool_runtime import ToolRegistry, ToolRuntime
 from ..llm import LlmClient
 from ..models import ExecutionPlan, GeneratedArtifacts, NcProgramSpec, PlanStep, WorkflowState
+from ..execution_plan_schema import execution_plan_view, normalize_execution_plan, validate_execution_plan
 from ..tool_protocol import ToolCall, tool_calls_from_step, validate_tool_calls
 from ..utils import ensure_dir
 from ..sdk_type_index import (
     load_or_build_sdk_type_index, validate_struct_member_access,
     sdk_index_prompt_context, sdk_environment_identity,
 )
+from ..history_examples import retrieve_verified_api_examples
+from ..deterministic_cpp_assembler import assemble_core_cpp, DeterministicAssemblyError
 
 
 def sdk_type_context_for_abi(abi: str) -> str:
@@ -82,6 +87,31 @@ class CodeGenerationAgent(AgentTemplate):
         if state.plan is None:
             raise ValueError("Cannot generate code before a plan exists.")
 
+        # Make the current run root available to the deterministic history
+        # retriever; it never becomes an instruction for the model.
+        state.plan.rag_context["output_dir"] = str(output_dir)
+        normalize_execution_plan(state.plan, state.plan.rag_context.get("traffic_relationships"))
+        state.plan.rag_context["execution_plan"] = execution_plan_view(state.plan)
+        state.plan.rag_context["execution_plan_validation"] = validate_execution_plan(state.plan)
+
+        # Query the authoritative SDK type contract before asking the model or
+        # deterministic renderer to produce production C++. This is read-only;
+        # unresolved types block generation instead of allowing local structs.
+        if self.tool_runtime is not None and "get_sdk_type_contract" in self.tool_runtime.registry.names():
+            target_api = str(state.plan.target_api or "").strip()
+            if target_api:
+                sdk_contract, _record = self.tool_runtime.call(
+                    self.role_name,
+                    "get_sdk_type_contract",
+                    SdkTypeContractInput(target_api),
+                )
+                if not isinstance(sdk_contract, dict) or not sdk_contract.get("ok"):
+                    raise ValueError(
+                        "SDK_TYPE_CONTRACT_UNRESOLVED: "
+                        + str((sdk_contract or {}).get("error", target_api))
+                    )
+                state.plan.rag_context["sdk_type_contract"] = sdk_contract
+
         soul_store = getattr(self, "soul_store", None)
         if soul_store is not None:
             state.plan.rag_context["code_generator_soul"] = soul_store.prompt_context(
@@ -115,7 +145,19 @@ class CodeGenerationAgent(AgentTemplate):
             default_focas_header_dir() / "Fwlib32.h",
             Path(os.environ.get("FOCAS_DLL_DIR", str(default_focas_runtime_dir()))) / "Fwlib32.dll",
         )
-        code_generation_tool_search = self._model_tool_retrieval(
+        # Production API operations are generated as small model-authored
+        # fragments.  The model receives the exact SDK ABI/rule context and
+        # the immutable harness still owns connection, capture, logging and
+        # cleanup.  Deterministic validation/compilation remains the admission
+        # gate; the old recipe renderer is retained for compatibility callers.
+        deterministic_cpp_path = False
+        deterministic_fast_path = bool(state.plan.rag_context.get("fast_path", {}).get("enabled"))
+        state.plan.rag_context["generation_mode"] = "llm_api_fragments"
+        state.plan.rag_context["logs_generated_by"] = "deterministic_harness"
+        # Retrieve rule/context evidence once for the complete plan.  The
+        # subsequent bundle generation sends it together with the active SDK
+        # excerpts, rather than issuing one model request per API.
+        code_generation_tool_search = [] if deterministic_cpp_path else self._model_tool_retrieval(
             state.request.description,
             state.plan.scenario_type,
             code_spec,
@@ -125,7 +167,9 @@ class CodeGenerationAgent(AgentTemplate):
             state.plan.rag_context["code_generation_tool_search"] = code_generation_tool_search
         if self.environment is not None:
             state.plan.rag_context["environment_shared_rules"] = self.environment.shared_rules
-        codegen_knowledge = retrieve_codegen_knowledge_context(self.knowledge_base, state, executable_steps)
+        codegen_knowledge = [] if deterministic_cpp_path else retrieve_codegen_knowledge_context(
+            self.knowledge_base, state, executable_steps
+        )
         if codegen_knowledge:
             state.plan.rag_context["code_generation_knowledge"] = codegen_knowledge
         generated_dir = ensure_dir(output_dir / "generated")
@@ -170,17 +214,32 @@ class CodeGenerationAgent(AgentTemplate):
             and not scene.get("nc_execution_decision", {}).get("cycle_start_allowed")
             for scene in state.plan.rag_context.get("scene_plans", [])
         )
-        if deferred_motion:
+        # A running-NC plan may still be waiting for the operator/Cycle Start
+        # gate, but it must retain a valid O-number payload for upload and
+        # later execution.  Clearing it here while the running rule has
+        # already restored StartProgram creates an internally contradictory
+        # contract and fails before capture.
+        if should_defer_nc_program_generation(state.plan, deferred_motion):
             nc_program = ""
             nc_generation_diagnostics = [
                 "NC generation/execution deferred: Cycle Start is required but its simulator and operator gates are not verified."
             ]
-        elif state.plan.rag_context.get("fast_path", {}).get("enabled"):
+        elif should_skip_nc_program_generation(state.plan):
             nc_program = ""
             nc_generation_diagnostics = [
                 "CodeGenerationAgent used deterministic read-only fast path; NC program generation skipped."
             ]
         else:
+            # NC generation needs the same graph contract that Planner used.
+            # Keep it in the shared context so the generator and its validator
+            # cannot silently downgrade a running-state scene to O-number/M30.
+            state.plan.rag_context["nc_program_requirements"] = list(
+                dict.fromkeys(str(item).strip() for item in state.plan.nc_program_requirements if str(item).strip())
+            )
+            state.plan.rag_context["nc_target_api"] = str(
+                state.plan.target_api
+                or next((step.api or step.protocol_function.split("/")[0] for step in executable_steps if step.role == "target"), "")
+            ).strip()
             nc_program, nc_generation_diagnostics = generate_nc_program(
                 state.request.description,
                 state.plan.scenario_type,
@@ -208,24 +267,20 @@ class CodeGenerationAgent(AgentTemplate):
             cpp_generation_diagnostics = [
                 "Production capture uses the immutable SMPAgent harness; only API operations are generated/repaired."
             ]
+            if deterministic_fast_path:
+                cpp_generation_diagnostics.extend([
+                    "Planner fast path selected for scenario/NC decisions; API fragments still use SDK-context LLM generation.",
+                    "Input/output CSV rows, invocation IDs, timestamps and return-code text are generated by CaptureContext and checked by ValidateFocasCppTool.",
+                ])
         elif repairing_existing_fragment:
-            fragment_text = previous_fragment_path.read_text(encoding="utf-8")
-            if self.llm_client.enabled and repair_context:
-                fragment_text = repair_scenario_fragment(
-                    state,
-                    executable_steps,
-                    nc_program,
-                    fragment_text,
-                    repair_context,
-                    self.llm_client,
-                )
-            harness_text = (
-                previous_harness_path.read_text(encoding="utf-8")
-                if previous_harness_path is not None and previous_harness_path.exists()
-                else render_focas_harness(state, executable_steps, fragment_text)
+            # Rebuild from the current ExecutionPlan and SDK recipes.  A
+            # previous fragment is evidence for diagnostics only; it is never
+            # handed back to a model to rewrite ABI-critical C++.
+            harness_text, fragment_text = render_code_only_cpp_artifacts(
+                state, executable_steps, nc_program, self.llm_client,
             )
             cpp_generation_diagnostics = [
-                "CodeGenerationAgent repaired only the existing scenario_fragment.inc and preserved the fixed FOCAS harness."
+                "CodeGenerationAgent regenerated only the affected API fragments from the ExecutionPlan after a repair request."
             ]
         else:
             harness_text, fragment_text = render_code_only_cpp_artifacts(
@@ -306,15 +361,11 @@ class CodeGenerationAgent(AgentTemplate):
                     self._render_focas_cpp(harness_path, fragment_path, api_script_path)
                     api_script = api_script_path.read_text(encoding="utf-8")
                     continue
-                if compile_attempt < max_internal_repair_attempts and self.llm_client.enabled and not runtime_capture:
-                    fragment_text = repair_scenario_fragment_after_contract_error(
-                        state, executable_steps, nc_program, fragment_text,
-                        "; ".join(validation_errors), self.llm_client,
+                if not generated_runtime_capture:
+                    raise ValueError(
+                        "CODEGEN_DETERMINISTIC_VALIDATION_FAILED: "
+                        + "; ".join(validation_errors)
                     )
-                    self._write_artifact(fragment_path, fragment_text)
-                    self._render_focas_cpp(harness_path, fragment_path, api_script_path)
-                    api_script = api_script_path.read_text(encoding="utf-8")
-                    continue
                 raise ValueError(("CODEGEN_REPAIR_EXHAUSTED: " if runtime_capture else "") +
                                  "ValidateFocasCppTool rejected generated C++: " + "; ".join(validation_errors))
             if state.request.target_environment != "ncguide-generated-cpp":
@@ -330,7 +381,7 @@ class CodeGenerationAgent(AgentTemplate):
                 break
             diagnostics.append(f"MSVC preflight compilation failed on CodeGenerationAgent internal attempt {compile_attempt + 1}: {compile_error}")
             state.artifacts.diagnostics = diagnostics
-            if compile_attempt >= max_internal_repair_attempts or not self.llm_client.enabled or fixed_runtime_capture:
+            if compile_attempt >= max_internal_repair_attempts or not self.llm_client.enabled or fixed_runtime_capture or not generated_runtime_capture:
                 raise ValueError(("CODEGEN_REPAIR_EXHAUSTED: " if runtime_capture else "") +
                                  "Generated C++ failed MSVC preflight compilation: " + compile_error)
             if generated_runtime_capture:
@@ -356,7 +407,11 @@ class CodeGenerationAgent(AgentTemplate):
             self._render_focas_cpp(harness_path, fragment_path, api_script_path)
             api_script = api_script_path.read_text(encoding="utf-8")
             cpp_generation_diagnostics.append("CodeGenerationAgent repaired scenario_fragment.inc from MSVC preflight compiler diagnostics.")
-        if self.llm_client.enabled and not bool(state.request.permissions.get("code_only_evaluation")):
+        # Runtime fragments already pass the deterministic SDK/contract/MSVC
+        # gates below.  Do not spend a second model call on an advisory whole
+        # program review for the same live capture; keep that review for the
+        # non-runtime compatibility path only.
+        if self.llm_client.enabled and not deterministic_cpp_path and not generated_runtime_capture and not bool(state.request.permissions.get("code_only_evaluation")):
             review_diagnostics = review_generated_with_llm(
                     self.llm_client,
                     state.request.description,
@@ -745,7 +800,12 @@ def generate_nc_program(
     generated = generate_nc_program_with_llm(task_description, scenario, nc_program_spec, rag_context, llm_client)
     if not generated:
         raise ValueError("CodeGenerationAgent LLM returned an empty or unsafe NC program.")
-    framing_errors = validate_nc_payload_framing(generated) + validate_nc_controller_modes(generated)
+    framing_errors = (
+        validate_nc_payload_framing(generated)
+        + validate_nc_controller_modes(generated, rag_context)
+        + validate_nc_program_requirements(generated, rag_context)
+        + validate_nc_runtime_budget(generated, rag_context)
+    )
     if framing_errors:
         repaired = repair_nc_program_with_llm(
             task_description,
@@ -758,14 +818,25 @@ def generate_nc_program(
         )
         if not repaired:
             raise ValueError("CodeGenerationAgent NC repair returned an empty or unsafe NC program.")
-        framing_errors = validate_nc_payload_framing(repaired) + validate_nc_controller_modes(repaired)
+        framing_errors = (
+            validate_nc_payload_framing(repaired)
+            + validate_nc_controller_modes(repaired, rag_context)
+            + validate_nc_program_requirements(repaired, rag_context)
+            + validate_nc_runtime_budget(repaired, rag_context)
+        )
         if framing_errors:
             raise ValueError("CodeGenerationAgent NC payload repair failed: " + "; ".join(framing_errors))
         return repaired, [
             "LLM generated NC program from PlannerAgent specification.",
             "CodeGenerationAgent repaired NC payload framing from validation feedback.",
+            f"Deterministic NC runtime estimate: {rag_context.get('nc_runtime_estimate', {}).get('estimated_seconds', 0)}s "
+            f"within budget {rag_context.get('nc_runtime_budget_seconds', nc_runtime_budget_seconds())}s.",
         ]
-    return generated, ["LLM generated NC program from PlannerAgent specification."]
+    return generated, [
+        "LLM generated NC program from PlannerAgent specification.",
+        f"Deterministic NC runtime estimate: {rag_context.get('nc_runtime_estimate', {}).get('estimated_seconds', 0)}s "
+        f"within budget {rag_context.get('nc_runtime_budget_seconds', nc_runtime_budget_seconds())}s.",
+    ]
 
 
 def generate_nc_program_with_llm(
@@ -785,16 +856,64 @@ def generate_nc_program_with_llm(
         "- Do not emit redundant G97 when no G96 constant-surface-speed mode is used. For a G17 milling program, use S with M03/M04 directly; do not introduce G96.\n"
         "- If rag_context.coverage_segments contains multiple segments, generate one short NC text payload for the first segment with nc_program_required=true. Only cycle_start_required=true calls for executable axis motion. A program-transfer segment may need NC text but must not start it. Other non-NC segments use direct FOCAS calls.\n"
         "- For coordinate-motion traffic, prefer several observable G01 motion blocks whose main motion lasts about 2-5 seconds each in simulation.\n"
-        "- Use moderate low feed and moderate travel: slow enough for repeated sampling, but not so slow that the program takes excessive time. Avoid extremely low feed values or very long travel unless repair context explicitly requires them.\n"
+        "- Use a documented positive feed and short travel that keeps the complete payload within the deterministic runtime budget. Do not force a slow feed merely to obtain longer sampling windows.\n"
+        "- Keep the complete payload within the deterministic global runtime budget. Prefer short motion blocks and documented feed values; never use long low-feed motion that can hold run=3/motion=1 until the executor timeout.\n"
         "- Use PlannerAgent's quality analysis: if feed/position variation is required, balance motion duration, sampling frequency, and total runtime.\n"
         "- If a previous NC program failed or produced poor traffic, revise that program based on the failure context instead of ignoring it.\n"
         "- End with M30.\n"
         "- Return JSON only. Do not include Markdown.\n\n"
         "# Output Schema\n"
-        "{\"nc_program\":\"O1234\\nG90 G54\\nG01 X...\\nM30\\n\",\"notes\":[\"short note\"]}"
+        "{\"nc_program\":\"O1234\\nG90 G54\\nG01 X...\\nM30\\n\",\"notes\":[\"short note\"],\"alarm_trigger\":{\"alarm_code\":\"controller code\",\"condition\":\"exact NC condition\",\"evidence\":\"RAG/manual evidence id\"}}"
     )
+    required_nc = [str(item).strip() for item in rag_context.get("nc_program_requirements", []) if str(item).strip()]
+    target_api = str(rag_context.get("nc_target_api", "")).strip()
+    if required_nc:
+        system_prompt += (
+            "\n# Mandatory graph NC requirements\n"
+            f"Target API: {target_api or 'unspecified'}\n"
+            f"Requirements: {required_nc}\n"
+            "These requirements are executable constraints, not explanatory notes. "
+            "Do not return an idle O-number/M30-only program when they require a running state. "
+            "For spindle variation, include real M03 or M04 start and multiple distinct S speed blocks "
+            "(minimum two; additional values are allowed and preferred when the runtime budget permits), "
+            "M05 stop, and M30.\n"
+        )
+    if target_api == "cnc_rdspcss":
+        system_prompt += (
+            "\n# Constant-surface-speed requirement\n"
+            "cnc_rdspcss reads CSS state, so the NC payload must execute in lathe/CSS mode: "
+            "include G96 before the spindle speed stages, use multiple distinct S values "
+            "(minimum two; do not cap the program at two when more values fit the runtime budget), "
+            "and do not emit G17 or G94 milling-mode blocks. Keep M03/M04, M05 and M30.\n"
+        )
+        system_prompt += (
+            "Use a short, moderate-speed motion window: prefer G91 incremental moves of about "
+            "Z-2.0 and X1.0 (never an absolute far-away X target such as X30 when the current "
+            "position is unknown), use short incremental moves and a documented positive feed selected "
+            "from the active controller limits, then restore G90 before M05/M30. The global runtime "
+            "estimate, rather than an API-specific slow-feed rule, controls the duration.\n"
+        )
+        system_prompt += (
+            "The attached FANUC 0i-D manual distinguishes M and T semantics: "
+            "for M-series machining centers use G92 S_ for the maximum spindle-speed clamp; "
+            "G50 S_ is a T-series G-code-system-A option and must not be emitted unless "
+            "rag_context explicitly confirms T series and G-code system A. If the series is "
+            "unknown, record the missing clamp as an advisory state and allow the observation "
+            "to proceed; do not turn smax=0 into a code-generation rejection.\n"
+        )
+    alarm_trigger = rag_context.get("alarm_history_trigger", {})
+    if isinstance(alarm_trigger, dict) and alarm_trigger.get("required"):
+        system_prompt += (
+            "\n# Required alarm-producing NC behavior\n"
+            "The selected target requires a fresh alarm before alarm-history reads. "
+            "Choose one controller-specific alarm-producing NC condition from the retrieved, "
+            "verified RAG/manual evidence for this controller and scenario. Include the exact "
+            "alarm code/condition and its evidence in notes. Do not invent, hard-code, or reuse "
+            "a generic G/M code when evidence does not support it; if no verified NC trigger is "
+            "available, return an explicit generation error instead of a normal no-alarm program.\n"
+        )
     segments = rag_context.get("coverage_segments", [])
-    if segments and not any(segment.get("cycle_start_required") for segment in segments if isinstance(segment, dict)):
+    if segments and not any(segment.get("cycle_start_required") for segment in segments if isinstance(segment, dict)) and not (isinstance(alarm_trigger, dict) and alarm_trigger.get("required")):
         system_prompt += (
             "\n# Non-motion API batch\n"
             "The NC text, if needed, is only a program-transfer or verification input. "
@@ -829,6 +948,15 @@ def generate_nc_program_with_llm(
             "proposed and unknown relationships are hypotheses only.\n"
         )
     payload = llm_client.invoke_json(system_prompt, user_prompt)
+    if isinstance(alarm_trigger, dict) and alarm_trigger.get("required"):
+        selected = payload.get("alarm_trigger") if isinstance(payload, dict) else None
+        if not isinstance(selected, dict) or not all(
+            str(selected.get(key, "")).strip() for key in ("alarm_code", "condition", "evidence")
+        ):
+            raise ValueError(
+                "Alarm-history NC generation requires a controller-specific alarm_trigger "
+                "with alarm_code, condition, and RAG evidence; no generic trigger is accepted."
+            )
     nc_program = str(payload.get("nc_program", "")).strip()
     if not nc_program:
         blocks = payload.get("blocks", [])
@@ -849,7 +977,7 @@ def validate_nc_payload_framing(nc_program: str) -> list[str]:
     return errors
 
 
-def validate_nc_controller_modes(nc_program: str) -> list[str]:
+def validate_nc_controller_modes(nc_program: str, rag_context: dict[str, Any] | None = None) -> list[str]:
     blocks = [re.sub(r"\([^)]*\)", "", line).upper() for line in nc_program.splitlines()]
     has_g17 = any(re.search(r"(?<![A-Z0-9.])G0?17(?![0-9.])", block) for block in blocks)
     has_g96 = any(re.search(r"(?<![A-Z0-9.])G0?96(?![0-9.])", block) for block in blocks)
@@ -860,6 +988,65 @@ def validate_nc_controller_modes(nc_program: str) -> list[str]:
         re.search(r"(?<![A-Z0-9.])G0?97(?![0-9.])", block) for block in blocks
     ):
         errors.append("NC program must omit unneeded G97; use S with M03/M04 directly")
+    rag_context = rag_context or {}
+    has_g50_speed_clamp = any(re.search(r"(?<![A-Z0-9.])G0?50\s*S\s*[+-]?\d", block) for block in blocks)
+    series = str(rag_context.get("controller_series") or rag_context.get("machine_series") or "").strip().upper()
+    g_code_system = str(rag_context.get("g_code_system") or "").strip().upper()
+    if has_g50_speed_clamp and not (series.startswith("T") and g_code_system in {"A", "GCODE_A", "G CODE SYSTEM A"}):
+        errors.append("G50 S maximum-spindle-speed clamp requires confirmed T series and G-code system A; use G92 S_ for M series or request confirmation")
+    return errors
+
+
+def validate_nc_program_requirements(nc_program: str, rag_context: dict[str, Any]) -> list[str]:
+    """Validate graph-declared NC behavior before upload.
+
+    The check is deliberately based on the plan contract, while the spindle
+    rule is expressed by capability (a running spindle with speed variation),
+    so new APIs can reuse it without adding API-specific branches.
+    """
+    requirements = [str(item).strip().lower() for item in rag_context.get("nc_program_requirements", []) if str(item).strip()]
+    target = str(rag_context.get("nc_target_api", "")).strip()
+    if not requirements:
+        return []
+    text = re.sub(r"\([^)]*\)", "", nc_program).upper()
+    errors: list[str] = []
+    running = any("running" in item or "主轴启动" in item or "spindle" in item for item in requirements)
+    spindle_variation = any(
+        marker in item
+        for item in requirements
+        for marker in ("恒表面速度", "主轴速度变化", "spindle speed", "speed variation")
+    )
+    css_target = target == "cnc_rdspcss"
+    if running and spindle_variation or css_target:
+        if not re.search(r"\bM0?[34]\b", text):
+            errors.append(f"NC requirement for {target or 'target API'} requires spindle start with M03 or M04")
+        speeds = re.findall(r"\bS(?:[0-9]+(?:\.[0-9]+)?)\b", text)
+        if len(set(speeds)) < 2:
+            errors.append(
+                f"NC requirement for {target or 'target API'} requires multiple distinct spindle speed S values "
+                "(minimum two; additional values are allowed)"
+            )
+        if not re.search(r"\bM0?5\b", text):
+            errors.append(f"NC requirement for {target or 'target API'} requires spindle stop with M05")
+    if css_target:
+        if not re.search(r"\bG0?96\b", text):
+            errors.append("NC requirement for cnc_rdspcss requires G96 constant-surface-speed mode")
+        if re.search(r"\bG0?17\b", text) or re.search(r"\bG0?94\b", text):
+            errors.append("NC requirement for cnc_rdspcss forbids G17/G94 milling mode; use G96 CSS mode")
+        feeds = [float(value) for value in re.findall(r"\bF([0-9]+(?:\.[0-9]+)?)\b", text)]
+        if feeds and any(value <= 0 for value in feeds):
+            errors.append("NC requirement for cnc_rdspcss requires positive feed values")
+        series = str(rag_context.get("controller_series") or rag_context.get("machine_series") or "").strip().upper()
+        g_code_system = str(rag_context.get("g_code_system") or "").strip().upper()
+        has_g92_clamp = any(re.search(r"\bG0?92\s*S\s*[1-9][0-9]*(?:\.[0-9]+)?\b", block) for block in text.splitlines())
+        has_t_g50_clamp = (
+            series.startswith("T")
+            and g_code_system in {"A", "GCODE_A", "G CODE SYSTEM A"}
+            and any(re.search(r"\bG0?50\s*S\s*[1-9][0-9]*(?:\.[0-9]+)?\b", block) for block in text.splitlines())
+        )
+        # smax=0 is a controller state observation.  Record it for graph/RAG
+        # diagnostics instead of rejecting the NC payload; the applicable
+        # G92/G50 rule depends on the machine series and code system.
     return errors
 
 
@@ -875,8 +1062,12 @@ def repair_nc_program_with_llm(
     system_prompt = (
         "You are CodeGenerationAgent repairing an NC download payload. Return JSON only with key nc_program. "
         "Preserve the valid NC blocks, program number, safety constraints, and M30. "
+        "The repaired payload must fit the deterministic global runtime budget; shorten motion blocks or use a "
+        "documented feed instead of adding waits or long low-feed motion. "
         "Repair all reported framing and controller-mode errors. For a G17 milling program, remove G97 "
         "and use S with M03/M04 directly; do not introduce G96. The exact payload must start with one LF before O-number, "
+        "For cnc_rdspcss, a positive maximum spindle-speed clamp must appear before G96: use G92 S#### for an M-series "
+        "machining center; use G50 S#### only when the context explicitly confirms T series and G-code system A. "
         "use LF between lines, and end with one LF followed by exactly one percent character: \nO1234\n...\nM30\n%. "
         "Do not add a percent line at the beginning or any content after the final percent."
     )
@@ -896,6 +1087,10 @@ def normalize_llm_nc_program(nc_program: str, program_name: str) -> str:
     program_name = safe_nc_program_name(program_name)
     lines = [line.strip() for line in nc_program.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
     lines = [line for line in lines if line and not line.startswith("%")]
+    # Standalone parenthesized lines are generator commentary, not executable
+    # NC blocks.  They also consume a Single Block click in NCGuide, so keep
+    # them out of the uploaded payload entirely.
+    lines = [line for line in lines if not re.fullmatch(r"\([^()]*\)", line)]
     if not lines:
         return ""
     if not lines[0].startswith("O"):
@@ -921,6 +1116,34 @@ def safe_nc_program_name(program_name: str) -> str:
     return f"O{safe_nc_program_number(nc_program_number(program_name, 5711)):04d}"
 
 
+def should_skip_nc_program_generation(plan: ExecutionPlan) -> bool:
+    """Return whether the selected path is genuinely read-only.
+
+    A running-NC fast path still needs a generated O-number program; it only
+    skips the Planner LLM decision.  Treating it as a read-only path produces
+    an empty payload and is rejected by the execution contract.
+    """
+    fast_path = plan.rag_context.get("fast_path", {}) if plan is not None else {}
+    return bool(
+        isinstance(fast_path, dict)
+        and fast_path.get("enabled")
+        and fast_path.get("kind") != "running_nc_program"
+        and not plan.rag_context.get("alarm_history_trigger", {}).get("required")
+    )
+
+
+def should_defer_nc_program_generation(plan: ExecutionPlan, deferred_motion: bool) -> bool:
+    """Defer only plans that do not already require a running NC payload."""
+    if not deferred_motion:
+        return False
+    fast_path = plan.rag_context.get("fast_path", {})
+    running_plan = (
+        plan.nc_program_type == "required_for_running_state"
+        or (isinstance(fast_path, dict) and fast_path.get("kind") == "running_nc_program")
+    )
+    return not running_plan
+
+
 def safe_nc_program_number(program_number: int) -> int:
     """Avoid FANUC protected O8000/O9000 ranges for generated upload payloads."""
 
@@ -943,37 +1166,14 @@ def generate_cpp_api_script(
 ) -> tuple[str, list[str]]:
     if state.plan is None:
         raise ValueError("CodeGenerationAgent cannot generate C++ before a plan exists.")
-    fixed_interfaces = {
-        "UploadProgram",
-        "SelectProgram",
-        "ReadProgramNumber",
-        "StartProgram",
-        "ReadRunStatus",
-        "ReadPosition",
-        "ReadDistanceToGo",
-        "ReadFeedSpeed",
-        "ReadSpindleSpeed",
-        "ReadAlarm",
-    }
-    code_only = bool(state.request.permissions.get("code_only_evaluation"))
-    representative_code_only = bool(
-        code_only and state.request.permissions.get("representative_scenario")
-    )
-    if representative_code_only:
-        script = render_code_only_cpp_template(state, executable_steps, nc_program, llm_client)
-        return script, [
-            "CodeGenerationAgent rendered a fixed ABI-safe C++ template and inserted only the LLM-generated scenario core."
-        ]
-    if code_only or any(step.interface_name not in fixed_interfaces for step in executable_steps):
-        script = generate_cpp_api_script_with_llm(state, executable_steps, nc_program, llm_client)
-        return script, [
-            "CodeGenerationAgent used the RAG/official-ABI LLM path; no TOOL_REGISTRY admission filter was applied."
-        ]
-    script = render_fixed_ncguide_cpp_script(state, executable_steps, nc_program)
+    # Keep this public compatibility entry point on the same statements-only
+    # fragment path as production capture.  The LLM may author API statements,
+    # while the fixed harness and validators own the surrounding C++.
+    script = render_code_only_cpp_template(state, executable_steps, nc_program, llm_client)
     if not script:
-        raise ValueError("CodeGenerationAgent fixed C++ scaffold renderer returned an empty script.")
+        raise ValueError("CodeGenerationAgent deterministic C++ renderer returned an empty script.")
     return script, [
-        "CodeGenerationAgent used fixed NCGuide C++ scaffold; LLM only supplies fillable NC payload/configuration content."
+        "CodeGenerationAgent generated ordered SDK-context API fragments; the fixed harness and deterministic validators own execution admission."
     ]
 
 
@@ -1004,10 +1204,34 @@ def render_code_only_cpp_artifacts(
             for function_name in protocol_function_names(step.protocol_function)
         }
     )
-    core_cpp = generate_scenario_core_with_llm(
-        state, executable_steps, nc_program, llm_client, selected_functions
+    contract = execution_contract(
+        state.plan,
+        state.request.permissions.get("coverage_current_batch_functions")
+        or state.request.permissions.get("required_api_functions") or (),
     )
-    fragment = build_scenario_fragment(core_cpp)
+    if llm_client.enabled:
+        # Keep the same statements-only API fragment contract for simulator,
+        # code-only and live-capture callers.  The production harness still
+        # owns its main function and dynamic bindings.
+        core_cpp = generate_api_fragments_with_llm(
+            state, executable_steps, nc_program, llm_client,
+            wrap=False,
+        )
+        fragment = build_scenario_fragment(core_cpp)
+    else:
+        from ..parameter_coverage import attach_parameter_contract
+        parameter_contract = attach_parameter_contract(state.plan, contract.targets)
+        try:
+            core_cpp = assemble_core_cpp(
+                targets=contract.targets,
+                planned_functions=contract.planned_functions or selected_functions,
+                steps=executable_steps,
+                parameter_contract=parameter_contract,
+            )
+        except DeterministicAssemblyError as exc:
+            raise ValueError(str(exc)) from exc
+        core_cpp = normalize_capture_core(core_cpp)
+        fragment = build_scenario_fragment(core_cpp)
     return render_focas_harness(state, executable_steps, fragment), fragment
 
 
@@ -1045,6 +1269,55 @@ def _normalize_model_core(core_cpp: str) -> str:
         text = match.group(1).strip()
     text = re.sub(r"(?m)^\s*(?:short\s+ret|bool\s+ok)\s*=.*?;\s*$", "", text)
     text = re.sub(r"sizeof\s*\(\s*ODBAXIS\s*\)", "(4 + 4 * MAX_AXIS)", text, flags=re.IGNORECASE)
+    # The fixed harness owns the FOCAS handle lifecycle.  Models sometimes
+    # copy a cleanup call into the fragment; remove that complete conditional
+    # block before validation/compilation so it cannot double-free the handle
+    # or trigger the fragment-boundary validator.
+    cursor = 0
+    while True:
+        match = re.search(r"(?m)^\s*if\s*\([^\n]*matched_targets[^\n]*\)\s*\{", text[cursor:])
+        if not match:
+            break
+        start = cursor + match.start()
+        brace = cursor + match.end() - 1
+        depth, index, quoted, escaped = 0, brace, None, False
+        while index < len(text):
+            char = text[index]
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quoted:
+                    quoted = None
+            elif char in {"'", '"'}:
+                quoted = char
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index + 1
+                    block = text[start:end]
+                    if "cnc_freelibhndl" in block:
+                        text = text[:start] + "/* framework owns cnc_freelibhndl cleanup */" + text[end:]
+                    cursor = start
+                    break
+            index += 1
+        else:
+            break
+    # A standalone release operation is another common model leak. Remove
+    # the complete call up to its following return-code check; the immutable
+    # harness performs the release after the fragment returns.
+    text = re.sub(
+        r'(?s)ctx\.call\([^;]*"cnc_freelibhndl".*?\}\);\s*(?=if\s*\(ret)',
+        '/* framework owns cnc_freelibhndl cleanup */\n',
+        text,
+        count=4,
+    )
+    # Log payload fields are semicolon-delimited.  Normalize the common
+    # generated string form `",field="` without touching C++ argument lists.
+    text = re.sub(r'(["\']),(?=[A-Za-z_]\w*=)', r'\1;', text)
     return text
 
 def build_scenario_fragment(core_cpp: str) -> str:
@@ -1056,6 +1329,7 @@ def build_scenario_fragment(core_cpp: str) -> str:
         "    unsigned short handle\n"
         ")\n"
         "{\n"
+        "    CaptureContext ctx;\n"
         "    bool ok = true;\n"
         "    std::string nc_payload;\n"
         "    std::vector<char> nc_buffer;\n"
@@ -1095,123 +1369,150 @@ def normalize_capture_core(core: str) -> str:
     return "".join(lines)
 
 
+def _core_cpp_from_payload(payload: Any) -> str:
+    """Accept the canonical core_cpp key and common provider aliases."""
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("core_cpp", "fragment_cpp", "scenario_fragment", "cpp_code"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return strip_cpp_fence(value).strip()
+    return ""
+
+
+def _record_generation_response(state: WorkflowState, llm_client: LlmClient, *, stage: str) -> None:
+    """Keep structured diagnostics without confusing them with API evidence."""
+    if state.plan is None:
+        return
+    raw_text = getattr(llm_client, "last_json_text", "") or ""
+    text = raw_text if isinstance(raw_text, str) else ""
+    payload = getattr(llm_client, "last_json_payload", {}) or {}
+    state.plan.rag_context.setdefault("code_generation_responses", []).append({
+        "stage": stage,
+        "response_chars": len(text),
+        "raw_response": text,
+        "response_keys": sorted(payload) if isinstance(payload, dict) else [],
+        "parse_error": str(getattr(llm_client, "last_json_parse_error", "") or ""),
+        "contains_cpp_marker": "core_cpp" in text or "fragment_cpp" in text,
+    })
+
+
+def _ensure_parameter_combinations(plan: ExecutionPlan, contract: Any, targets: set[str]) -> None:
+    """Reject only a completed empty domain, never a pending dependency."""
+    # Direct recipe/unit callers may construct a partial plan before the
+    # normal CodeGenerationAgent validation hand-off. Defer this guard until
+    # that hand-off has produced its structured validation record.
+    if "execution_plan_validation" not in plan.rag_context:
+        return
+    coverage = plan.rag_context.get("parameter_coverage_contract", {})
+    entries = coverage.get("functions", {}) if isinstance(coverage, dict) else {}
+    pending_targets: set[str] = set()
+    for binding in getattr(plan, "runtime_bindings", ()) or ():
+        if isinstance(binding, dict) and str(binding.get("target_api", "")).strip():
+            pending_targets.add(str(binding["target_api"]).strip())
+    for step in getattr(plan, "steps", ()) or ():
+        params = step.parameters if isinstance(step.parameters, dict) else {}
+        # Deterministic running-state recipes may declare a domain directly
+        # on the step (for example cnc_accdecdly axis=1..N sourced from
+        # cnc_sysinfo.sysinfo.axes) rather than using a graph runtime_binding.
+        # This is a resolvable runtime domain, not an empty combination set.
+        if (
+            str(step.protocol_function or "").strip() == "cnc_accdecdly"
+            and str(params.get("axis_domain", "")).strip() == "1..N"
+            and str(params.get("axis_source", "")).strip()
+        ):
+            pending_targets.add("cnc_accdecdly")
+        for binding in params.get("runtime_bindings", ()) or ():
+            if isinstance(binding, dict) and str(binding.get("target_api", "")).strip():
+                pending_targets.add(str(binding["target_api"]).strip())
+    runtime_results = plan.rag_context.get("runtime_parameter_bindings", {})
+    runtime_results = runtime_results if isinstance(runtime_results, dict) else {}
+    for target in sorted(targets):
+        runtime_result = runtime_results.get(target)
+        if target in pending_targets and runtime_result is None:
+            # The first generation pass is allowed to contain the prerequisite
+            # call. The target is resolved after Executor records its output.
+            continue
+        if target in pending_targets and isinstance(runtime_result, dict):
+            status = str(runtime_result.get("status", "")).strip()
+            if status in {"pending_dependencies", "source_pending"}:
+                continue
+            if runtime_result.get("success") is False:
+                errors = runtime_result.get("errors", [])
+                detail = "; ".join(
+                    str(item.get("message", item)) if isinstance(item, dict) else str(item)
+                    for item in errors
+                ) or "runtime parameter binding failed"
+                raise ValueError(f"PARAMETER_BINDING_FAILED: {target}; {detail}")
+            if status == "empty_result" or runtime_result.get("empty_result"):
+                raise ValueError(f"PARAMETER_COMBINATIONS_EMPTY: {target}; filtered legal domain is empty")
+        entry = entries.get(target, {}) if isinstance(entries, dict) else {}
+        dimensions = entry.get("dimensions", []) if isinstance(entry, dict) else []
+        cases = entry.get("cases", []) if isinstance(entry, dict) else []
+        strategies = entry.get("planner_strategies", []) if isinstance(entry, dict) else []
+        if dimensions and not cases and not strategies and target not in pending_targets:
+            raise ValueError(
+                f"PARAMETER_COMBINATIONS_EMPTY: {target}; parameter domain/selection is unresolved "
+                "(no bound values, legal cases, or deterministic selection strategy)"
+            )
+
+
+def active_sdk_symbol_evidence(functions: list[str] | set[str] | tuple[str, ...]) -> dict[str, str]:
+    """Return prototype evidence for planned APIs from the active header.
+
+    This is deliberately independent of the optional SDK type-candidate index:
+    an empty type-candidate list does not mean that the API itself is missing.
+    """
+    header = default_focas_header_dir() / "Fwlib32.h"
+    if not header.is_file():
+        return {str(name): "header_unavailable" for name in functions}
+    try:
+        text = header.read_text(encoding="latin-1")
+    except OSError:
+        return {str(name): "header_unreadable" for name in functions}
+    result: dict[str, str] = {}
+    for name in sorted({str(item).strip() for item in functions if str(item).strip()}):
+        if re.search(rf"\b{re.escape(name)}\s*\(", text):
+            result[name] = "confirmed_header_prototype"
+        else:
+            result[name] = "not_found_in_active_header"
+    return result
+
+
 def generate_capture_fragment(
     state: WorkflowState, steps: list[PlanStep], nc_program: str, llm_client: LlmClient,
     *, previous: str = "", diagnostics: str = "",
 ) -> str:
-    """Model edits typed operations; connection, capture and CSV are fixed."""
+    """Generate the production fragment from ordered, SDK-scoped API pieces.
+
+    A configured LLM receives the complete ExecutionPlan once and returns an
+    ordered bundle of statements-only fragments, one per planned API step. The
+    fixed harness and :class:`ValidateFocasCppTool` remain the owners of
+    connection, capture, logging, ABI checks and compilation. The deterministic
+    recipe path is retained only for offline/legacy callers that do not
+    configure an LLM; it is no longer the production admission path and its
+    missing-recipe error is never used when the model is available.
+    """
     assert state.plan is not None
-    deterministic_fast_path = bool(state.plan.rag_context.get("fast_path", {}).get("enabled"))
     contract = execution_contract(state.plan, state.request.permissions.get("coverage_current_batch_functions")
                                   or state.request.permissions.get("required_api_functions") or ())
     targets = set(contract.targets)
     from ..parameter_coverage import attach_parameter_contract
-    parameter_contract = attach_parameter_contract(state.plan, contract.targets)
-    core = (skip_read_core() if targets == {"cnc_skip"} else
-            download4_core() if targets == {"cnc_download4"} else
-            motion_read_core(targets) if contract.motion else guarded_core(
-                targets, samples=int(state.request.permissions.get("capture_samples", 30)),
-                interval_ms=int(1000 * float(state.request.permissions.get("capture_interval_seconds", 0.2))),
-            ))
-    # Only no-variable-input recipes may bypass generation. A parameterized
-    # plan must be implemented from its contract, without API-name exceptions.
-    variable = any(rule["dimensions"] for rule in parameter_contract["functions"].values())
-    planned_cases = any(rule["planner_strategies"] or rule["planner_constraints"] or rule["planner_goals"] or rule["cases"] or rule["state_coverage"]
-                        for rule in parameter_contract["functions"].values())
-    if not deterministic_fast_path and targets not in ({"cnc_skip"}, {"cnc_download4"}) and (planned_cases or variable):
-        core = None  # A generic recipe must never overwrite the Planner's concrete design.
-    fast_path_repair = bool(
-        state.plan.rag_context.get("fast_path", {}).get("enabled")
-        and diagnostics
-        and any(marker in diagnostics.lower() for marker in (
-            "no logged invocation", "target api", "parameter log fields",
-        ))
+    attach_parameter_contract(state.plan, contract.targets)
+    _ensure_parameter_combinations(state.plan, contract, targets)
+    if llm_client.enabled:
+        return generate_api_fragments_with_llm(
+            state,
+            steps,
+            nc_program,
+            llm_client,
+            previous=previous,
+            diagnostics=diagnostics,
+        )
+    raise ValueError(
+        "CODEGEN_LLM_UNAVAILABLE: production API fragment generation requires "
+        "a configured CodeGenerationAgent model; no deterministic recipe fallback is used"
     )
-    if (previous or diagnostics) and not fast_path_repair and not deterministic_fast_path and targets not in ({"cnc_skip"}, {"cnc_download4"}):
-        core = None  # Repair evidence must not be discarded by a fixed recipe.
-    if core is not None:
-        return wrap_capture_fragment(normalize_capture_core(core))
-    functions = capture_functions(contract.functions, previous)
-    operation_steps = [step for step in steps if not contract.motion or
-                       set(protocol_function_names(step.protocol_function)) & targets]
-    prompt = (
-        "Implement PlanningAgent's parameter-domain constraints for EVERY target API. Planner specifies "
-        "semantic constraints, evidence, and dependencies; YOU resolve concrete test values using the official "
-        "Fwlib32.h/API documentation and runtime discovery. Preserve planner_strategies, planner_constraints, "
-        "planner_goals and state_coverage. Resolve discovered values by the planned discovery APIs and selection "
-        "rules, not guesses. Never widen the documented domain, narrow a planned coverage goal, or lower "
-        "minimum_distinct. "
-        "Build bounded, valid coupled cases that satisfy planner_constraints; do not emit arbitrary Cartesian products. "
-        "Use controlled one-factor-at-a-time changes for independent dimensions and only Planner-declared valid tuples for coupled dimensions. "
-        "Choose concrete values here from documented ranges/enums and runtime discovery; stay within configuration_budget and do not repeat historical_diversity_feedback configurations unless verifying reproducibility. "
-        "Log each generated configuration in the same invocation record as its response and call timing. Diversity is diagnostic only: a low count must preserve successful calls and must not make online execution fail. "
-        "Discover device-dependent domains through successful read APIs; do not invent program/parameter/axis numbers. "
-        "If any scene_plans entry requires Cycle Start but cycle_start_allowed is false, generate only direct read-only target baselines; omit all program transfer/selection/start operations and do not call the NCGuide motion driver. "
-        "For cnc_skip, call cnc_rdaxisname to discover the controller-reported axis count, then call cnc_skip for axis=-1 and each valid axis 1..count. A CNC program or SKIP signal is not required for these reads. "
-        "Log every formal input using its exact documented name and actual value; serialize input buffers, never addresses. "
-        "Both input and output log fields MUST use semicolon-separated key=value pairs, never comma-separated named fields. "
-        "Example: FlibHndl=32769;number=3329;expected_return_code=5. Commas may appear only within values such as arrays. "
-        "Handles, timestamps, sample indexes and buffer sizes do not count as semantic diversity. "
-        "Implement the requested minimum_distinct from Parameter coverage contract. A single successful "
-        "matched call is valid callable coverage when the contract minimum is one; do not invent extra cases. "
-        "If a larger evidence-backed diversity goal cannot be met, retain successful calls and report the "
-        "limitation without unsafe probing; do not block or discard valid samples merely for low diversity. "
-        "For APIs with no variable inputs use meaningful planned device states; do not vary handles. "
-        "Preserve length/axis/type/buffer dependencies. Writes/control require snapshot, readback and verified restoration "
-        "on success and failure. RESTORE calls are excluded from target diversity. "
-        "Generate only C++17 statements for a FOCAS API scenario. Return JSON {\"core_cpp\":\"...\"}. "
-        "Do not define run_generated_scenario or any enclosing function: the framework wraps core_cpp exactly once. "
-        "When repairing the Existing fragment, return only its body statements, not its function signature or outer braces. "
-        "The immutable production harness provides FocasApi& api, unsigned short handle, CaptureContext& ctx, "
-        "short ret=EW_OK, bool ok=true. Never redeclare ret or ok. Never generate main, types, includes, DLL loading, capture, CSV or connection. "
-        "For cnc_rddynamic and cnc_rddynamic2, use the actual SDK output types ODBDY and ODBDY2, "
-        "pass sizeof(ODBDY) or sizeof(ODBDY2), and log the resulting numeric length. "
-        "EVERY API call MUST use ctx.call(step, exact_api_name, input_parameter_string, api.function, "
-        "[&]{ return api.function(...); }, [&](short rc){ return serialized_output; }). "
-        'step, exact_api_name and input_parameter_string are std::string parameters; use a quoted step label such as "S001". '
-        "The harness checks export availability, records input/output with nanosecond boundaries, and only invokes "
-        "the output builder on EW_OK. The builder must serialize actual named output fields, never addresses, "
-        "sizeof, metadata or invented values. Do not memcpy/reinterpret official outputs. "
-        "For missing prerequisites use ctx.block(target_api, concrete_reason) and stop that operation. "
-        "Check every prerequisite return BEFORE using outputs. Gate state-changing operations on a fresh "
-        "cnc_statinfo: motion=0, run in {0,1}, alarm=0, emergency=0, and documented mode. "
-        "When planner_scene_requirements declares a required CNC mode that differs from a fresh cnc_statinfo read, do not call the dependent target. Require operator action and a fresh read-only mode verification before continuing; if the documented mode-to-ODBST.aut mapping is unknown, block the dependent target and report MODE_EVIDENCE_REQUIRED. Never change the CNC mode in code. "
-        "Writes require a valid read snapshot and verified restoration; do not guess pointers/ranges or restore zero. "
-        "Program APIs must first discover a real resident program; an NC text constant or host_setup is not upload evidence. "
-        "cnc_rdpdf_line must use a non-null explicit verified filename, reset lengths before each call, and read only "
-        "allocated buffer capacity. In MEM mode it must not move the execution pointer. "
-        "Mode/option/reject errors require stopping that operation, never 30 unchanged attempts. "
-        "After EW_DATA call cnc_getdtailerr and report actual err_no/err_dtno. "
-        "Only perform documented intentional negative cases; annotate their input with expected_return_code=<number>. "
-        "Never generate UI clicks, motion startup, NC download, program selection or motion wait loops when "
-        "the execution contract says motion=true: the fixed driver owns that lifecycle. "
-        "Return error when a required operation fails; successful prerequisite calls cannot mask target failure. "
-        "For motion=true generate ONE sampling pass without a repeat loop or Sleep: the driver invokes it "
-        "before motion, repeatedly during blocks, and after completion. For motion=false repeat valid reads "
-        "according to the plan, with bounded intervals. Required targets must all have real ctx.call invocations."
-    )
-    abi = official_focas_abi_context(functions)
-    user = (
-        f"Task: {state.request.description}\nPermissions: {state.request.permissions}\n"
-        f"Execution contract: {contract.to_dict()}\n"
-        f"Scene capability plans (actual changes require runtime evidence): {state.plan.rag_context.get('scene_plans', [])}\n"
-        f"Planner scene requirements: {state.plan.rag_context.get('planner_scene_requirements', [])}\n"
-        f"Environment preflight policy: {state.plan.rag_context.get('environment_preflight_policy', {})}\n"
-        f"Parameter coverage contract: {parameter_contract}\n"
-        f"Target operation steps: {steps_for_prompt(operation_steps)}\nAvailable APIs (helpers allowed): {functions}\n"
-        f"Official ABI:\n{abi}\n"
-        f"SDK type definitions from the active header:\n{sdk_type_context_for_abi(abi)}\n"
-        f"Full documented prerequisites/arguments/options:\n{named_contract_context(functions, max_chars=48000, full=True)}\n"
-        f"NC input (prepare only if planned; never claim it resident): {nc_program!r}\n"
-        f"Repair evidence: {summarize_codegen_repair_context(state)}\n"
-        f"Existing fragment: {previous}\nValidation/compiler diagnostics: {diagnostics}"
-    )
-    payload = llm_client.invoke_json(prompt, user)
-    core = strip_cpp_fence(str(payload.get("core_cpp", ""))).strip()
-    if not core:
-        raise ValueError("Production API generation returned empty core_cpp")
-    return wrap_capture_fragment(normalize_capture_core(core))
-
 
 def validate_scenario_fragment(fragment: str) -> list[str]:
     """Enforce the narrow source boundary between the model and the harness."""
@@ -1267,17 +1568,45 @@ def generate_scenario_core_with_llm(
     nc_program: str,
     llm_client: LlmClient,
     selected_functions: list[str],
+    *,
+    context_steps: list[PlanStep] | None = None,
+    repair_diagnostics: str = "",
+    existing_fragment: str = "",
 ) -> str:
-    """Ask the model for only scenario-specific statements, not a full file."""
+    """Ask the model for statements for the selected API fragment only.
+
+    ``executable_steps`` identifies the fragment being generated.  The full
+    ``context_steps`` list is supplied as read-only ordering/dependency
+    context, so a later fragment can consume variables produced by an earlier
+    planned call without inventing a return value.
+    """
     assert state.plan is not None
     abi = official_focas_abi_context(selected_functions)
     sdk_types = sdk_type_context_for_abi(abi)
     required_semantics = []
-    if state.plan.scenario_type == "tool_management":
+    if state.plan.scenario_type == "tool_management" and any(
+        name in {"cnc_rdtool", "cnc_rdtofs", "cnc_rdtofsr", "cnc_rdtofsinfo", "cnc_rdtofsinfo2"}
+        for name in selected_functions
+    ):
         required_semantics.append(
             "tool_data_access: make a real call to one of cnc_rdtool, cnc_rdtofs, cnc_rdtofsr, "
             "cnc_rdtofsinfo, or cnc_rdtofsinfo2; for cnc_rdtool use IODBTLMNG and check its return code."
         )
+    history_target = selected_functions[0] if selected_functions else state.plan.target_api or next(
+        (name for step in executable_steps if getattr(step, "role", "") == "target"
+         for name in protocol_function_names(step.protocol_function)),
+        "",
+    )
+    historical_examples = retrieve_verified_api_examples(
+        history_target,
+        output_dir=Path(state.plan.rag_context.get("output_dir", "")) if state.plan.rag_context.get("output_dir") else None,
+        limit=3,
+        sdk_identity=str(sdk_environment_identity(
+            default_focas_header_dir(),
+            Path(os.environ.get("FOCAS_DLL_DIR", str(default_focas_runtime_dir()))) / "Fwlib32.dll",
+        )),
+    )
+    state.plan.rag_context["verified_api_examples"] = historical_examples
     system_prompt = (
         "You are CodeGenerationAgent generating only the scenario core for a fixed FANUC FOCAS C++17 template. "
         "Return JSON only with key core_cpp. Do not return includes, structs, typedefs, templates, main(), "
@@ -1292,27 +1621,307 @@ def generate_scenario_core_with_llm(
         "and actual_feed.data. For cnc_download3, use nc_buffer.data() and nc_length; the fixed template already "
         "provides the correctly framed NC payload. Every Planner semantic operation is mandatory and must have a "
         "real executable call in this fragment, never a comment, dead branch, or declaration-only reference. "
+        "Resolve every selected API to its concrete api.<function_name> member from the supplied Fwlib32.h prototype; "
+        "api.function, target_api, TODO and ellipsis are forbidden output tokens. "
         "Keep the fragment concise and compilable."
     )
+    ordered_context_steps = context_steps if context_steps is not None else executable_steps
+    fragment_steps = steps_for_prompt(executable_steps)
     user_prompt = (
         f"Task: {state.request.description}\n"
         f"Scenario: {state.plan.scenario_type}\n"
-        f"Planner steps: {steps_for_prompt(executable_steps)}\n"
-        f"Official APIs available in the fixed shell: {selected_functions}\n"
+        f"ExecutionPlan order and dependency context: {steps_for_prompt(ordered_context_steps)}\n"
+        f"Current API fragment steps (implement only these now): {fragment_steps}\n"
+        f"Official APIs for this fragment: {selected_functions}\n"
         f"Official ABI excerpts:\n{abi}\n"
         f"SDK type definitions from the active header:\n{sdk_types}\n"
+        f"Parameter/API rules from the local knowledge context:\n{state.plan.rag_context.get('code_generation_knowledge', [])}\n"
+        f"Exact API contracts and runtime bindings:\n{state.plan.rag_context.get('exact_api_contracts', {})}\n"
+        f"Runtime execution evidence (only values already returned by upstream calls):\n{getattr(state, 'execution_context', {})}\n"
+        f"Verified historical examples (wire-matched successful calls only; values are comparison evidence, not authority):\n{json.dumps(historical_examples, ensure_ascii=False, indent=2)}\n"
         f"Required semantic operations (must be implemented): {required_semantics}\n"
         f"Agent Soul:\n{code_generator_soul_context(state.plan.rag_context)}\n"
         f"Traffic Relationship Graph context:\n{state.plan.rag_context.get('traffic_relationships', {})}\n"
         f"NC program is already embedded by the shell:\n{nc_program}\n"
-        "Initialize nc_payload/nc_buffer/nc_length inside the fragment when an upload API needs them, using the supplied NC program. "
-        "Return the smallest complete core fragment that implements the Planner steps."
+        + (f"Repair diagnostics for this fragment:\n{repair_diagnostics}\nExisting fragment to repair:\n{existing_fragment}\n" if repair_diagnostics or existing_fragment else "")
+        + "Initialize nc_payload/nc_buffer/nc_length inside the fragment when an upload API needs them, using the supplied NC program. "
+        "When a verified historical example is present, reuse its call shape, structure access, prerequisite order, and log format only after checking them against the current Fwlib32.h prototype and SDK type index; never copy its device-specific values blindly. "
+        "Implement only the current API fragment, preserve the ExecutionPlan order, use runtime-bound variables from earlier steps, and never invent an upstream return value. Return the smallest complete core fragment that implements the current API step."
     )
     payload = llm_client.invoke_json(system_prompt, user_prompt)
-    core = str(payload.get("core_cpp", "")).strip()
+    _record_generation_response(state, llm_client, stage="scenario_core_generation")
+    core = _core_cpp_from_payload(payload)
     if not core:
-        raise ValueError("CodeGenerationAgent scenario-core generation returned an empty core_cpp fragment.")
+        retry_payload = llm_client.invoke_json(
+            "Return JSON only with a non-empty core_cpp string containing the requested FOCAS statements. "
+            "Do not return markdown or an empty value.",
+            user_prompt,
+        )
+        _record_generation_response(state, llm_client, stage="scenario_core_generation_retry")
+        core = _core_cpp_from_payload(retry_payload)
+    if not core:
+        keys = sorted(payload.keys()) if isinstance(payload, dict) else []
+        category = "model_no_code" if not keys else "response_format_error"
+        raise ValueError("CODEGEN_CORE_EMPTY[" + category + "]: CodeGenerationAgent scenario-core generation returned an empty core_cpp fragment (response_keys=" + ",".join(keys) + ").")
     return _normalize_model_core(strip_cpp_fence(core))
+
+
+def _validate_api_fragment_call(fragment: str, functions: list[str]) -> None:
+    """Require each requested API fragment to contain a real SDK call."""
+    source = re.sub(r"//[^\n]*|/\*.*?\*/", "", fragment, flags=re.DOTALL)
+    missing = [
+        name for name in functions
+        if not re.search(rf"\b(?:api\.)?{re.escape(name)}(?:_fn|_p)?\s*\(", source)
+    ]
+    if missing:
+        raise ValueError(
+            "API_FRAGMENT_MISSING_CALL: " + ", ".join(missing)
+            + "; generated fragment must call the requested SDK API"
+        )
+
+
+def generate_api_fragments_with_llm(
+    state: WorkflowState,
+    steps: list[PlanStep],
+    nc_program: str,
+    llm_client: LlmClient,
+    *,
+    previous: str = "",
+    diagnostics: str = "",
+    wrap: bool = True,
+) -> str:
+    """Generate an ordered fragment bundle with one model invocation.
+
+    The initial request contains the complete ExecutionPlan.  The model
+    returns one statements-only fragment per executable API step in the same
+    order.  On repair, diagnostics select only the affected step IDs; one
+    repair request can still update several related fragments without
+    regenerating the unaffected operations.
+    """
+    assert state.plan is not None
+    fragment_rows: list[tuple[PlanStep, list[str]]] = []
+    for step in steps:
+        names = [name for name in protocol_function_names(step.protocol_function) if name not in SESSION_APIS]
+        if names:
+            fragment_rows.append((step, names))
+
+    if not fragment_rows:
+        raise ValueError("CODEGEN_NO_API_FRAGMENTS: ExecutionPlan contains no API operation for CodeGenerationAgent")
+
+    cache = state.plan.rag_context.setdefault("codegen_api_fragments", {})
+    if not isinstance(cache, dict):
+        cache = {}
+        state.plan.rag_context["codegen_api_fragments"] = cache
+    elif not previous and not diagnostics:
+        # A fresh generation must not reuse fragments left by an earlier run
+        # that happened to reuse the same in-memory ExecutionPlan.
+        cache.clear()
+
+    mentioned = set(re.findall(r"\b(?:cnc|pmc)_\w+\b", str(diagnostics)))
+    mentioned_step_ids = set(re.findall(r"\bS[A-Za-z0-9_.-]+\b", str(diagnostics)))
+    repair_step_ids = {
+        step.step_id
+        for step, names in fragment_rows
+        if mentioned.intersection(names)
+    }
+    if diagnostics and not repair_step_ids:
+        # Prefer an explicit step marker when a compiler/validator reports
+        # one.  If only a generic target diagnostic is available, repair the
+        # planned target step; never discard unrelated cached fragments.
+        repair_step_ids = {
+            step.step_id
+            for step, _names in fragment_rows
+            if str(step.step_id) in mentioned_step_ids
+        }
+    if diagnostics and not repair_step_ids:
+        target_name = str(getattr(state.plan, "target_api", "") or "").strip()
+        repair_step_ids = {
+            step.step_id
+            for step, names in fragment_rows
+            if target_name and target_name in names
+        }
+    if diagnostics and not repair_step_ids and len(fragment_rows) == 1:
+        # A single-fragment plan has an unambiguous repair owner even when a
+        # mock/compiler diagnostic omitted both the API name and step marker.
+        repair_step_ids = {fragment_rows[0][0].step_id}
+    if diagnostics and not repair_step_ids:
+        raise ValueError(
+            "API_FRAGMENT_REPAIR_SCOPE_UNKNOWN: diagnostics do not identify a planned API or step; "
+            "refusing to regenerate unrelated fragments"
+        )
+
+    requested_rows = [
+        (step, names)
+        for step, names in fragment_rows
+        if not diagnostics or step.step_id in repair_step_ids or not cache.get(str(step.step_id))
+    ]
+    if requested_rows:
+        try:
+            generated = generate_api_fragment_bundle_with_llm(
+                state,
+                steps,
+                requested_rows,
+                nc_program,
+                llm_client,
+                diagnostics=diagnostics,
+                existing_fragments={
+                    str(key): str(value.get("core_cpp", ""))
+                    for key, value in cache.items()
+                    if isinstance(value, dict) and str(value.get("core_cpp", "")).strip()
+                },
+            )
+        except Exception as exc:
+            api_label = ",".join(
+                name for _step, names in requested_rows for name in names
+            )
+            raise ValueError(f"API_FRAGMENT_GENERATION_FAILED[{api_label}]: {exc}") from exc
+        for step, names in requested_rows:
+            key = str(step.step_id)
+            core = generated.get(key, "")
+            if not core:
+                raise ValueError(
+                    f"API_FRAGMENT_MISSING_FRAGMENT[{','.join(names)}]: model did not return step_id={key}"
+                )
+            _validate_api_fragment_call(core, names)
+            cache[key] = {"step_id": key, "functions": names, "core_cpp": core}
+
+    rows: list[str] = []
+    for step, names in fragment_rows:
+        cached = cache.get(str(step.step_id))
+        if not isinstance(cached, dict) or not str(cached.get("core_cpp", "")).strip():
+            raise ValueError(
+                f"API_FRAGMENT_MISSING_FRAGMENT[{','.join(names)}]: no cached fragment for step_id={step.step_id}"
+            )
+        rows.append(str(cached["core_cpp"]))
+
+    combined = "\n\n".join(item for item in rows if item.strip())
+    if not combined.strip():
+        raise ValueError("CODEGEN_CORE_EMPTY[no_api_fragments]: no API fragment was generated")
+    state.plan.rag_context["code_generation_fragments_order"] = [
+        str(step.step_id) for step, _names in fragment_rows
+    ]
+    normalized = normalize_capture_core(combined)
+    return wrap_capture_fragment(normalized) if wrap else normalized
+
+
+def generate_api_fragment_bundle_with_llm(
+    state: WorkflowState,
+    all_steps: list[PlanStep],
+    requested_rows: list[tuple[PlanStep, list[str]]],
+    nc_program: str,
+    llm_client: LlmClient,
+    *,
+    diagnostics: str = "",
+    existing_fragments: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Call the model once and parse an ordered ``step_id`` fragment bundle."""
+    assert state.plan is not None
+    requested_functions = [name for _step, names in requested_rows for name in names]
+    all_functions = [
+        name for step in all_steps
+        for name in protocol_function_names(step.protocol_function)
+        if name not in SESSION_APIS
+    ]
+    all_functions = list(dict.fromkeys(all_functions))
+    abi = official_focas_abi_context(all_functions)
+    sdk_types = sdk_type_context_for_abi(abi)
+    history: dict[str, Any] = {}
+    for name in requested_functions:
+        history[name] = retrieve_verified_api_examples(
+            name,
+            output_dir=Path(state.plan.rag_context.get("output_dir", ""))
+            if state.plan.rag_context.get("output_dir") else None,
+            limit=3,
+            sdk_identity=str(sdk_environment_identity(
+                default_focas_header_dir(),
+                Path(os.environ.get("FOCAS_DLL_DIR", str(default_focas_runtime_dir()))) / "Fwlib32.dll",
+            )),
+        )
+    state.plan.rag_context["verified_api_examples"] = history
+    requested_prompt_rows = [
+        {
+            "step_id": str(step.step_id),
+            "apis": names,
+            "phase": step.phase,
+            "action": step.action,
+            "parameters": step.parameters,
+        }
+        for step, names in requested_rows
+    ]
+    existing = existing_fragments or {}
+    system_prompt = (
+        "You are CodeGenerationAgent generating API operation fragments for a fixed FANUC FOCAS C++17 harness. "
+        "Return JSON only with key api_fragments, whose value is an array of objects with step_id, apis and core_cpp. "
+        "Generate exactly one statements-only core_cpp fragment for every requested step_id, in the requested order. "
+        "Do not return main(), the callback wrapper, includes, structs, typedefs, connection, cleanup, or markdown. "
+        "The harness already provides FocasApi api, unsigned short handle, CaptureContext ctx, bool ok, short ret, "
+        "nc_payload/nc_buffer/nc_length and the SDK dynamic bindings. Use only official Fwlib32.h types, fields and "
+        "api.<function> members. Preserve the complete ExecutionPlan order and use real variables produced by earlier "
+        "steps for runtime dependencies; never invent an upstream output or replace it with a guessed literal. "
+        "Each requested API must have a real ctx.call invocation with the exact return code, input parameters and output "
+        "logging. Do not emit api.function(...), target_api(...), TODO or ellipsis. Avoid duplicate local declarations "
+        "across fragments by prefixing new locals with the step_id. Repair only requested fragments when diagnostics are "
+        "present; leave unrelated cached fragments unchanged."
+    )
+    user_prompt = (
+        f"Task: {state.request.description}\n"
+        f"Scenario: {state.plan.scenario_type}\n"
+        f"Target environment: {state.request.target_environment}\n"
+        f"Complete ExecutionPlan in authoritative order:\n{steps_for_prompt(all_steps)}\n"
+        f"Fragments to generate or repair now:\n{requested_prompt_rows}\n"
+        f"Official ABI declarations and referenced structures:\n{abi}\n"
+        f"SDK type index context:\n{sdk_types}\n"
+        f"Parameter/rule knowledge:\n{state.plan.rag_context.get('code_generation_knowledge', [])}\n"
+        f"Exact API contracts:\n{state.plan.rag_context.get('exact_api_contracts', {})}\n"
+        f"Traffic Relationship Graph context:\n{state.plan.rag_context.get('traffic_relationships', {})}\n"
+        f"Runtime execution evidence (only successful upstream outputs):\n{getattr(state, 'execution_context', {})}\n"
+        f"Verified same-API examples:\n{json.dumps(history, ensure_ascii=False, indent=2)}\n"
+        f"NC program already embedded by the harness:\n{nc_program}\n"
+        f"Repair diagnostics:\n{diagnostics}\n"
+        f"Existing fragments for the requested steps:\n{json.dumps(existing, ensure_ascii=False, indent=2)}\n"
+        "Return JSON with this shape: {\"api_fragments\":[{\"step_id\":\"S001\",\"apis\":[\"cnc_statinfo\"],\"core_cpp\":\"...\"}]}"
+    )
+    payload = llm_client.invoke_json(system_prompt, user_prompt)
+    _record_generation_response(state, llm_client, stage="api_fragment_bundle_generation")
+    rows = payload.get("api_fragments") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        retry_payload = llm_client.invoke_json(
+            "Return JSON only with api_fragments. Include every requested step_id exactly once; each core_cpp must be non-empty statements-only C++.",
+            user_prompt,
+        )
+        _record_generation_response(state, llm_client, stage="api_fragment_bundle_generation_retry")
+        payload = retry_payload
+        rows = payload.get("api_fragments") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        # Keep compatibility with providers that return one combined core_cpp;
+        # it is accepted only when one fragment was requested.
+        if len(requested_rows) == 1:
+            core = _core_cpp_from_payload(payload)
+            if core:
+                return {str(requested_rows[0][0].step_id): _normalize_model_core(core)}
+        raise ValueError("CODEGEN_FRAGMENT_BUNDLE_FORMAT: expected JSON api_fragments array")
+    expected = {str(step.step_id): names for step, names in requested_rows}
+    result: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        step_id = str(row.get("step_id", "")).strip()
+        if step_id not in expected:
+            raise ValueError(f"CODEGEN_FRAGMENT_BUNDLE_UNPLANNED_STEP: {step_id or '<missing>'}")
+        returned_apis = row.get("apis", expected[step_id])
+        if not isinstance(returned_apis, list) or set(str(item) for item in returned_apis) != set(expected[step_id]):
+            raise ValueError(
+                f"CODEGEN_FRAGMENT_BUNDLE_API_MISMATCH: step_id={step_id}; "
+                f"expected={expected[step_id]}; returned={returned_apis}"
+            )
+        core = _core_cpp_from_payload({"core_cpp": row.get("core_cpp", "")})
+        if not core:
+            raise ValueError(f"CODEGEN_CORE_EMPTY[step={step_id}]: fragment core_cpp is empty")
+        result[step_id] = _normalize_model_core(core)
+    missing = [step_id for step_id in expected if step_id not in result]
+    if missing:
+        raise ValueError("CODEGEN_FRAGMENT_BUNDLE_MISSING_STEPS: " + ", ".join(missing))
+    return result
 
 
 def repair_scenario_fragment_after_compile_error(
@@ -1417,6 +2026,89 @@ def effective_nc_segment_count(nc_program: str) -> int:
     return max(count, 1)
 
 
+def estimate_nc_runtime(nc_program: str) -> dict[str, Any]:
+    """Estimate bounded NC execution time from modal feed and axis distance.
+
+    This is a preflight estimate, not a claim about controller timing.  It is
+    deliberately conservative: every executable line gets a small observation
+    allowance, while motion time is computed from the line distance and the
+    active feed.  Unknown-feed motion is reported instead of silently treating
+    it as instantaneous.
+    """
+    position = {axis: 0.0 for axis in ("X", "Y", "Z", "A", "B", "C")}
+    absolute = True
+    feed: float | None = None
+    segments: list[dict[str, Any]] = []
+    total = 0.0
+    unknown_feed = False
+    for raw in nc_program.replace("\r", "").splitlines():
+        line = re.sub(r"\([^)]*\)", "", raw).strip().upper()
+        if not line or line.startswith("%") or line.startswith("O"):
+            continue
+        if re.search(r"\bG0?91\b", line):
+            absolute = False
+        elif re.search(r"\bG0?90\b", line):
+            absolute = True
+        feed_match = re.search(r"\bF([0-9]+(?:\.[0-9]+)?)", line)
+        if feed_match:
+            parsed_feed = float(feed_match.group(1))
+            if parsed_feed > 0:
+                feed = parsed_feed
+        deltas: list[float] = []
+        for axis in position:
+            match = re.search(rf"\b{axis}(-?[0-9]+(?:\.[0-9]+)?)", line)
+            if not match:
+                continue
+            value = float(match.group(1))
+            delta = value if not absolute else value - position[axis]
+            deltas.append(delta)
+            position[axis] = position[axis] + delta if not absolute else value
+        distance = sum(delta * delta for delta in deltas) ** 0.5
+        if distance > 0:
+            if feed is None:
+                unknown_feed = True
+                motion_seconds = 8.0
+            else:
+                motion_seconds = (distance / feed) * 60.0
+            segment_seconds = max(0.8, motion_seconds) + 0.4
+        else:
+            segment_seconds = 0.35
+        total += segment_seconds
+        segments.append({"line": line, "distance": round(distance, 4), "feed": feed,
+                         "estimated_seconds": round(segment_seconds, 3)})
+    return {
+        "estimated_seconds": round(total, 3),
+        "segment_count": len(segments),
+        "segments": segments,
+        "unknown_feed_motion": unknown_feed,
+    }
+
+
+def nc_runtime_budget_seconds() -> float:
+    try:
+        configured = float(os.environ.get("SMP_MAX_NC_RUNTIME_SECONDS", "90"))
+    except ValueError:
+        configured = 90.0
+    return max(10.0, min(configured, 3600.0))
+
+
+def validate_nc_runtime_budget(nc_program: str, rag_context: dict[str, Any]) -> list[str]:
+    estimate = estimate_nc_runtime(nc_program)
+    budget = nc_runtime_budget_seconds()
+    rag_context["nc_runtime_estimate"] = estimate
+    rag_context["nc_runtime_budget_seconds"] = budget
+    errors: list[str] = []
+    if estimate["unknown_feed_motion"]:
+        errors.append("NC runtime estimate cannot verify a motion line because no feed value is available")
+    if estimate["estimated_seconds"] > budget:
+        errors.append(
+            "NC runtime estimate exceeds global budget: "
+            f"estimated={estimate['estimated_seconds']:.1f}s;budget={budget:.1f}s; "
+            "shorten motion distances or use a documented higher feed while preserving the target condition"
+        )
+    return errors
+
+
 def planned_api_names_by_phase(steps: list[PlanStep]) -> dict[str, list[str]]:
     by_phase: dict[str, list[str]] = {"before": [], "during": [], "after": []}
     for step in steps:
@@ -1435,6 +2127,7 @@ def cpp_string_vector(values: list[str]) -> str:
 
 FIXED_NCGUIDE_APIS = {
     "cnc_allclibhndl3", "cnc_freelibhndl", "cnc_statinfo", "cnc_alarm2",
+    "cnc_sysinfo",
     "cnc_rdalmmsg", "cnc_rdprogdir3", "cnc_dwnstart3", "cnc_download3",
     "cnc_dwnend3", "cnc_search", "cnc_rdprgnum", "cnc_actf",
     "cnc_rdposition", "cnc_rdsvmeter", "cnc_rdparam", "cnc_distance",
@@ -1536,12 +2229,7 @@ def render_fixed_ncguide_cpp_script(
             "delete_all_failed=true;delete_return=" + std::to_string(preDeleteRet),
             [&]() { return cnc_statinfo_fn(handle, &protectStatus); },
             [&]() { return "delete_all_failed=true;delete_return=" + std::to_string(preDeleteRet) +
-                ";delete_return_text=" + RetText(preDeleteRet) +
-                ";aut=" + std::to_string(protectStatus.aut) +
-                ";run=" + std::to_string(protectStatus.run) +
-                ";motion=" + std::to_string(protectStatus.motion) +
-                ";alarm=" + std::to_string(protectStatus.alarm) +
-                ";edit=" + std::to_string(protectStatus.edit) +
+                ";delete_return_text=" + RetText(preDeleteRet) + ";" + StatinfoData(protectStatus) +
                 ";upload_protection_or_mode_gate=true"; }, "Before");
         cleanup();
         return 6;
@@ -1565,6 +2253,8 @@ def render_fixed_ncguide_cpp_script(
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1631,6 +2321,30 @@ string NormalizePhase(const string& value) {
 }
 
 string gCurrentPhase = "Before";
+int gSysinfoAxes = 0;
+std::vector<long> gAccdecReferenceData;
+bool gAccdecVariationObserved = false;
+
+int ParseSysinfoAxes(const char raw[2]) {
+    const unsigned char first = static_cast<unsigned char>(raw[0]);
+    const unsigned char second = static_cast<unsigned char>(raw[1]);
+    if (first >= '0' && first <= '9' && second >= '0' && second <= '9') {
+        return static_cast<int>(first - '0') * 10 + static_cast<int>(second - '0');
+    }
+    if (first >= '0' && first <= '9') return static_cast<int>(first - '0');
+    if (second >= '0' && second <= '9') return static_cast<int>(second - '0');
+    if (first > 0 && second == 0) return static_cast<int>(first);
+    return 0;
+}
+
+string StatinfoData(const ODBST& status) {
+    return "aut=" + std::to_string(status.aut) +
+        ";run=" + std::to_string(status.run) +
+        ";motion=" + std::to_string(status.motion) +
+        ";emergency=" + std::to_string(status.emergency) +
+        ";alarm=" + std::to_string(status.alarm) +
+        ";edit=" + std::to_string(status.edit);
+}
 
 string EscapeCsv(const string& value) {
     if (value.find(',') == string::npos && value.find('"') == string::npos && value.find('\n') == string::npos) {
@@ -1643,9 +2357,12 @@ string EscapeCsv(const string& value) {
 }
 
 int ApiParameterCount(const string& api) {
+    // Legacy CSV compatibility field: SDK/ABI argument count. FlibHndl is
+    // session context, while ODBST* is an output buffer for cnc_statinfo.
     if (api == "cnc_allclibhndl3") return 4;
     if (api == "cnc_freelibhndl") return 1;
     if (api == "cnc_statinfo") return 2;
+    if (api == "cnc_sysinfo") return 2;
     if (api == "cnc_alarm2") return 2;
     if (api == "cnc_rdalmmsg") return 4;
     if (api == "cnc_rdprogdir3") return 5;
@@ -1785,8 +2502,9 @@ int EnvInt(const char* name, int fallback = 0) {
 
 class PacketSniffer {
 public:
-    PacketSniffer(const string& networkDevice, const string& pcapFile)
-        : device_(networkDevice), file_(pcapFile) {}
+    PacketSniffer(const string& networkDevice, const string& pcapFile,
+                  const string& apiDirectory, const string& batchId)
+        : device_(networkDevice), file_(pcapFile), apiDirectory_(apiDirectory), batchId_(batchId) {}
     bool Start() {
         // Prefer Npcap explicitly. A legacy WinPcap DLL can also be present
         // in SysWOW64 and loads successfully, but it cannot open Npcap's
@@ -1816,13 +2534,46 @@ public:
         if (!dumper_) { error_ = "pcap_dump_open failed"; return false; }
         return true;
     }
+    bool BeginApi(const string& api) {
+        if (!handle_ || !dumpOpen_) return false;
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = apiDumpers_.find(api);
+        if (found == apiDumpers_.end()) {
+            string safe = api;
+            for (char& c : safe) {
+                if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-')) c = '_';
+            }
+            string safeBatch = batchId_;
+            for (char& c : safeBatch) {
+                if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-')) c = '_';
+            }
+            string path = apiDirectory_ + "\\" + safeBatch + "_" + safe + ".pcap";
+            pcap_dumper_t* dumper = dumpOpen_(handle_, path.c_str());
+            if (!dumper) { error_ = "pcap_dump_open failed for API " + api; failed_ = true; return false; }
+            found = apiDumpers_.emplace(api, dumper).first;
+        }
+        activeApi_ = api;
+        return true;
+    }
+    void EndApi(const string& api) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = apiDumpers_.find(api);
+        if (found != apiDumpers_.end() && dumpFlush_) dumpFlush_(found->second);
+        if (activeApi_ == api) activeApi_.clear();
+    }
     void CapturePackets(int packetCount = 12) {
         if (!handle_ || !dumper_ || !dispatch_) return;
-        activeDump_ = dump_;
-        dispatch_(handle_, packetCount, &PacketSniffer::DumpThunk, reinterpret_cast<u_char*>(dumper_));
+        dispatch_(handle_, packetCount, &PacketSniffer::DumpThunk, reinterpret_cast<u_char*>(this));
         if (dumpFlush_) dumpFlush_(dumper_);
     }
     void Stop() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& item : apiDumpers_) {
+            if (dumpFlush_) dumpFlush_(item.second);
+            if (dumpClose_) dumpClose_(item.second);
+        }
+        apiDumpers_.clear();
+        activeApi_.clear();
         if (dumper_ && dumpClose_) { dumpFlush_(dumper_); dumpClose_(dumper_); dumper_ = nullptr; }
         if (handle_ && close_) { close_(handle_); handle_ = nullptr; }
         if (dll_) { FreeLibrary(dll_); dll_ = nullptr; }
@@ -1830,15 +2581,28 @@ public:
     string Error() const { return error_; }
 private:
     static void DumpThunk(u_char* user, const pcap_pkthdr* header, const u_char* packet) {
-        if (activeDump_) activeDump_(user, header, packet);
+        auto* self = reinterpret_cast<PacketSniffer*>(user);
+        if (self->dump_ && self->dumper_) {
+            self->dump_(reinterpret_cast<u_char*>(self->dumper_), header, packet);
+        }
+        std::lock_guard<std::mutex> lock(self->mutex_);
+        auto found = self->apiDumpers_.find(self->activeApi_);
+        if (found != self->apiDumpers_.end() && self->dump_) {
+            self->dump_(reinterpret_cast<u_char*>(found->second), header, packet);
+        }
     }
-    inline static pcap_dump_t activeDump_ = nullptr;
     string device_;
     string file_;
+    string apiDirectory_;
+    string batchId_;
     string error_;
     HMODULE dll_ = nullptr;
     pcap_t* handle_ = nullptr;
     pcap_dumper_t* dumper_ = nullptr;
+    std::map<string, pcap_dumper_t*> apiDumpers_;
+    string activeApi_;
+    std::mutex mutex_;
+    bool failed_ = false;
     pcap_open_live_t openLive_ = nullptr;
     pcap_dump_open_t dumpOpen_ = nullptr;
     pcap_dispatch_t dispatch_ = nullptr;
@@ -1854,6 +2618,7 @@ short CallFocasLazy(std::ofstream& inputCsv, std::ofstream& outputCsv, int& idx,
                     OutputBuilder&& buildOutput, const string& phase = "") {
     string effectivePhase = phase.empty() ? gCurrentPhase : NormalizePhase(phase);
     sniffer.CapturePackets();
+    sniffer.BeginApi(api);
     long long startNs = TimestampNs();
     string ts = Timestamp();
     string invocationId = InvocationId(idx);
@@ -1866,6 +2631,7 @@ short CallFocasLazy(std::ofstream& inputCsv, std::ofstream& outputCsv, int& idx,
     short ret = fn();
     sniffer.CapturePackets();
     long long endNs = TimestampNs();
+    sniffer.EndApi(api);
     string outputData = buildOutput();
     PrintApiEnd(idx, api, ret, RetText(ret), outputData);
     LogOutput(outputCsv, idx, step, api, ret, RetText(ret), outputData, Timestamp(),
@@ -1990,6 +2756,12 @@ int CountNcEffectiveSegments() {
 
 int main() {
     CreateDirectoryA("data", nullptr);
+    CreateDirectoryA("data\\by_api", nullptr);
+    {
+        std::ofstream marker("data\\by_api\\.runtime_per_api_capture", std::ios::binary);
+        marker << "mode=runtime_per_api_dumper;batch_id="
+               << EnvString("SMPAGENT_BATCH_ID", "batch_unknown") << "\n";
+    }
     std::ofstream inputCsv("data\\focas_api_input.csv", std::ios::binary);
     std::ofstream outputCsv("data\\focas_api_output.csv", std::ios::binary);
     WriteBom(inputCsv);
@@ -2000,7 +2772,8 @@ int main() {
 
     string networkDevice = EnvString("PCAP_NETWORK_DEVICE", "\\Device\\NPF_Loopback");
     string pcapFile = "data\\focas_capture.pcap";
-    PacketSniffer sniffer(networkDevice, pcapFile);
+    PacketSniffer sniffer(networkDevice, pcapFile, "data\\by_api",
+                          EnvString("SMPAGENT_BATCH_ID", "batch_unknown"));
     {
         string ts = Timestamp();
         string invocationId = InvocationId(idx);
@@ -2047,6 +2820,7 @@ int main() {
     auto cnc_allclibhndl3_fn = reinterpret_cast<decltype(&::cnc_allclibhndl3)>(GetProcAddress(focasDll, "cnc_allclibhndl3"));
     auto cnc_freelibhndl_fn = reinterpret_cast<decltype(&::cnc_freelibhndl)>(GetProcAddress(focasDll, "cnc_freelibhndl"));
     auto cnc_statinfo_fn = reinterpret_cast<decltype(&::cnc_statinfo)>(GetProcAddress(focasDll, "cnc_statinfo"));
+    auto cnc_sysinfo_fn = reinterpret_cast<decltype(&::cnc_sysinfo)>(GetProcAddress(focasDll, "cnc_sysinfo"));
     auto cnc_alarm2_fn = reinterpret_cast<decltype(&::cnc_alarm2)>(GetProcAddress(focasDll, "cnc_alarm2"));
     auto cnc_rdprogdir3_fn = reinterpret_cast<decltype(&::cnc_rdprogdir3)>(GetProcAddress(focasDll, "cnc_rdprogdir3"));
     auto cnc_dwnstart3_fn = reinterpret_cast<decltype(&::cnc_dwnstart3)>(GetProcAddress(focasDll, "cnc_dwnstart3"));
@@ -2081,7 +2855,12 @@ int main() {
     auto cnc_rdtofsinfo_fn = reinterpret_cast<decltype(&::cnc_rdtofsinfo)>(GetProcAddress(focasDll, "cnc_rdtofsinfo"));
     auto cnc_rdtofsinfo2_fn = reinterpret_cast<decltype(&::cnc_rdtofsinfo2)>(GetProcAddress(focasDll, "cnc_rdtofsinfo2"));
 __DELETE_ALL_RESOLVE__
+    bool plannedNeedsSysinfo = false;
+    for (const auto& plannedApi : kPlannedBeforeApis) plannedNeedsSysinfo = plannedNeedsSysinfo || plannedApi == "cnc_sysinfo";
+    for (const auto& plannedApi : kPlannedDuringApis) plannedNeedsSysinfo = plannedNeedsSysinfo || plannedApi == "cnc_sysinfo";
+    for (const auto& plannedApi : kPlannedAfterApis) plannedNeedsSysinfo = plannedNeedsSysinfo || plannedApi == "cnc_sysinfo";
     if (!cnc_allclibhndl3_fn || !cnc_freelibhndl_fn || !cnc_statinfo_fn || !cnc_alarm2_fn ||
+        (plannedNeedsSysinfo && !cnc_sysinfo_fn) ||
         !cnc_rdprogdir3_fn || !cnc_dwnstart3_fn || !cnc_download3_fn || !cnc_dwnend3_fn ||
         !cnc_search_fn || !cnc_rdprgnum_fn || !cnc_actf_fn || !cnc_rdposition_fn || !cnc_distance_fn ||
         !cnc_getdtailerr_fn__DELETE_ALL_MISSING_CHECK__) {
@@ -2132,8 +2911,28 @@ __DELETE_ALL_RESOLVE__
             ODBST st{};
             return CallFocasLazy(inputCsv, outputCsv, idx, sniffer, stepBase + "_cnc_statinfo", "cnc_statinfo",
                 noParams, [&]() { return cnc_statinfo_fn(handle, &st); },
-                [&]() { return "run=" + std::to_string(st.run) + ";motion=" + std::to_string(st.motion) +
-                ";alarm=" + std::to_string(st.alarm); });
+                [&]() { return StatinfoData(st); });
+        }
+        if (api == "cnc_sysinfo") {
+            if (!cnc_sysinfo_fn) {
+                LogHost(inputCsv, outputCsv, idx, stepBase + "_cnc_sysinfo", "host_unsupported_api", 1,
+                        "UNSUPPORTED_SYMBOL", "requested_api=cnc_sysinfo");
+                return 1;
+            }
+            ODBSYS sysinfo{};
+            return CallFocasLazy(inputCsv, outputCsv, idx, sniffer, stepBase + "_cnc_sysinfo", "cnc_sysinfo",
+                noParams, [&]() {
+                    short result = cnc_sysinfo_fn(handle, &sysinfo);
+                    if (result == 0) {
+                        gSysinfoAxes = ParseSysinfoAxes(sysinfo.axes);
+                        if (gSysinfoAxes < 1 || gSysinfoAxes > MAX_AXIS) gSysinfoAxes = 0;
+                    }
+                    return result;
+                },
+                [&]() { return "axes=" + std::to_string(gSysinfoAxes) +
+                    ";axes_raw0=" + std::to_string(static_cast<unsigned char>(sysinfo.axes[0])) +
+                    ";axes_raw1=" + std::to_string(static_cast<unsigned char>(sysinfo.axes[1])) +
+                    ";axis_domain=1..N;axis_count_source=cnc_sysinfo.sysinfo.axes"; });
         }
         if (api == "cnc_alarm2") {
             long alarmBits = 0;
@@ -2240,10 +3039,15 @@ __DELETE_ALL_RESOLVE__
             }
             auto callAxis = [&](short selectedAxis) -> short {
                 ODBAXIS axis{};
-                const short len = static_cast<short>(sizeof(ODBAXIS));
+                // FOCAS length is the logical ODBAXIS data block, not the
+                // C struct size: one axis is 4+4, ALL_AXES is 4+4*MAX_AXIS.
+                const short len = selectedAxis == static_cast<short>(-1)
+                    ? static_cast<short>(4 + 4 * MAX_AXIS)
+                    : static_cast<short>(8);
                 return CallFocasLazy(inputCsv, outputCsv, idx, sniffer,
                     stepBase + "_" + axisApi + "_axis_" + std::to_string(selectedAxis), axisApi,
-                    "axis=" + std::to_string(selectedAxis) + ";length=" + std::to_string(len),
+                    "axis=" + std::to_string(selectedAxis) +
+                        ";length=" + std::to_string(len),
                     [&]() { return fn(handle, selectedAxis, len, &axis); },
                     [&]() { return "axis_data1=" + std::to_string(axis.data[0]) +
                     ";axis_data2=" + std::to_string(axis.data[1]) +
@@ -2251,9 +3055,19 @@ __DELETE_ALL_RESOLVE__
             };
             short result = callAxis(-1);
             if (discoveryRet != 0 || axisCount <= 0 || axisCount > MAX_AXIS) return result;
+            // These APIs document the selector as an axis number.  Use the
+            // controller-reported count; do not reinterpret it as a position
+            // type domain.
             for (short selectedAxis = 1; selectedAxis <= axisCount; ++selectedAxis) {
                 const short axisRet = callAxis(selectedAxis);
                 if (result == 0 && axisRet != 0) result = axisRet;
+                if (axisRet == 0) {
+                    if (gAccdecReferenceData.empty()) {
+                        gAccdecReferenceData.assign(axis.data, axis.data + MAX_AXIS);
+                    } else if (!std::equal(gAccdecReferenceData.begin(), gAccdecReferenceData.end(), axis.data)) {
+                        gAccdecVariationObserved = true;
+                    }
+                }
             }
             return result;
         };
@@ -2264,7 +3078,37 @@ __DELETE_ALL_RESOLVE__
         if (api == "cnc_relative2") return runAxisApi("cnc_relative2", cnc_relative2_fn);
         if (api == "cnc_skip") return runAxisApi("cnc_skip", cnc_skip_fn);
         if (api == "cnc_srvdelay") return runAxisApi("cnc_srvdelay", cnc_srvdelay_fn);
-        if (api == "cnc_accdecdly") return runAxisApi("cnc_accdecdly", cnc_accdecdly_fn);
+        if (api == "cnc_accdecdly") {
+            if (!cnc_accdecdly_fn) {
+                LogHost(inputCsv, outputCsv, idx, stepBase + "_cnc_accdecdly", "host_unsupported_api", 1,
+                        "UNSUPPORTED_SYMBOL", "requested_api=cnc_accdecdly");
+                return 1;
+            }
+            if (gSysinfoAxes < 1 || gSysinfoAxes > MAX_AXIS) {
+                LogHost(inputCsv, outputCsv, idx, stepBase + "_cnc_accdecdly", "host_runtime_binding", 1,
+                        "AXIS_COUNT_UNAVAILABLE", "axis_count_source=cnc_sysinfo.sysinfo.axes;no_axis_call=true");
+                return 1;
+            }
+            short result = 0;
+            for (short selectedAxis = 1; selectedAxis <= gSysinfoAxes; ++selectedAxis) {
+                ODBAXIS axis{};
+                const short length = static_cast<short>(8);
+                const short axisRet = CallFocasLazy(inputCsv, outputCsv, idx, sniffer,
+                    stepBase + "_cnc_accdecdly_axis_" + std::to_string(selectedAxis), "cnc_accdecdly",
+                    "axis=" + std::to_string(selectedAxis) + ";length=" + std::to_string(length) + ";axis_count=" + std::to_string(gSysinfoAxes),
+                    [&]() { return cnc_accdecdly_fn(handle, selectedAxis, length, &axis); },
+                    [&]() {
+                        string data = "axis=" + std::to_string(selectedAxis) + ";length=" + std::to_string(length) + ";data=[";
+                        for (int dataIndex = 0; dataIndex < MAX_AXIS; ++dataIndex) {
+                            if (dataIndex) data += ",";
+                            data += std::to_string(axis.data[dataIndex]);
+                        }
+                        return data + "];axis_count_source=cnc_sysinfo.sysinfo.axes";
+                    });
+                if (result == 0 && axisRet != 0) result = axisRet;
+            }
+            return result;
+        }
         if (api == "cnc_rddynamic") {
             if (!cnc_rddynamic_fn) {
                 LogHost(inputCsv, outputCsv, idx, stepBase + "_cnc_rddynamic", "host_unsupported_api", 1,
@@ -2424,9 +3268,7 @@ __DELETE_ALL_RESOLVE__
     ret = CallFocasLazy(inputCsv, outputCsv, idx, sniffer, "S002_INITIAL_STATUS", "cnc_statinfo",
         "coverage_role=support",
         [&]() { return cnc_statinfo_fn(handle, &initialStatus); },
-        [&]() { return "aut=" + std::to_string(initialStatus.aut) + ";run=" + std::to_string(initialStatus.run) +
-        ";motion=" + std::to_string(initialStatus.motion) + ";alarm=" + std::to_string(initialStatus.alarm) +
-        ";edit=" + std::to_string(initialStatus.edit) + ";coverage_role=support"; });
+        [&]() { return StatinfoData(initialStatus) + ";coverage_role=support"; });
 
     long alarmBits = 0;
     CallFocasLazy(inputCsv, outputCsv, idx, sniffer, "S003_INITIAL_ALARM", "cnc_alarm2",
@@ -2527,12 +3369,8 @@ __DELETE_ALL_BLOCK__
             [&]() { return cnc_statinfo_fn(handle, &uploadEndStatus); },
             [&]() { return "upload_end_failed=true;upload_end_return=" + std::to_string(ret) +
                 ";upload_end_return_text=" + RetText(ret) +
-                ";selected_program_number=" + std::to_string(selectedProgram) +
-                ";aut=" + std::to_string(uploadEndStatus.aut) +
-                ";run=" + std::to_string(uploadEndStatus.run) +
-                ";motion=" + std::to_string(uploadEndStatus.motion) +
-                ";alarm=" + std::to_string(uploadEndStatus.alarm) +
-                ";edit=" + std::to_string(uploadEndStatus.edit) +
+                ";selected_program_number=" + std::to_string(selectedProgram) + ";" +
+                StatinfoData(uploadEndStatus) +
                 ";upload_protection_or_mode_gate=" + string(ret == 7 ? "true" : "false"); }, "Before");
         freeHandle(); cleanup(); return 8;
     }
@@ -2612,9 +3450,7 @@ __DELETE_ALL_BLOCK__
                 "S012_CYCLE_START_EFFECT_STATUS", "cnc_statinfo",
                 "segment_index=" + std::to_string(segment) + ";poll=" + std::to_string(poll),
                 [&]() { return cnc_statinfo_fn(handle, &observedStatus); },
-                [&]() { return "run=" + std::to_string(observedStatus.run) +
-                    ";motion=" + std::to_string(observedStatus.motion) +
-                    ";alarm=" + std::to_string(observedStatus.alarm); }, "During");
+                [&]() { return StatinfoData(observedStatus); }, "During");
             long seq = -1;
             long prg = -1;
             long feed = -1;
@@ -2661,9 +3497,7 @@ __DELETE_ALL_BLOCK__
                 "S012_CYCLE_START_READY_STATUS", "cnc_statinfo",
                 "segment_index=" + std::to_string(segment) + ";waited_ms=" + std::to_string(waited),
                 [&]() { return cnc_statinfo_fn(handle, &status); },
-                [&]() { return "run=" + std::to_string(status.run) +
-                    ";motion=" + std::to_string(status.motion) +
-                    ";alarm=" + std::to_string(status.alarm); }, "During");
+                [&]() { return StatinfoData(status); }, "During");
             bool ready = (lastRet == 0 && status.alarm == 0 && status.motion == 0 && (status.run == 0 || status.run == 1));
             if (ready) {
                 ++stableReadyPolls;
@@ -2737,9 +3571,8 @@ __DELETE_ALL_BLOCK__
             "program_completion_gate=true;expected_nc_segment_count=" + std::to_string(expected_nc_segment_count) +
             ";cycle_start_click_count=" + std::to_string(cycle_start_click_count),
             [&]() { return cnc_statinfo_fn(handle, &last); },
-            [&]() { return "program_completion_gate=true;last_run=" + std::to_string(last.run) +
-            ";last_motion=" + std::to_string(last.motion); });
-        if (cycle_start_click_count >= expected_nc_segment_count && (last.run == 0 || last.run == 1) && last.motion == 0) {
+            [&]() { return "program_completion_gate=true;" + StatinfoData(last); });
+        if (cycle_start_click_count >= expected_nc_segment_count && last.run == 0 && last.motion == 0) {
             completed = true;
             break;
         }
@@ -2759,9 +3592,11 @@ __DELETE_ALL_BLOCK__
     runPlannedApiList(kPlannedAfterApis, "S014_PLANNED_AFTER_API", expected_nc_segment_count, "after");
 
     LogHost(inputCsv, outputCsv, idx, "S015_EXECUTION_SUMMARY", "host_execution_summary", 0,
-            "EW_OK",
+            gAccdecVariationObserved ? "VARIATION_OBSERVED" : "NO_RESPONSE_VARIATION",
             "program_completed=" + string(completed ? "true" : "false") +
-            ";position_sample_count=generated_by_fixed_sampler;feed_sample_count=generated_by_fixed_sampler");
+            ";position_sample_count=generated_by_fixed_sampler;feed_sample_count=generated_by_fixed_sampler" +
+            ";accdecdly_variation_observed=" + string(gAccdecVariationObserved ? "true" : "false") +
+            ";variation_source=real_accdecdly.data[]");
 
     freeHandle();
     cleanup();
@@ -2806,6 +3641,7 @@ def repair_cpp_api_script_after_compile_error(
         "Return one complete corrected C++17 source file as JSON with key cpp_code.\n\n"
         "# Rules\n"
         "- Fix the MSVC compiler errors exactly; do not replace the PlannerAgent plan or choose a different NC program number.\n"
+        "- If diagnostics contain SDK_TYPE_UNKNOWN, use the supplied active Fwlib32.h prototype/type definitions; remove the invented type and select only the exact associated type. Never substitute by name similarity or define a local replacement typedef.\n"
         "- Preserve the uploaded NC payload, CSV schema, FOCAS lifecycle, selected protocol functions, and cleanup behavior unless the compiler error requires a local structural change.\n"
         "- Use the official Fwlib32.h declarations and dynamic LoadLibraryW/GetProcAddress pattern already required by the generation contract.\n"
         "- Avoid goto statements that cross initialization of C++ objects; prefer scoped cleanup helpers, early returns, or declarations before any jump target.\n"
@@ -3183,6 +4019,21 @@ def generate_cpp_api_script_with_llm(
             for function_name in protocol_function_names(step.protocol_function)
         }
     )
+    history_target = state.plan.target_api or next(
+        (name for step in executable_steps if getattr(step, "role", "") == "target"
+         for name in protocol_function_names(step.protocol_function)),
+        (selected_functions[-1] if selected_functions else ""),
+    )
+    verified_api_examples = retrieve_verified_api_examples(
+        history_target,
+        output_dir=Path(state.plan.rag_context.get("output_dir", "")) if state.plan.rag_context.get("output_dir") else None,
+        limit=3,
+        sdk_identity=str(sdk_environment_identity(
+            default_focas_header_dir(),
+            Path(os.environ.get("FOCAS_DLL_DIR", str(default_focas_runtime_dir()))) / "Fwlib32.dll",
+        )),
+    )
+    state.plan.rag_context["verified_api_examples"] = verified_api_examples
     official_abi_context = official_focas_abi_context(selected_functions)
     sdk_type_context = sdk_type_context_for_abi(official_abi_context)
     code_only = bool(state.request.permissions.get("code_only_evaluation"))
@@ -3200,6 +4051,7 @@ def generate_cpp_api_script_with_llm(
         "- Continue using LoadLibraryW and GetProcAddress; do not call imported FOCAS functions directly and do not require Fwlib32.lib.\n"
         "- The user prompt contains official ABI excerpts extracted from the configured Fwlib32.h for Planner-selected functions. Treat those declarations and structure fields as exact; never invent fields that are absent.\n"
         "- The named API contract below supplies the meaning and order of each argument because some Fwlib32.h declarations omit names. If Planner parameter keys conflict with that contract, the documented named argument order wins. Do not pass a count such as data_num as a byte length; for a single output structure use sizeof(the actual structure) where the API documents a byte-length argument. Log the canonical argument names and actual values.\n"
+        "- Before emitting each call, bind every expression to the ordered parameter list from Fwlib32.h and the SDK type index. Same-typed adjacent parameters are not interchangeable: for cnc_relative/cnc_absolute/cnc_machine/cnc_distance and their variants emit (handle, axis, length, &relative) exactly, then verify the logged values match those expressions.\n"
         "- Derive EW_* return labels from the configured Fwlib32.h constants. Never invent or reorder numeric error-code mappings; in particular a length error must be routed as a parameter/length repair, not an offset-number repair.\n"
         "- For FOCAS connection, follow cpp/focas_connect_demo.cpp exactly: read FOCAS_DLL_DIR with GetEnvironmentVariableW, call SetDllDirectoryW(dll_dir), load dll_dir + '\\\\Fwlib32.dll' with LoadLibraryW, resolve cnc_allclibhndl3/cnc_freelibhndl, then connect using FOCAS_HOST and FOCAS_PORT environment variables (defaults 127.0.0.1 and 8193) with timeout 10.\n"
         "- Do not hard-code mojibake/garbled Chinese DLL paths inside generated C++; use FOCAS_DLL_DIR and wide-character Windows APIs for DLL loading.\n"
@@ -3218,7 +4070,7 @@ def generate_cpp_api_script_with_llm(
         "- The listed interface meanings are examples, not the full API universe. If PlannerAgent provides an exact protocol_function that is not in the examples, use the retrieved API/rule knowledge to generate the required dynamic GetProcAddress typedef, argument construction, API call, output parsing, CSV logging, and cleanup.\n"
         "- FOCAS APIs with similar names are not ABI-compatible. Derive each resolved symbol's type from its exact official declaration in Fwlib32.h; never reuse another family member's type.\n"
         "- For cnc_rdposition, allocate a positive-count ODBPOS array and parse each requested element's abs/mach/rel/dist POSELM fields exactly as declared in Fwlib32.h. POSELM.data is one scalar long value, not an axis array. Read multiple axes as positions[i].abs.data, positions[i].mach.data, positions[i].rel.data, or positions[i].dist.data; never use p.data[i] or positions[i].abs.data[j]. Never use a negative axis selector as data_num.\n"
-        "- For cnc_absolute, cnc_absolute2, cnc_machine, cnc_relative, cnc_relative2, and cnc_distance, the third argument is the documented ODBAXIS data-block length; for FS0i-D all-axis reads use 4 + 4 * MAX_AXIS (MAX_AXIS=32), not a guessed count or pointer.\n"
+        "- For cnc_absolute, cnc_absolute2, cnc_machine, cnc_relative, cnc_relative2, and cnc_distance, the third argument is the documented ODBAXIS data-block length; for FS0i-D all-axis reads use 4 + 4 * MAX_AXIS (MAX_AXIS=32), not a guessed count or pointer. For cnc_wrrelpos, the documented read-back counterpart is cnc_relative or cnc_relative2, never cnc_rdrelpos.\n"
         "- Helper functions used across feed/position/status metric vectors must be type-correct. Prefer a function template such as template<class T> bool HasVariation(const std::vector<T>&) instead of a std::vector<long>-only helper called with std::vector<short>.\n"
         "- Avoid goto statements that jump over initialization of C++ objects such as std::string or std::vector. Prefer early returns, scoped cleanup helpers, or declare all such objects before any possible jump target.\n"
         "- If an API/control step is infeasible, generate a real best-effort implementation plus explicit diagnostics, or fail generation with a clear reason; do not silently skip required steps.\n"
@@ -3228,7 +4080,7 @@ def generate_cpp_api_script_with_llm(
         "- focas_api_output.csv header must be: index,timestamp,step_id,api_name,return_code,return_text,data,api_parameter_count\n"
         "- The same monotonically increasing integer index must be written to matching input/output rows.\n"
         "- For operation_kind=focas_sequence, expand api_calls into atomic logging and execution. Each api_calls element is one real FOCAS call: write one input row with its exact single protocol_function, execute it, and write one output row with the same exact single API name. Never write slash, plus, semicolon, arrow, or other delimiters between multiple API names in any api_name or protocol_function field. For example, cnc_dwnstart3, cnc_download3, and cnc_dwnend3 require three separate input/output row pairs.\n"
-        "- When execution_contract.api_prerequisites is present, implement its documented checks and operations in order before target calls. Log every preparation API separately, keep preparation/support traffic distinct from target coverage, and never write a CNC parameter unless safe_to_write is true and the task explicitly permits isolated-simulator writes. For a parameter bit, read the original value, change only the documented bit, write, read back, and restore or preserve a recoverable snapshot. If restart_required is true, record a pending reinitialization state and stop before the target; do not assume a successful write is active.\n"
+        "- When execution_contract.api_prerequisites is present, implement its documented checks and operations in order before target calls. Log every preparation API separately, keep preparation/support traffic distinct from target coverage, and use only the exact sourced parameter value, type, scope, and SDK constraints. Do not infer snapshot, readback, restoration, or a single candidate from a write classification. If restart_required is true, record a pending reinitialization state and stop before the target; do not assume a successful write is active.\n"
         "- Download API versions are strict session pairs: cnc_download3 uses cnc_dwnstart3/cnc_dwnend3; cnc_download4 uses cnc_dwnstart4/cnc_dwnend4. Never mix versions. For an NC program downloaded by cnc_download4, use cnc_dwnstart4(handle, 0, nullptr) when selecting the current CNC folder, and log dir_name=NULL;destination=current_folder. Check the matching start return code and skip transfer on any non-EW_OK result; call the matching end only for a session that was successfully opened. Do not claim a specific absolute destination or successful registration without directory/read-back evidence.\n"
         "- cnc_dncstart2 is a CNC-side DNC/M198 activity query, not a DNC start command. It returns EW_OK only when DNC/M198 is already active and EW_REJECT when it is not. Call cnc_dnc2/cnc_dncend2 only after cnc_dncstart2 returns EW_OK; never make negative probes after EW_REJECT to manufacture EW_FUNC traffic. DNC requires independently verified CNC operating mode/options/signals; do not switch modes, change parameters, or claim NCGuide unsupported without direct evidence.\n"
         "- A high-level interface_name such as UploadProgram may describe a sequence, but it must never collapse several real calls into one CSV record.\n"
@@ -3305,6 +4157,8 @@ def generate_cpp_api_script_with_llm(
         f"Official FOCAS header: {default_focas_header_dir() / 'Fwlib32.h'}\n"
         f"Official ABI excerpts for Planner-selected functions:\n{official_abi_context}\n\n"
         f"SDK-derived structure/union field index (authoritative; generated from the active header):\n{sdk_type_context}\n\n"
+        f"Verified historical same-API examples (successful return + matched PCAP only; validate against the active SDK before reuse):\n{json.dumps(verified_api_examples, ensure_ascii=False, indent=2)}\n\n"
+        f"Pre-generation SDK type contract lookup (read-only; reuse these existing types and never define local SDK structs):\n{json.dumps(state.plan.rag_context.get('sdk_type_contract', {}), ensure_ascii=False, indent=2)}\n\n"
         f"NC program:\n{nc_program}\n\n"
         f"Coverage segments for this run: {state.plan.rag_context.get('coverage_segments', [])}\n"
         f"Function coverage manifest context: {state.plan.rag_context.get('function_coverage_manifest', {})}\n"
@@ -3315,8 +4169,15 @@ def generate_cpp_api_script_with_llm(
         f"Retrieved error-experience memories (historical evidence, not binding API documentation; apply only when trigger and environment match): {state.plan.rag_context.get('long_term_memories', [])}\n"
         f"Retrieved API/rule examples for these interfaces: {summarize_codegen_rag_examples(state.plan.rag_context, executable_steps)}\n"
         f"Dynamic Agent Soul and scoped experience:\n{code_generator_soul_context(state.plan.rag_context)}\n"
-        f"Traffic Relationship Graph context (verified facts and proposed hypotheses):\n"
+        f"Traffic Relationship Graph context (canonical filters/prepares facts and proposed hypotheses):\n"
         f"{state.plan.rag_context.get('traffic_relationships', {})}\n"
+        f"Structured ExecutionPlan hand-off (authoritative for step order, runtime bindings, prerequisites and collection):\n"
+        f"{json.dumps(execution_plan_view(state.plan), ensure_ascii=False, sort_keys=True)}\n"
+        f"ExecutionPlan validation:\n{state.plan.rag_context.get('execution_plan_validation', {})}\n"
+        f"Runtime ExecutionContext evidence (real prerequisite outputs only; never invent missing values):\n"
+        f"{getattr(state, 'execution_context', {})}\n"
+        f"Structured relation discovery plan (hypotheses only until execution evidence exists):\n"
+        f"{state.plan.rag_context.get('relation_discovery_plan', [])}\n"
         f"Executable API steps:\n{steps_for_prompt(executable_steps)}\n\n"
         "Parameter generation policy:\n"
         "- fixed: use the provided constant value in every generated call.\n"
@@ -3324,6 +4185,7 @@ def generate_cpp_api_script_with_llm(
         "- range: call the API at representative points: min, max, and middle samples from the PlannerAgent strategy.\n"
         "- Log the actual generated input values in focas_api_input.csv parameters for each call.\n"
         "- The documented named API prototype overrides conflicting Planner argument labels. If a required value cannot be derived safely, stop before calling the API and report the missing prerequisite; do not sweep arbitrary values to guess an undocumented range.\n"
+        "- For any step.parameters.runtime_bindings, use the deterministic bound_parameters and binding evidence produced by Executor after successful upstream calls; apply include/exclude and transform rules only through the local binding tool, then enumerate the resulting values in the target call. Never replace a missing/failed source result with a literal guess; emit a prerequisite failure and skip the dependent call.\n"
         "- Returned output parameter variation, not input variation, is what RouterAgent will evaluate for quality.\n\n"
         "Common C++ interface meanings, for convenience only:\n"
         "- UploadProgram -> cnc_dwnstart3/cnc_download3/cnc_dwnend3\n"
@@ -3378,6 +4240,8 @@ def generate_cpp_api_script_with_llm(
             f"NC payload:\n{nc_program}\n\n"
             f"{contract_owner} atomic tool calls:\n{steps_for_prompt(executable_steps)}\n\n"
             f"Structured CodeSpec (authoritative contract):\n{asdict(state.plan.code_spec) if state.plan.code_spec is not None else {}}\n\n"
+            f"Structured ExecutionPlan (authoritative step order and API contract):\n{json.dumps(execution_plan_view(state.plan), ensure_ascii=False, sort_keys=True)}\n"
+            f"ExecutionPlan validation:\n{state.plan.rag_context.get('execution_plan_validation', {})}\n"
             f"RAG API/rule evidence:\n{state.plan.rag_context.get('code_generation_knowledge', [])}\n"
             f"Retrieved examples:\n{summarize_codegen_rag_examples(state.plan.rag_context, executable_steps)}\n\n"
             f"Agent Soul:\n{code_generator_soul_context(state.plan.rag_context)}\n"
@@ -4404,7 +5268,7 @@ def cpp_step_block(step) -> list[str]:
                 "        packetCapture.Capture();",
                 "        short callRet = cnc_statinfo_fn(handle, &status);",
                 "        packetCapture.Capture();",
-                '        string data = "aut=" + to_string(status.aut) + ";run=" + to_string(status.run) + ";motion=" + to_string(status.motion) + ";alarm=" + to_string(status.alarm);',
+                '        string data = "aut=" + to_string(status.aut) + ";run=" + to_string(status.run) + ";motion=" + to_string(status.motion) + ";emergency=" + to_string(status.emergency) + ";alarm=" + to_string(status.alarm) + ";edit=" + to_string(status.edit);',
                 f'        WriteOutput(outputCsv, index, "{step.step_id}", "cnc_statinfo", callRet, data);',
             ]
         )
@@ -4706,6 +5570,11 @@ def validate_generated(
     import re
 
     diagnostics: list[str] = []
+    if re.search(r"expected_return_code|error[- _]?path\s+probe|negative\s+probe", api_script, re.IGNORECASE):
+        diagnostics.append(
+            "BLOCKING: generated C++ contains a disabled error-path probe or expected_return_code; "
+            "only successful documented API calls may be collected."
+        )
     if "cnc_allclibhndl3" not in api_script:
         diagnostics.append("C++ API script does not connect with cnc_allclibhndl3")
     if "LoadLibraryW" not in api_script or "GetProcAddress" not in api_script:
@@ -4753,6 +5622,24 @@ def validate_generated(
         planned_functions = {
             name for step in executable_steps for name in protocol_function_names(step.protocol_function)
         }
+        # A target that is present in the active FOCAS header must not be
+        # downgraded to a synthetic unavailable block by code generation.
+        # Keep the normal target-invocation check intact; this diagnostic makes
+        # the upstream false-availability decision explicit in the failure.
+        confirmed_symbols = active_sdk_symbol_evidence(planned_functions)
+        unavailable_block = re.compile(
+            r'ctx\.block\s*\(\s*["\'](?P<api>(?:cnc|pmc|ds)_\w+)["\']\s*,\s*[^)]*'
+            r'(?:no\s+prototype|dll\s+export|unsupported\s+api|api\s+unavailable)',
+            re.IGNORECASE | re.DOTALL,
+        )
+        for match in unavailable_block.finditer(api_script):
+            api_name = match.group("api")
+            if confirmed_symbols.get(api_name) == "confirmed_header_prototype":
+                diagnostics.append(
+                    "BLOCKING: GENERATOR_FALSE_UNAVAILABLE: "
+                    f"{api_name} is present in the active Fwlib32.h prototype set, "
+                    "but generated code blocks it as unavailable; emit the real SDK call."
+                )
         if not code_only_evaluation:
             if "StartProgram" not in planned_interfaces and re.search(
                 r"\b(?:SetCursorPos|mouse_event|SendInput)\s*\(", api_script
@@ -4813,6 +5700,10 @@ def validate_generated(
             diagnostics.extend(validate_focas_program_directory_abi(api_script, executable_steps))
             diagnostics.extend(validate_focas_position_abi(api_script, executable_steps))
             diagnostics.extend(validate_focas_odbaxis_abi(api_script, executable_steps))
+        # Function-pointer declarations can still compile when adjacent
+        # same-typed SDK arguments are swapped.  Validate the call semantics
+        # separately from the ABI shape checks above.
+        diagnostics.extend(validate_focas_argument_semantics(api_script, executable_steps))
         diagnostics.extend(validate_metric_helper_types(api_script))
         diagnostics.extend(validate_semantic_api_bindings(api_script, executable_steps))
         uses_delete_all = "cnc_delall" in api_script.lower()
@@ -5351,6 +6242,93 @@ def validate_focas_odbaxis_abi(api_script: str, executable_steps: list[PlanStep]
             diagnostics.append(
                 f"BLOCKING: {function_name} uses an unnormalized ODBAXIS length; use 4 + 4 * MAX_AXIS for 0i-D all-axis reads."
             )
+    return diagnostics
+
+
+def validate_focas_argument_semantics(api_script: str, executable_steps: list[PlanStep] | None = None) -> list[str]:
+    """Check semantic ordering for SDK calls whose adjacent arguments share a type.
+
+    C++ accepts a swapped ``short`` pair such as ``axis`` and ``length``.  The
+    compiler therefore cannot catch this ABI error; inspect the call expression
+    against the names and values in the active SDK contract before execution.
+    This deliberately remains conservative and reports only an unambiguous
+    length/axis (or type) swap.
+    """
+    import re
+
+    planned = {
+        name
+        for step in (executable_steps or [])
+        for name in protocol_function_names(step.protocol_function)
+    }
+    diagnostics: list[str] = []
+    # The SDK position family is (FlibHndl, axis/type, length, ODBAXIS*).
+    # Keep the check expression based so it also covers dynamically resolved
+    # members (api.cnc_relative) and local function-pointer variables.
+    functions = planned or {
+        name for name in ("cnc_absolute", "cnc_absolute2", "cnc_machine",
+                          "cnc_relative", "cnc_relative2", "cnc_distance")
+        if re.search(rf"\b(?:api\.)?{name}\s*\(", api_script)
+    }
+    for function_name in sorted(functions):
+        if function_name not in {"cnc_absolute", "cnc_absolute2", "cnc_machine",
+                                 "cnc_relative", "cnc_relative2", "cnc_distance"}:
+            continue
+        # Count direct SDK call arguments as a second guard.  A missing axis
+        # argument is otherwise easy to miss because all remaining values are
+        # short/pointer compatible at the C++ call site.
+        call_pattern = re.compile(
+            rf"\b(?:api\.)?{re.escape(function_name)}(?:_fn)?\s*\(([^;\n]*)\)",
+            re.IGNORECASE,
+        )
+        for call in call_pattern.finditer(api_script):
+            raw_args = call.group(1)
+            depth = 0
+            commas = 0
+            for char in raw_args:
+                if char in "(<[{":
+                    depth += 1
+                elif char in ")>]}" and depth:
+                    depth -= 1
+                elif char == "," and depth == 0:
+                    commas += 1
+            if commas + 1 != 4:
+                diagnostics.append(
+                    f"BLOCKING: {function_name} SDK call has {commas + 1} arguments; "
+                    "the official Fwlib32.h prototype requires (handle, axis, length, &ODBAXIS)."
+                )
+                break
+        if function_name == "cnc_relative" and re.search(r"\bODBPOS\b", api_script):
+            diagnostics.append(
+                "BLOCKING: cnc_relative output must use the SDK ODBAXIS structure; "
+                "ODBPOS/POSELM is the cnc_rdposition structure and cannot be used for relative snapshots."
+            )
+        # Capture one call at a time.  The generated calls use simple scalar
+        # expressions for these two arguments, so nested commas are not valid
+        # in the selector/length positions.
+        pattern = re.compile(
+            rf"\b(?:api\.)?{re.escape(function_name)}(?:_fn)?\s*\(\s*[^,]+,\s*([^,]+),\s*([^,]+),\s*&",
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(api_script):
+            second = match.group(1).strip().lower()
+            third = match.group(2).strip().lower()
+            second_is_length = bool(re.search(r"\b(?:len|length|rellen|axislength)\b|sizeof", second))
+            third_is_selector = bool(re.search(r"(?:^|\W)-1\b|\b(?:axis|selectedaxis|type)\b", third))
+            if second_is_length and third_is_selector:
+                diagnostics.append(
+                    f"BLOCKING: {function_name} SDK arguments are reversed; expected "
+                    "(handle, axis/type, length, &ODBAXIS), but the generated call passes length before axis/type."
+                )
+                break
+            # A literal negative selector in the length position is always
+            # invalid for this family, even when the first expression is not
+            # named in the usual way.
+            if re.fullmatch(r"(?:static_cast\s*<\s*short\s*>\s*\(\s*)?-1\s*\)?", third):
+                diagnostics.append(
+                    f"BLOCKING: {function_name} third SDK argument is -1; this position is the positive ODBAXIS length."
+                )
+                break
     return diagnostics
 
 

@@ -6,10 +6,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdlib>
+#include <cctype>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -51,9 +55,21 @@ __RETURN_CODE_CASES__
     }
 }
 
+// Keep every cnc_statinfo record comparable across preflight, diagnostics,
+// operator polling, and postcheck paths. Values are read directly from the
+// returned ODBST; this function only fixes the serialized field order.
+static std::string StatinfoData(const ODBST& status) {
+    return "aut=" + std::to_string(status.aut) + ";run=" + std::to_string(status.run) +
+        ";motion=" + std::to_string(status.motion) + ";emergency=" +
+        std::to_string(status.emergency) + ";alarm=" + std::to_string(status.alarm) +
+        ";edit=" + std::to_string(status.edit);
+}
+
 class PacketSniffer {
 public:
-    PacketSniffer(const std::string& device, const std::string& file) : device_(device), file_(file) {}
+    PacketSniffer(const std::string& device, const std::string& file,
+                  const std::string& api_directory, const std::string& batch_id)
+        : device_(device), file_(file), api_directory_(api_directory), batch_id_(batch_id) {}
     ~PacketSniffer() { Stop(); }
     bool Start() {
         char windows[MAX_PATH]{};
@@ -96,9 +112,61 @@ public:
         });
         return true;
     }
+    bool BeginApi(const std::string& api, long long start_ns) {
+        if (!handle_ || !dump_open_) return false;
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = api_dumpers_.find(api);
+        if (found == api_dumpers_.end()) {
+            std::string safe = api;
+            for (char& c : safe) {
+                if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-')) c = '_';
+            }
+            std::string safe_batch = batch_id_;
+            for (char& c : safe_batch) {
+                if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-')) c = '_';
+            }
+            std::string path = api_directory_ + "\\" + safe_batch + "_" + safe + ".pcap";
+            pcap_dumper* api_dumper = dump_open_(handle_, path.c_str());
+            if (!api_dumper) { error_ = "pcap_dump_open failed for API " + api; failed_ = true; return false; }
+            found = api_dumpers_.emplace(api, api_dumper).first;
+        }
+        // Attribution is based on the packet timestamp, not on which API the
+        // background thread happens to be processing when the packet arrives.
+        // This prevents a short call's response from being assigned to the
+        // following helper call.
+        api_windows_.push_back(ApiWindow{api, start_ns, LLONG_MAX});
+        return true;
+    }
+    void EndApi(const std::string& api, long long end_ns) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = api_dumpers_.find(api);
+        if (found != api_dumpers_.end() && flush_) flush_(found->second);
+        for (auto it = api_windows_.rbegin(); it != api_windows_.rend(); ++it) {
+            if (it->api == api && it->end_ns == LLONG_MAX) {
+                it->end_ns = end_ns;
+                break;
+            }
+        }
+    }
+    // Capture runs continuously on the background thread. Keep this hook so
+    // the invocation wrapper can use the same lifecycle as the synchronous
+    // fixed runner without opening a second Npcap handle.
+    void CapturePackets(int wait_ms = 4) {
+        // The capture loop is asynchronous. Keep the API interval open for a
+        // bounded drain period so packets queued by Npcap after a very fast
+        // FOCAS return are still attributed to the correct invocation.
+        if (wait_ms > 0) Sleep(static_cast<DWORD>(wait_ms));
+    }
     void Stop() {
         running_ = false;
         if (thread_.joinable()) thread_.join();
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& item : api_dumpers_) {
+            if (flush_) flush_(item.second);
+            if (dump_close_) dump_close_(item.second);
+        }
+        api_dumpers_.clear();
+        api_windows_.clear();
         if (dumper_) { dump_close_(dumper_); dumper_ = nullptr; }
         if (handle_) { close_(handle_); handle_ = nullptr; }
         if (dll_) { FreeLibrary(dll_); dll_ = nullptr; }
@@ -106,14 +174,40 @@ public:
     bool Failed() const { return failed_; }
     std::string Error() const { return error_; }
 private:
+    struct ApiWindow {
+        std::string api;
+        long long start_ns;
+        long long end_ns;
+    };
+    static long long PacketTimestampNs(const pcap_pkthdr* header) {
+        if (!header) return 0;
+        return static_cast<long long>(header->ts.tv_sec) * 1000000000LL +
+               static_cast<long long>(header->ts.tv_usec) * 1000LL;
+    }
     static void __cdecl Dump(unsigned char* user, const pcap_pkthdr* header, const unsigned char* packet) {
         auto* self = reinterpret_cast<PacketSniffer*>(user);
-        self->dump_(reinterpret_cast<unsigned char*>(self->dumper_), header, packet);
+        std::lock_guard<std::mutex> lock(self->mutex_);
+        if (self->dumper_) self->dump_(reinterpret_cast<unsigned char*>(self->dumper_), header, packet);
+        const long long packet_ns = PacketTimestampNs(header);
+        // A packet belongs to at most one invocation interval. Windows are
+        // sequential because CaptureContext closes one before opening the
+        // next, so this does not duplicate traffic between APIs.
+        for (const auto& window : self->api_windows_) {
+            if (packet_ns < window.start_ns || packet_ns > window.end_ns) continue;
+            auto found = self->api_dumpers_.find(window.api);
+            if (found != self->api_dumpers_.end()) {
+                self->dump_(reinterpret_cast<unsigned char*>(found->second), header, packet);
+            }
+            break;
+        }
     }
-    std::string device_, file_, error_;
+    std::string device_, file_, api_directory_, batch_id_, error_;
     HMODULE dll_ = nullptr;
     pcap* handle_ = nullptr;
     pcap_dumper* dumper_ = nullptr;
+    std::map<std::string, pcap_dumper*> api_dumpers_;
+    std::vector<ApiWindow> api_windows_;
+    std::mutex mutex_;
     std::atomic<bool> running_{false}, failed_{false};
     std::thread thread_;
     pcap* (__cdecl *open_)(const char*, int, int, int, char*) = nullptr;
@@ -147,7 +241,8 @@ __FOCAS_BINDINGS__
 
 class CaptureContext {
 public:
-    CaptureContext() : input_("data\\focas_api_input.csv", std::ios::binary),
+    explicit CaptureContext(PacketSniffer* sniffer = nullptr) : sniffer_(sniffer),
+                       input_("data\\focas_api_input.csv", std::ios::binary),
                        output_("data\\focas_api_output.csv", std::ios::binary) {
         if (!input_ || !output_) throw std::runtime_error("Cannot create API CSV logs");
         input_ << "\xEF\xBB\xBFindex,timestamp,step_id,interface_name,protocol_function,parameters,api_parameter_count,invocation_id,transaction_id,start_timestamp_ns,device_context\n";
@@ -162,9 +257,22 @@ public:
         const std::string id = "inv-" + nonce_ + "-" + std::to_string(index);
         const std::string tx = "tx-" + nonce_ + "-" + std::to_string(index);
         long long start = timestamp_ns();
+        if (sniffer_) sniffer_->BeginApi(name, start);
+        // Keep the complete runtime argument payload.  The fixed log contract
+        // counts FlibHndl because it is a real parameter in the SDK
+        // signature; the legacy dataset projection may still filter it later.
         write_input(index, step, name, parameters, id, tx, start);
-        short ret = invoke();
+        short ret = EW_OK;
+        try { ret = invoke(); }
+        catch (...) {
+            if (sniffer_) sniffer_->EndApi(name, timestamp_ns());
+            throw;
+        }
+        if (sniffer_) {
+            sniffer_->CapturePackets();
+        }
         long long end = timestamp_ns();
+        if (sniffer_) sniffer_->EndApi(name, end);
         // Failed outputs are undefined and must never be interpreted as device values.
         std::string data = ret == EW_OK ? build_output(ret) : "output_valid=false";
         write_output(index, step, name, ret, RetText(ret), data, id, tx, end);
@@ -195,17 +303,19 @@ public:
         std::cout << "@@SMP@@{\"event\":\"operator_action_required\",\"data\":{\"action\":\""
                   << safe_action << "\",\"target\":\"" << target
                   << "\",\"timeout_seconds\":" << timeout_seconds << "}}" << std::endl;
+        // An operator action is an explicit prerequisite. Keep the process
+        // alive until FOCAS observes the requested state; the desktop task
+        // can be cancelled by the operator when the action is not possible.
+        const bool wait_indefinitely = true;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
         int attempt = 0;
-        while (std::chrono::steady_clock::now() < deadline) {
+        while (wait_indefinitely || std::chrono::steady_clock::now() < deadline) {
             ODBST state{};
             short ret = call("OPERATOR_STATE_POLL", "cnc_statinfo",
                 "FlibHndl=" + std::to_string(handle) + ";action=" + safe_action +
                     ";attempt=" + std::to_string(++attempt), api.cnc_statinfo,
                 [&] { return api.cnc_statinfo(handle, &state); }, [&](short) {
-                    return "aut=" + std::to_string(state.aut) + ";run=" + std::to_string(state.run) +
-                        ";motion=" + std::to_string(state.motion) + ";alarm=" +
-                        std::to_string(state.alarm) + ";emergency=" + std::to_string(state.emergency);
+                    return StatinfoData(state);
                 });
             bool ready = ret == EW_OK && state.alarm == 0 && state.emergency == 0 &&
                 state.motion == 0 && (state.run == 0 || state.run == 1);
@@ -248,17 +358,16 @@ public:
         std::cout << "@@SMP@@{\"event\":\"operator_action_required\",\"data\":{\"action\":\"mode\",\"target\":\""
                   << target << "\",\"required_mode\":\"" << required_mode
                   << "\",\"timeout_seconds\":" << timeout_seconds << "}}" << std::endl;
+        const bool wait_indefinitely = true;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
         int attempt = 0;
-        while (std::chrono::steady_clock::now() < deadline) {
+        while (wait_indefinitely || std::chrono::steady_clock::now() < deadline) {
             ODBST state{};
             short ret = call("OPERATOR_MODE_POLL", "cnc_statinfo",
                 "FlibHndl=" + std::to_string(handle) + ";required_mode=" + required_mode +
                     ";expected_aut=" + std::to_string(expected_aut) + ";attempt=" + std::to_string(++attempt),
                 api.cnc_statinfo, [&] { return api.cnc_statinfo(handle, &state); }, [&](short) {
-                    return "aut=" + std::to_string(state.aut) + ";run=" + std::to_string(state.run) +
-                        ";motion=" + std::to_string(state.motion) + ";alarm=" +
-                        std::to_string(state.alarm) + ";emergency=" + std::to_string(state.emergency);
+                    return StatinfoData(state);
                 });
             const bool ready = ret == EW_OK && state.aut == expected_aut && state.alarm == 0 &&
                 state.emergency == 0 && state.motion == 0 && (state.run == 0 || state.run == 1);
@@ -296,7 +405,28 @@ public:
     }
     bool failed() const { return failed_; }
 private:
+    static std::string parameters_without_handle(const std::string& parameters) {
+        std::stringstream source(parameters);
+        std::string part;
+        std::string result;
+        while (std::getline(source, part, ';')) {
+            const auto equals = part.find('=');
+            std::string key = equals == std::string::npos ? part : part.substr(0, equals);
+            while (!key.empty() && std::isspace(static_cast<unsigned char>(key.front()))) key.erase(key.begin());
+            while (!key.empty() && std::isspace(static_cast<unsigned char>(key.back()))) key.pop_back();
+            std::string folded = key;
+            std::transform(folded.begin(), folded.end(), folded.begin(),
+                           [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+            if (folded == "flibhndl") continue;
+            if (!result.empty() && !part.empty()) result += ";";
+            result += part;
+        }
+        return result;
+    }
+
     static int parameter_count(const std::string& name) {
+        // This legacy CSV field is the SDK/ABI argument count. FlibHndl is
+        // session context, and must not be described as a CNC business input.
         if (name == "cnc_alarm") return 2;
         if (name == "cnc_alarm2") return 2;
         if (name == "cnc_clralm") return 2;
@@ -333,6 +463,7 @@ __PARAMETER_COUNTS__
     bool manual_action_timed_out_ = false;
     std::string nonce_;
     std::function<void(bool)> error_diagnostics_;
+    PacketSniffer* sniffer_ = nullptr;
     std::ofstream input_, output_;
 };
 
@@ -343,8 +474,7 @@ static bool capture_alarm_diagnostics(FocasApi& api, unsigned short handle, Capt
     const short status_rc = api.cnc_statinfo
         ? ctx.call("ALARM_DIAGNOSTIC", "cnc_statinfo", "FlibHndl=" + std::to_string(handle), api.cnc_statinfo,
             [&] { return api.cnc_statinfo(handle, &status); }, [&](short) {
-                return "run=" + std::to_string(status.run) + ";motion=" + std::to_string(status.motion) +
-                    ";emergency=" + std::to_string(status.emergency) + ";alarm=" + std::to_string(status.alarm);
+                return StatinfoData(status);
             })
         : -15;
     if (!api.cnc_statinfo) ctx.host("cnc_statinfo", -15, "UNSUPPORTED_SYMBOL", "alarm status reader is not exported");
@@ -460,8 +590,7 @@ static bool recover_alarm(FocasApi& api, unsigned short handle, CaptureContext& 
     auto read_state = [&]() {
         short status_rc = ctx.call("ALARM_RECOVERY_VERIFY", "cnc_statinfo", "FlibHndl=" + std::to_string(handle),
             api.cnc_statinfo, [&] { return api.cnc_statinfo(handle, &state); }, [&](short) {
-                return "run=" + std::to_string(state.run) + ";motion=" + std::to_string(state.motion) +
-                    ";emergency=" + std::to_string(state.emergency) + ";alarm=" + std::to_string(state.alarm);
+                return StatinfoData(state);
             });
         if (status_rc != EW_OK) return status_rc;
         return ctx.call("ALARM_RECOVERY_VERIFY", "cnc_alarm2", "FlibHndl=" + std::to_string(handle),
@@ -524,8 +653,16 @@ __EXECUTION_DRIVER__
 
 int main() {
     CreateDirectoryW(L"data", nullptr);
-    CaptureContext ctx;
-    PacketSniffer sniffer(env("PCAP_NETWORK_DEVICE", "\\Device\\NPF_Loopback"), "data\\focas_capture.pcap");
+    CreateDirectoryW(L"data\\by_api", nullptr);
+    {
+        std::ofstream marker("data\\by_api\\.runtime_per_api_capture", std::ios::binary);
+        marker << "mode=runtime_per_api_dumper;batch_id="
+               << env("SMPAGENT_BATCH_ID", "batch_unknown") << "\n";
+    }
+    PacketSniffer sniffer(env("PCAP_NETWORK_DEVICE", "\\Device\\NPF_Loopback"),
+                          "data\\focas_capture.pcap", "data\\by_api",
+                          env("SMPAGENT_BATCH_ID", "batch_unknown"));
+    CaptureContext ctx(&sniffer);
     if (!sniffer.Start()) {
         ctx.host("pcap_open_live", -1, "PCAP_CAPTURE_FAILED", sniffer.Error());
         std::cerr << "PCAP_CAPTURE_FAILED: " << sniffer.Error() << std::endl;
@@ -568,10 +705,7 @@ int main() {
             short initial_rc = ctx.call("ALARM_PREFLIGHT", "cnc_statinfo",
                 "FlibHndl=" + std::to_string(handle), api.cnc_statinfo,
                 [&] { return api.cnc_statinfo(handle, &initial_state); }, [&](short) {
-                    return "run=" + std::to_string(initial_state.run) + ";motion=" +
-                        std::to_string(initial_state.motion) + ";emergency=" +
-                        std::to_string(initial_state.emergency) + ";alarm=" +
-                        std::to_string(initial_state.alarm);
+                    return StatinfoData(initial_state);
                 });
             bool recovery_ready = initial_state.alarm == 0 && initial_state.emergency == 0;
             if (initial_rc == EW_OK && !recovery_ready) recovery_ready = recover_alarm(api, handle, ctx);
@@ -593,10 +727,7 @@ int main() {
                     short final_rc = ctx.call("ALARM_POSTCHECK", "cnc_statinfo",
                         "FlibHndl=" + std::to_string(handle), api.cnc_statinfo,
                         [&] { return api.cnc_statinfo(handle, &final_state); }, [&](short) {
-                            return "run=" + std::to_string(final_state.run) + ";motion=" +
-                                std::to_string(final_state.motion) + ";emergency=" +
-                                std::to_string(final_state.emergency) + ";alarm=" +
-                                std::to_string(final_state.alarm);
+                            return StatinfoData(final_state);
                         });
                     if (final_rc == EW_OK && final_state.alarm && !ctx.manual_action_timed_out()) recover_alarm(api, handle, ctx);
                 }

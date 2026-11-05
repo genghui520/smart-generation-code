@@ -39,10 +39,10 @@ $coverage_instruction
 """
 
 FULL_API_PROMPT = """使用 SMPAgent 为 FANUC NCGuide 执行$coverage_scope FOCAS API 与参数流量采集。
-以 $manifest 为函数清单；本次目标共 $function_count 个唯一 API：$selected_functions。必须分批覆盖本次选中的每一个 API，禁止把未选 API 算作目标。
+设备范围：$scope_title（$scope_id）。以 $manifest 为完整函数知识清单；本次目标共 $function_count 个唯一 API：$selected_functions。必须分批覆盖本次选中的每一个 API，禁止把未选 API 算作目标。
 对每个 API：依据官方 Fwlib32.h、RAG 原型和控制器能力构造参数；记录函数名、全部实际输入参数、返回码和全部输出。
 参数覆盖规则：固定参数使用有依据的固定值；枚举参数覆盖所有安全且有文档依据的枚举值；范围参数至少覆盖边界值、典型值和安全中间值；指针、缓冲区、长度、轴号、程序号、参数号等关联参数必须保持一致。
-写入或控制类 API 只有在环境和恢复路径均已验证时才允许使用有界值，并执行“读取原值→写入/控制→读取验证→恢复原值”；无法安全调用时不得为了覆盖率强行探测。头文件无原型或 DLL 无导出可由静态证据判定为不可用；NCGuide 不支持须有真实证据。所有不可用项都不得计入已采集流量。
+所有 API 统一依据 SDK 合同、ExecutionPlan 和参数组合执行；不因读写分类自动添加快照、恢复或单候选限制；无法安全调用时不得为了覆盖率强行探测。头文件无原型或 DLL 无导出可由静态证据判定为不可用；NCGuide 不支持须有真实证据。所有不可用项都不得计入已采集流量。
 根据每个 API 的功能、所需设备状态和前置依赖组织执行上下文；辅助 API 可重复调用，但不能代替目标 API 计数。
 只有目标 API 确实需要程序执行/坐标变化时才执行 NC 程序和 Cycle Start；程序下载、验证、目录、文件、参数、刀具、PMC 等 API 应直接采集其真实请求/响应，不得被坐标运动门控阻塞。NC 文本作为传输参数不等于要启动程序。
 若 Npcap 启动失败，在任何 FOCAS 目标调用前终止该批并记录具体错误；不得生成只有 CSV 没有 PCAP 的伪成功。
@@ -53,8 +53,11 @@ FULL_API_PROMPT = """使用 SMPAgent 为 FANUC NCGuide 执行$coverage_scope FOC
 """
 
 
-from .protocol_profiles import protocol_profile, require_capture_adapter
-from .api_compatibility import UNSELECTED, SDK_UNKNOWN, CONTROLLER_MODELS, unavailable_reason, detect_sdk_model
+from .protocol_profiles import protocol_profile, require_capture_adapter, require_connection_adapter
+from .api_compatibility import (
+    UNSELECTED, SDK_UNKNOWN, CONTROLLER_MODELS, unavailable_reason, detect_sdk_model,
+    F0ID_MODEL, F0ID_SCOPE_ID, f0id_api_names,
+)
 
 
 def scenarios():
@@ -71,6 +74,17 @@ def atomic_scene_api_names(scene):
         for name in re.split(r"[,/;+]+", str(entry))
         if re.fullmatch(r"(?:cnc|pmc)_[A-Za-z0-9_]+", name.strip())
     })
+
+
+def target_permission_flags(api_names):
+    """Derive target-scoped permissions from explicitly selected APIs.
+
+    ``cnc_delall`` is allowed for a run only when it is itself a selected
+    target.  This keeps the desktop path consistent with the CLI flag while
+    avoiding implicit authorization when it is merely an unrelated helper.
+    """
+    names = {str(name).strip() for name in (api_names or ()) if str(name).strip()}
+    return {"allow_delete_all_programs": "cnc_delall" in names}
 
 
 def filter_scene_for_config(scene, config):
@@ -186,7 +200,10 @@ def defaults():
                 values[key.strip()] = value.strip().strip('\"').strip("'")
     values.update(os.environ)
     from .integrations.ncguide import default_focas_runtime_dir
-    return dict(protocol="focas", controller_model=detect_sdk_model(values.get("FOCAS_HEADER_DIR", r"C:\Lib\FOCAS2 Library\Fwlib\0iD")), host=values.get("FOCAS_HOST", "127.0.0.1"), port=values.get("FOCAS_PORT", "8193"),
+    # This NCGuide FS0i-D instance exposes its FOCAS Ethernet service on
+    # 8192.  Keep FOCAS_PORT/FOCAS_HOST overrides authoritative for other
+    # controllers and installations.
+    return dict(protocol="focas", controller_model=detect_sdk_model(values.get("FOCAS_HEADER_DIR", r"C:\Lib\FOCAS2 Library\Fwlib\0iD")), host=values.get("FOCAS_HOST", "127.0.0.1"), port=values.get("FOCAS_PORT", "8192"),
                 device=values.get("PCAP_NETWORK_DEVICE", r"\Device\NPF_Loopback"),
                 dll=values.get("FOCAS_DLL_DIR", str(default_focas_runtime_dir())),
                 header=values.get("FOCAS_HEADER_DIR", r"C:\Lib\FOCAS2 Library\Fwlib\0iD"),
@@ -216,7 +233,7 @@ def chinese_api_description(function: str, description: str = "") -> str:
         "cnc_getdtailerr": "读取最近一次 FOCAS 调用的详细错误号。",
         "cnc_download3": "向 CNC 下载程序内容，需要配合下载开始和结束 API。",
         "cnc_upload3": "从 CNC 上传程序内容，需要配合上传开始和结束 API。",
-        "cnc_wrparam": "写入 CNC 参数；必须先读取原值、验证写入并恢复原值。",
+        "cnc_wrparam": "写入 CNC 参数；按照 ExecutionPlan 和 SDK 原型执行有界参数调用并记录结果。",
         "cnc_wrmdipntr": "写入 MDI 指针；必须先读取原指针并验证恢复。",
     }
     if function in known:
@@ -280,7 +297,7 @@ def is_full_api_mode(config):
     if config.get("capture_mode"):
         return config["capture_mode"] == "all_apis"
     if "selected_apis" in config:
-        known = {row["function"] for row in function_manifest()}
+        known = f0id_api_names() if configured_controller_model(config) == F0ID_MODEL else {row["function"] for row in function_manifest()}
         return set(config.get("selected_apis", [])) == known and bool(known)
     known = {scene["scenario_id"] for scene in scenarios()}
     return set(config.get("selected", [])) == known and bool(known)
@@ -292,21 +309,35 @@ def selected_api_names(config):
     if "header" in eligibility:
         eligibility["controller_model"] = detect_sdk_model(eligibility.pop("header"))
     if config.get("capture_mode") == "all_apis" or "selected_apis" not in config:
+        if eligibility.get("controller_model") == F0ID_MODEL:
+            names = f0id_api_names()
+            return [row["function"] for row in function_manifest() if row["function"] in names]
         return [row["function"] for row in function_manifest() if not unavailable_reason(row["function"], eligibility)]
     selected = set(config.get("selected_apis", []))
     return [row["function"] for row in function_manifest()
             if row["function"] in selected and not unavailable_reason(row["function"], eligibility)]
 
 
+def configured_controller_model(config):
+    """Resolve the explicit model/header once for scope propagation."""
+    if config.get("header"):
+        return detect_sdk_model(config["header"])
+    return config.get("controller_model", UNSELECTED)
+
+
 def render_full_api_prompt(config, *, batch_targets=None):
     selected = list(batch_targets) if batch_targets is not None else selected_api_names(config)
     single_api = config.get("capture_mode") == "single_api"
-    all_selected = not single_api and len(selected) == len(function_manifest())
+    scope_model = configured_controller_model(config)
+    scope_id = F0ID_SCOPE_ID if scope_model == F0ID_MODEL else "manifest"
+    all_selected = not single_api and len(selected) == (len(f0id_api_names()) if scope_model == F0ID_MODEL else len(function_manifest()))
     prompt = Template(config.get("full_template") or FULL_API_PROMPT).substitute(
         manifest="rag_indexes/focas/function_manifest.jsonl",
         function_count=len(selected),
         coverage_scope="全部" if all_selected else ("本批选定的" if batch_targets is not None and not single_api else "选定的"),
         selected_functions="清单中的全部函数" if all_selected else ", ".join(selected),
+        scope_title=f"FANUC {F0ID_MODEL}" if scope_model == F0ID_MODEL else "当前设备范围",
+        scope_id=scope_id,
         scene_names=_lines(dict.fromkeys(scene["scenario_name"] for scene in scenarios())),
         **{k: config[k] for k in ("host", "port", "device", "samples", "interval", "requirements")},
     )
@@ -317,6 +348,16 @@ def render_full_api_prompt(config, *, batch_targets=None):
         prompt = prompt.replace("每批采样次数参考值", "采样次数参考值")
         prompt = prompt.replace("持续执行后续批次，直到函数清单各项均有明确状态；", "本次仅执行一次采集流程，失败后结束；")
         prompt = prompt.replace("不得在只完成一个批次时宣称全覆盖", "不得在缺少真实流量时宣称采集完成")
+    # cnc_prstwkcd is collected as a direct read-style FOCAS transaction in
+    # the deterministic ABI recipe.  It does not require the generic write
+    # snapshot/readback/restore workflow, and must not be expanded with
+    # cnc_wrzofs/cnc_rdzofs helper calls by the planning prompt.
+    if "cnc_prstwkcd" in selected:
+        prompt = prompt.replace(
+            "所有 API 统一依据 SDK 合同、ExecutionPlan 和参数组合执行；不因读写分类自动添加快照、恢复或单候选限制；",
+            "写入或控制类 API 只有在环境和恢复路径均已验证时才允许使用有界值，并执行相应的已确认安全流程；",
+        )
+        prompt += "\n本次目标 cnc_prstwkcd 使用官方 IDBWRA 直接调用；不要添加 cnc_wrzofs、cnc_rdzofs 或任何快照/恢复步骤。\n"
     return prompt
 
 
@@ -375,12 +416,16 @@ def cycle_start_configuration_error(config):
 
 def validate(config, capture=False):
     errors = []
-    for key, label in (("host", "仿真器地址"), ("base_url", "模型地址"), ("model", "模型名称"), ("api_key", "API Key")):
+    protocol = str(config.get("protocol", "focas"))
+    required_fields = [("host", "设备地址")]
+    if protocol != "lsv2":
+        required_fields.extend((("base_url", "模型地址"), ("model", "模型名称"), ("api_key", "API Key")))
+    for key, label in required_fields:
         if not str(config.get(key, "")).strip():
             errors.append(f"请填写{label}")
     from urllib.parse import urlparse
     url = urlparse(config.get("base_url", ""))
-    if url.scheme not in ("http", "https") or not url.netloc:
+    if protocol != "lsv2" and (url.scheme not in ("http", "https") or not url.netloc):
         errors.append("模型地址必须是完整的 HTTP(S) URL")
     for key, low, high, cast in (("port", 1, 65535, int), ("samples", 1, 100000, int),
                                  ("interval", 0.01, 3600, float), ("timeout", 1, 600, float)):
@@ -392,6 +437,41 @@ def validate(config, capture=False):
     if capture:
         if not protocol_profile(config)["available"]:
             errors.append(f"{protocol_profile(config)['label']} 采集适配器尚未接入")
+            return errors
+        if protocol == "lsv2":
+            from .heidenhain_catalog import HEIDENHAIN_READ_ONLY_API_NAMES, heidenhain_tnc640_catalog
+            mode = config.get("capture_mode")
+            selected = config.get("selected_apis", [])
+            if mode == "single_api" and len(selected) != 1:
+                errors.append("单个 API 模式请选择且仅选择一个 API")
+            if mode and mode not in ("single_api", "all_apis", "read_only_priority", "auto_no_parameter"):
+                errors.append("海德汉不支持场景模式，请选择 API 采集模式")
+            if mode == "all_apis":
+                selected = [row["function"] for row in heidenhain_tnc640_catalog()
+                            if row["function"] in HEIDENHAIN_READ_ONLY_API_NAMES]
+            if not isinstance(selected, list) or not selected:
+                errors.append("请至少选择一个海德汉只读 API")
+            else:
+                known = {row["function"] for row in heidenhain_tnc640_catalog()}
+                unknown = set(selected) - known
+                blocked = set(selected) - HEIDENHAIN_READ_ONLY_API_NAMES
+                if unknown:
+                    errors.append(f"存在未知海德汉 API：{sorted(unknown)}")
+                if blocked:
+                    errors.append(f"海德汉写入/控制 API 暂不允许采集：{sorted(blocked)}")
+            if not config.get("output", "").strip():
+                errors.append("请填写输出目录")
+            vector_path = Path(str(config.get("vector", ""))).expanduser()
+            if not vector_path.is_dir():
+                errors.append(f"海德汉 LSV-2 知识库不存在：{vector_path}；请先运行 build_heidenhain_rag_index")
+            resume = str(config.get("resume_from", "")).strip()
+            if resume:
+                output_root = Path(config.get("output", "")).expanduser().resolve()
+                resume_path = Path(resume).expanduser().resolve()
+                if not resume_path.is_dir() or not resume_path.is_relative_to(output_root):
+                    errors.append("续采目录必须是采集输出目录下已存在的一次运行目录")
+                elif not (resume_path / "settings.json").is_file():
+                    errors.append("续采目录缺少 settings.json，无法核对原采集配置")
             return errors
         mode = config.get("capture_mode")
         if "header" not in config and config.get("controller_model", UNSELECTED) not in (*CONTROLLER_MODELS, SDK_UNKNOWN):
@@ -482,6 +562,39 @@ def make_llm(config):
 
 
 def test_simulator(config):
+    require_connection_adapter(config)
+    if config.get("protocol", "focas") == "ezsocket":
+        from .integrations.ezsocket import (
+            call_ezsocket_com_api,
+            test_ezsocket_api_contract,
+            test_ezsocket_connection,
+        )
+        if config.get("ezsocket_test_mode") == "com":
+            result = call_ezsocket_com_api(
+                config["host"],
+                int(config["port"]),
+                function="Status_GetRunStatus",
+                timeout=min(float(config.get("timeout", 5)), 15.0),
+                com_machine=(str(config.get("ezsocket_com_machine", "")).strip() or None),
+            )
+            return (
+                f"三菱 EZSocket COM API 调用成功：Status_GetRunStatus(1)="
+                f"{result['run_status']}，返回码 {result['return_code']}"
+            )
+        result = test_ezsocket_connection(
+            config["host"], int(config["port"]),
+            timeout=min(float(config.get("timeout", 5)), 15.0),
+        )
+        api = test_ezsocket_api_contract("Status_GetRunStatus")
+        return (
+            f"三菱 EZSocket 连接成功，仿真器已监听 "
+            f"{result['host']}:{result['port']}（TCP）；已通过知识库校验只读 API "
+            f"{api['function']} 的调用契约"
+        )
+    if config.get("protocol", "focas") == "lsv2":
+        from .integrations.heidenhain_lsv2 import test_lsv2_directory_info
+        result = test_lsv2_directory_info(config["host"], int(config["port"]), timeout=min(float(config.get("timeout", 5)), 15.0))
+        return f"海德汉 LSV2 连接成功，已读取 TNC 目录：{result.get('directory')}"
     require_capture_adapter(config)
     from .integrations.ncguide import FocasCppBridgeClient
     with socket.create_connection((config["host"], int(config["port"])), timeout=5):
@@ -522,6 +635,17 @@ def preflight(config):
     errors = validate(config, capture=True)
     if errors:
         raise ValueError("\n".join(errors))
+    if config.get("protocol", "focas") == "lsv2":
+        try:
+            import pyLSV2  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError("未安装 pyLSV2，请先执行：python -m pip install -e .") from exc
+        out = Path(config["output"])
+        out.mkdir(parents=True, exist_ok=True)
+        import tempfile
+        with tempfile.TemporaryFile(dir=out):
+            pass
+        return "海德汉 LSV2 采集前检查通过：pyLSV2、地址、端口、只读 API 和输出目录"
     from .agent_tools.cpp_execution import find_msvc_x86_toolchain
     if find_msvc_x86_toolchain() is None:
         raise RuntimeError("未找到 MSVC x86 编译器或 Windows SDK")
@@ -562,6 +686,146 @@ def capture_output_dir(config):
         if old.get(key, fallback) != config.get(key, fallback):
             raise ValueError(f"续采配置 {key} 与原运行不一致；请新建采集，不要混合两次流量")
     return out
+
+
+def run_lsv2_capture(config, out, emit):
+    """Run the protocol-native, read-only Heidenhain collection path."""
+    from datetime import datetime, timezone
+    from .heidenhain_catalog import HEIDENHAIN_READ_ONLY_API_NAMES, heidenhain_tnc640_catalog
+    from .integrations.heidenhain_lsv2 import HeidenhainLsv2Client
+    from .utils import write_json
+
+    out.mkdir(parents=True, exist_ok=True)
+    emit("output", {"path": str(out)})
+    safe = {k: v for k, v in config.items() if k != "api_key"}
+    write_json(out / "settings.json", safe)
+    selected = list(config.get("selected_apis") or [])
+    if config.get("capture_mode") == "all_apis":
+        selected = [row["function"] for row in heidenhain_tnc640_catalog()
+                    if row["function"] in HEIDENHAIN_READ_ONLY_API_NAMES]
+    selected = [name for name in selected if name in HEIDENHAIN_READ_ONLY_API_NAMES]
+    if not selected:
+        raise ValueError("没有选中可采集的海德汉只读 API")
+
+    folder = out / "batch_001"
+    retry = 1
+    while folder.exists():
+        folder = out / f"batch_001_retry_{retry:03d}"
+        retry += 1
+    execution = folder / "execution"
+    execution.mkdir(parents=True)
+    api_log_path = execution / "api_logs.jsonl"
+    transaction_path = execution / "protocol_transactions.jsonl"
+    parameter_path = out / "actual_parameter_coverage.json"
+    records: list[dict] = []
+    emit("coverage_batch", {"batch": 1, "single_api": len(selected) == 1,
+                             "covered": 0, "resolved": 0, "total": len(selected)})
+
+    def save_record(record):
+        records.append(record)
+        line = json.dumps(record, ensure_ascii=False, default=str)
+        with api_log_path.open("a", encoding="utf-8") as stream:
+            stream.write(line + "\n")
+        with transaction_path.open("a", encoding="utf-8") as stream:
+            stream.write(line + "\n")
+        write_json(parameter_path, {
+            "description": "Actual input parameter values sent to Heidenhain LSV2.",
+            "record_count": len(records),
+            "records": [{
+                "batch": 1,
+                "protocol_function": item.get("protocol_function"),
+                "step_id": item.get("step_id"),
+                "input_parameters": item.get("input_parameters", {}),
+                "status_code": item.get("status_code"),
+                "error": item.get("error", ""),
+            } for item in records],
+        })
+        completed = len({item["protocol_function"] for item in records if item.get("success")})
+        emit("coverage_progress", {"batch": 1, "single_api": len(selected) == 1,
+                                    "covered": completed, "resolved": completed,
+                                    "total": len(selected)})
+
+    client = HeidenhainLsv2Client(
+        config["host"], int(config["port"]), timeout=min(float(config.get("timeout", 5)), 30.0)
+    )
+    try:
+        result = client.collect_read_only(
+            selected,
+            output_dir=folder,
+            samples=max(1, int(config.get("samples", 1))),
+            interval_seconds=float(config.get("interval", 0.0)),
+            on_record=save_record,
+        )
+    except Exception as exc:
+        successful = sorted({item["protocol_function"] for item in records if item.get("success")})
+        failure_summary = {
+            "protocol": "lsv2", "controller_model": "TNC640", "host": config["host"],
+            "port": int(config["port"]), "success": False,
+            "capture_mode": config.get("capture_mode", "single_api"),
+            "selection_scope": "single_api" if len(selected) == 1 else "selected_read_only_apis",
+            "collection_status": "failed", "offline_audit_status": "not_applicable",
+            "traffic_source": "pyLSV2 LSV2 response records", "target_functions": selected,
+            "successful_functions": successful,
+            "failed_functions": sorted(set(selected) - set(successful)),
+            "api_log_count": len(records), "error": f"{type(exc).__name__}: {exc}",
+        }
+        write_json(folder / "summary.json", failure_summary)
+        (folder / "summary_zh.txt").write_text(
+            f"海德汉 TNC640 LSV2 采集失败：{type(exc).__name__}: {exc}\n",
+            encoding="utf-8",
+        )
+        emit("coverage_batch_failed", {"batch": 1, "single_api": len(selected) == 1,
+                                        "targets": selected, "errors": [str(exc)],
+                                        "folder": str(folder)})
+        raise
+    successful = sorted({item["protocol_function"] for item in records if item.get("success")})
+    failed = sorted(set(selected) - set(successful))
+    status = "local_success" if not failed else ("partial" if successful else "failed")
+    summary = {
+        "protocol": "lsv2",
+        "controller_model": "TNC640",
+        "capture_mode": config.get("capture_mode", "single_api"),
+        "selection_scope": "single_api" if len(selected) == 1 else "selected_read_only_apis",
+        "host": config["host"],
+        "port": int(config["port"]),
+        "success": not failed,
+        "collection_status": status,
+        "offline_audit_status": "not_applicable",
+        "traffic_source": "pyLSV2 LSV2 response records",
+        "target_functions": selected,
+        "successful_functions": successful,
+        "failed_functions": failed,
+        "api_log_count": len(records),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_json(folder / "summary.json", summary)
+    (folder / "summary_zh.txt").write_text(
+        "海德汉 TNC640 LSV2 只读采集\n"
+        f"目标 API：{len(selected)}；成功：{len(successful)}；失败：{len(failed)}\n"
+        f"连接：{config['host']}:{config['port']}\n"
+        "数据来源：pyLSV2 返回值和实际输入参数；LSV2 不生成 FOCAS PCAP。\n",
+        encoding="utf-8",
+    )
+    write_json(out / "full_api_coverage_state.json", {
+        "protocol": "lsv2", "device_scope": "HEIDENHAIN_TNC640_LSV2",
+        "functions": {name: {"function": name, "status": "success" if name in successful else "failed",
+                             "terminal": name in successful, "coverage_role": "target",
+                             "evidence": str(folder / "execution" / "api_logs.jsonl")}
+                      for name in selected},
+    })
+    if not successful:
+        emit("coverage_batch_failed", {"batch": 1, "single_api": len(selected) == 1,
+                                        "targets": selected, "errors": [
+                                            "所有海德汉 API 调用均失败，请检查 LSV2 权限/选件和日志",
+                                        ], "folder": str(folder)})
+        raise RuntimeError("海德汉 LSV2 采集没有任何成功的只读 API")
+    if failed:
+        emit("partial", {"message": f"海德汉 LSV2 采集部分完成：成功 {len(successful)}/{len(selected)}，结果：{out}"})
+        return 0
+    label = "单 API" if len(selected) == 1 else "所选只读 API"
+    target_label = selected[0] if len(selected) == 1 else f"{len(selected)} 个"
+    emit("success", {"message": f"海德汉 TNC640 LSV2 {label}采集完成：{len(successful)}/{len(selected)}，目标={target_label}，结果：{out}"})
+    return 0
 
 
 def next_scene_folder(out, index, scene):
@@ -606,7 +870,17 @@ def simulator_is_idle_after_failure(config):
     ).call("ReadRunStatus")
     if response.get("status_code") != 0:
         return False
-    data = response.get("data") or response.get("response") or response
+    # The bridge returns ReadRunStatus under ``statinfo`` while generated
+    # harness logs may expose the same fields at the top level or under
+    # ``data``/``response``. Normalize all supported shapes before applying
+    # the idle gate; otherwise a known idle controller is incorrectly treated
+    # as unsafe and the scheduler stops after every recoverable failure.
+    data = (
+        response.get("statinfo")
+        or response.get("data")
+        or response.get("response")
+        or response
+    )
     return isinstance(data, dict) and str(data.get("run")) in {"0", "1"} and all(
         str(data.get(key)) == "0" for key in ("motion", "alarm", "emergency")
     )
@@ -647,9 +921,9 @@ def worker():
         print(EVENT + json.dumps({"event": event, "data": data}, ensure_ascii=False, default=str), flush=True)
     try:
         action = config["action"]
-        if action != "llm":
+        if action not in {"llm", "simulator"}:
             require_capture_adapter(config)
-        if protocol_profile(config)["available"]:
+        if protocol_profile(config)["available"] and config.get("protocol", "focas") != "lsv2":
             configure(config)
         else:
             os.environ["DEEPSEEK_API_KEY"] = str(config.get("api_key", ""))
@@ -659,7 +933,11 @@ def worker():
             return 0
         emit("status", {"message": "正在重新检查采集条件"})
         emit("status", {"message": preflight(config)})
+        if config.get("protocol", "focas") == "lsv2":
+            out = capture_output_dir(config)
+            return run_lsv2_capture(config, out, emit)
         from .knowledge import KnowledgeBase
+        from .traffic_graph import build_default_relationship_service
         from .models import TaskRequest
         from .workflow import TrafficGenerationWorkflow, workflow_success
         from .utils import write_json
@@ -668,7 +946,20 @@ def worker():
         safe = {k: v for k, v in config.items() if k != "api_key"}
         if not (out / "settings.json").exists():
             write_json(out / "settings.json", safe)
-        kb = KnowledgeBase(vector_db_dir=Path(config["vector"]))
+        kb = KnowledgeBase(
+            vector_db_dir=Path(config["vector"]),
+            collection_name=(
+                "heidenhain_lsv2_knowledge" if config.get("protocol") == "lsv2"
+                else ("ezsocket_knowledge" if config.get("protocol") == "ezsocket" else "focas_knowledge")
+            ),
+        )
+        graph_service = build_default_relationship_service()
+        graph_target = (config.get("selected_apis") or ["cnc_statinfo"])[0]
+        graph_service.ensure_local_server_started()
+        graph_service.call("get_api_info", graph_target)
+        emit("knowledge_status", {"vector": kb.status, "graph": graph_service.status})
+        if kb.status.get("status") in {"unavailable", "empty"} and not kb.status.get("fallback_available"):
+            emit("status", {"message": "知识库不可用：RAG 向量库未加载且没有本地降级知识；请先修复知识库连接"})
         catalog = {s["scenario_id"]: s for s in scenarios()}
         if config.get("capture_mode") != "single_scene" and ("selected_apis" in config or is_full_api_mode(config)):
             return run_full_api_capture(config, out, kb, emit)
@@ -686,11 +977,14 @@ def worker():
                 emit("scenario_done", {"index": index, "total": total, "resumed": True})
                 continue
             folder = next_scene_folder(out, index, scene)
+            required_api_functions = atomic_scene_api_names(scene)
             request = TaskRequest(description=render_prompt(config, scene), task_id=folder.name,
                 protocol=config.get("protocol", "focas"), target_environment="ncguide-generated-cpp", quality_gate_enabled=True,
-                permissions={"representative_scenario": True, "selected_scenario_ids": [sid],
-                    "required_api_functions": atomic_scene_api_names(scene),
-                    "allow_delete_all_programs": False, "historical_memory_enabled": True})
+                permissions={"representative_scenario": True, "allow_environment_writes": True,
+                    "ncguide_cycle_start_allowed": bool(config.get("ui_start")),
+                    "selected_scenario_ids": [sid],
+                    "required_api_functions": required_api_functions,
+                    **target_permission_flags(required_api_functions), "historical_memory_enabled": True})
             try:
                 workflow = TrafficGenerationWorkflow(kb, llm_client=make_llm(config), progress_callback=emit)
                 state = workflow.run(request, folder)
@@ -1045,7 +1339,12 @@ def write_selected_api_coverage_progress(
     }
     if status in ("completed", "failed"):
         try:
-            payload["overall_csv_progress"] = refresh_overall_collection_csv(out.parent / "采集进度.csv")
+            ledger_path = out.parent / "采集进度.csv"
+            payload["overall_csv_progress"] = refresh_overall_collection_csv(ledger_path)
+            from .function_coverage import sync_coverage_state_from_progress_csv
+            payload["global_coverage_sync"] = sync_coverage_state_from_progress_csv(
+                ledger_path, ROOT / "rag_indexes" / "focas" / "function_coverage_state.json"
+            )
         except (OSError, ValueError) as exc:
             # A locked or malformed ledger must not interrupt live capture.
             payload["overall_csv_update_error"] = f"{type(exc).__name__}: {exc}"
@@ -1253,6 +1552,7 @@ def run_full_api_capture(config, out, knowledge_base, emit):
         raise ValueError("没有选中可采集的 API")
     coverage_path = out / "full_api_coverage_state.json"
     coverage_state = load_function_coverage_state(coverage_path)
+    active_device_scope = F0ID_SCOPE_ID if configured_controller_model(config) == F0ID_MODEL else ""
 
     def batch_has_target_call(folder):
         log_path = folder / "execution" / "api_logs.jsonl"
@@ -1299,6 +1599,9 @@ def run_full_api_capture(config, out, knowledge_base, emit):
         for function, candidate in historical.get("functions", {}).items():
             if not isinstance(candidate, dict):
                 continue
+            candidate_scope = str(candidate.get("device_scope", ""))
+            if active_device_scope and candidate_scope and candidate_scope != active_device_scope:
+                continue
             if has_successful_coverage(candidate):
                 historical_success.add(str(function))
             current = functions.get(function)
@@ -1324,6 +1627,7 @@ def run_full_api_capture(config, out, knowledge_base, emit):
                 "terminal": True,
                 "coverage_role": "target",
                 "evidence": f"symbol absent from configured header: {header_path}",
+                "device_scope": active_device_scope,
             }
     write_json(coverage_path, coverage_state)
     # Each target receives one outer workflow dispatch. Repair attempts stay
@@ -1456,13 +1760,18 @@ def run_full_api_capture(config, out, knowledge_base, emit):
             description=render_full_api_prompt(config, batch_targets=current_targets), task_id=folder.name,
             protocol=config.get("protocol", "focas"), target_environment="ncguide-generated-cpp", quality_gate_enabled=True,
             permissions={
+                "allow_environment_writes": True,
+                "ncguide_cycle_start_allowed": bool(config.get("ui_start")),
                 "representative_scenario": False,
+                "device_model": configured_controller_model(config),
+                "device_scope": F0ID_SCOPE_ID if configured_controller_model(config) == F0ID_MODEL else "",
+                "device_api_names": sorted(selected),
                 "full_api_parameter_coverage": True,
                 "coverage_target_functions": current_targets,
                 "coverage_current_batch_functions": current_targets,
                 "coverage_skip_functions": [],
                 "require_planned_target_traffic": True,
-                "allow_delete_all_programs": False,
+                **target_permission_flags(current_targets),
                 "historical_memory_enabled": True,
                 "capture_samples": int(config["samples"]),
                 "capture_interval_seconds": float(config["interval"]),
@@ -1486,6 +1795,15 @@ def run_full_api_capture(config, out, knowledge_base, emit):
         if batch_has_target_call(folder):
             current_run_batches.append(folder)
         planned_any_target = planned_any_target or bool(result and result.plan is not None)
+        # Desktop full-API runs keep an output-local state for resumability.
+        # Promote the same evidence to the global history used by future
+        # batches; merge_workflow_function_coverage_state only promotes
+        # verified traffic/terminal evidence and never treats a name-only log
+        # as captured coverage.
+        if result is not None and result.plan is not None and result.result is not None:
+            from .function_coverage import merge_workflow_function_coverage_state
+            global_coverage_path = ROOT / "rag_indexes" / "focas" / "function_coverage_state.json"
+            merge_workflow_function_coverage_state(result, global_coverage_path)
         manual_action_unresolved = manual_operator_action_timed_out(folder)
         if manual_action_unresolved:
             os.environ["SMP_SKIP_MANUAL_ACTION_PROMPTS"] = "1"
@@ -1624,6 +1942,17 @@ def run_full_api_capture(config, out, knowledge_base, emit):
             targets=current_targets,
         )
     if not single_api:
+        # Preserve the legacy explicit selected-API contract: a request that
+        # produced no plan at all is a planning failure.  Full manifest mode
+        # still records each failed target and continues to its summary.
+        if (config.get("capture_mode") not in {"all_apis", "single_api"}
+                and "selected_apis" in config and not planned_any_target
+                and not header_blocked):
+            unresolved = sorted(selected)
+            raise RuntimeError(
+                f"未判定 API：本轮所有工作流均未生成可验证计划；未完成目标：{unresolved}。"
+                f"规划/生成失败证据见 {out / 'coverage_batch_failures.json'}"
+            )
         scheduler_metrics = full_api_scheduler_summary(scheduler_state)
         scheduler_state["summary"] = scheduler_metrics
         scheduler_state["run_status"] = "completed" if scheduler_metrics["unprocessed"] == 0 else "partial"

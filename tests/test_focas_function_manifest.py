@@ -14,9 +14,23 @@ from smart_traffic_agent.rag.focas_function_manifest import (
     split_function_cell,
     symbol_candidates_for,
 )
+from smart_traffic_agent.api_compatibility import f0id_api_names
 
 
 class FocasFunctionManifestTests(unittest.TestCase):
+    def test_f0id_context_uses_308_function_target_universe(self) -> None:
+        context = build_function_coverage_context(
+            Path("rag_indexes/focas/function_manifest.jsonl"),
+            target_functions=set(f0id_api_names()),
+            batch_size=1,
+            max_segments=1,
+            device_scope="fanuc:0i-D",
+            device_model="0i-D",
+        )
+        self.assertEqual(context["target_function_count"], 308)
+        self.assertEqual(context["device_scope"], "fanuc:0i-D")
+        self.assertEqual(context["device_model"], "0i-D")
+
     def test_split_function_cell_handles_multi_function_cells(self) -> None:
         self.assertEqual(split_function_cell("cnc_dwnstart3/cnc_dwnstart4"), ["cnc_dwnstart3", "cnc_dwnstart4"])
         self.assertEqual(split_function_cell("download3，download4"), ["download3", "download4"])

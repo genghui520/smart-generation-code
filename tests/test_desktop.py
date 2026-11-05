@@ -52,6 +52,15 @@ def test_select_all_switches_to_global_api_and_parameter_coverage():
     assert "不得在只完成一个批次时宣称全覆盖" in prompts[0]
 
 
+def test_delete_all_permission_follows_explicit_target_selection():
+    assert backend.target_permission_flags(["cnc_statinfo"]) == {
+        "allow_delete_all_programs": False
+    }
+    assert backend.target_permission_flags(["cnc_delall"]) == {
+        "allow_delete_all_programs": True
+    }
+
+
 def test_selected_api_prompt_and_validation_do_not_expand_to_all_functions():
     cfg = config()
     cfg["selected"] = []
@@ -228,6 +237,17 @@ def test_failed_scene_continues_only_when_controller_is_verified_idle():
         assert not backend.simulator_is_idle_after_failure(cfg)
 
 
+def test_failed_scene_accepts_bridge_statinfo_shape():
+    cfg = config()
+    with patch("smart_traffic_agent.integrations.ncguide.FocasCppBridgeClient") as bridge:
+        bridge.return_value.call.return_value = {
+            "status_code": 0,
+            "function": "cnc_statinfo",
+            "statinfo": {"run": 0, "motion": 0, "alarm": 0, "emergency": 0},
+        }
+        assert backend.simulator_is_idle_after_failure(cfg)
+
+
 def test_required_target_api_requires_invocation_but_not_online_traffic_match():
     from smart_traffic_agent.agents.executor import required_traffic_errors
     from smart_traffic_agent.models import ApiCallLog, TaskRequest, WorkflowState
@@ -390,6 +410,35 @@ def test_desktop_build_preview_and_connection_invalidation():
         assert "测试" in app.sim_status.get()
         app.select_all(False)
         assert not app.config()["selected_apis"]
+    finally:
+        root.destroy()
+
+
+def test_api_change_resets_monitor_evidence_for_new_target():
+    import tkinter as tk
+    from smart_traffic_agent.desktop import DesktopApp
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        app = DesktopApp(root)
+        app.append_log("旧 API cnc_statinfo 的历史事件")
+        app.progress["value"] = 75
+        app._loaded_history_path = object()
+
+        app.api_search.set("cnc_actf")
+        app.listbox.selection_clear(0, "end")
+        app.listbox.selection_set(app.visible_api_names.index("cnc_actf"))
+        app.on_api_selection()
+
+        assert app.selected_api_set == {"cnc_actf"}
+        assert app.monitor_events is None
+        assert app.monitor_flow is None
+        assert app.progress["value"] == 0
+        assert app.output is None
+        assert app._loaded_history_path is None
+        assert "旧 API" not in app.log.get("1.0", "end")
+        assert "已更换 API" in app.monitor_stage.get()
     finally:
         root.destroy()
 
@@ -566,6 +615,23 @@ def test_detailed_log_keeps_history_position_when_new_lines_arrive():
         root.destroy()
 
 
+def test_monitor_view_has_outer_scrollbar_for_short_windows():
+    import tkinter as tk
+    from smart_traffic_agent.desktop import DesktopApp
+
+    root = tk.Tk()
+    try:
+        app = DesktopApp(root)
+        root.geometry("720x420")
+        root.update()
+        assert app.monitor_canvas.winfo_exists()
+        assert app.monitor_scrollbar.winfo_exists()
+        assert app.plan_steps_scroll.winfo_exists()
+        assert app.log.winfo_exists()
+    finally:
+        root.destroy()
+
+
 def test_prompt_panel_keeps_actions_visible_and_text_scrollable():
     import tkinter as tk
     from smart_traffic_agent.desktop import DesktopApp
@@ -597,7 +663,7 @@ def test_prompt_panel_keeps_actions_visible_and_text_scrollable():
 
 def test_unsupported_protocol_never_uses_focas_adapter():
     cfg = config()
-    for protocol in ("ezsocket", "s7comm", "lsv2", "unknown"):
+    for protocol in ("s7comm", "unknown"):
         cfg["protocol"] = protocol
         assert any("尚未接入" in error for error in backend.validate(cfg, capture=True))
         assert "FOCAS" in backend.render_selected_prompts(cfg)[0]
@@ -605,6 +671,51 @@ def test_unsupported_protocol_never_uses_focas_adapter():
             with pytest.raises(ValueError, match="尚未接入"):
                 backend.test_simulator(cfg)
             connect.assert_not_called()
+
+
+def test_ezsocket_connection_test_uses_read_only_tcp_adapter():
+    cfg = config()
+    cfg.update(protocol="ezsocket", host="192.168.139.130", port="683", timeout="3")
+    with patch("smart_traffic_agent.integrations.ezsocket.test_ezsocket_connection", return_value={
+        "host": cfg["host"], "port": 683,
+    }) as probe:
+        with patch("smart_traffic_agent.integrations.ezsocket.test_ezsocket_api_contract", return_value={
+            "function": "Status_GetRunStatus",
+        }) as contract:
+            message = backend.test_simulator(cfg)
+    assert "三菱 EZSocket" in message
+    probe.assert_called_once_with(cfg["host"], 683, timeout=3.0)
+    contract.assert_called_once_with("Status_GetRunStatus")
+
+
+def test_ezsocket_com_test_uses_read_only_api_adapter():
+    cfg = config()
+    cfg.update(
+        protocol="ezsocket",
+        host="192.168.139.130",
+        port="683",
+        timeout="3",
+        ezsocket_test_mode="com",
+        ezsocket_com_machine="192.168.139.130",
+    )
+    with patch(
+        "smart_traffic_agent.integrations.ezsocket.call_ezsocket_com_api",
+        return_value={"run_status": 0, "return_code": 0},
+    ) as call:
+        message = backend.test_simulator(cfg)
+    assert "Status_GetRunStatus(1)=0" in message
+    call.assert_called_once_with(
+        cfg["host"], 683, function="Status_GetRunStatus", timeout=3.0,
+        com_machine="192.168.139.130",
+    )
+
+
+def test_lsv2_connection_test_uses_read_only_adapter():
+    cfg = config()
+    cfg.update(protocol="lsv2", port="19000", timeout="5")
+    with patch("smart_traffic_agent.integrations.heidenhain_lsv2.test_lsv2_directory_info", return_value={"directory": "TNC:"}) as probe:
+        assert "海德汉 LSV2" in backend.test_simulator(cfg)
+        probe.assert_called_once_with(cfg["host"], 19000, timeout=5.0)
 
 
 def test_protocol_switch_inherits_focas_content_and_keeps_edits_independent():
@@ -624,14 +735,23 @@ def test_protocol_switch_inherits_focas_content_and_keeps_edits_independent():
             app.change_protocol()
             root.update()
             assert app.config()["protocol"] == key
-            assert app.config()["selected_apis"] == original_api
+            expected_api = (["Status_GetRunStatus"] if key == "ezsocket" else
+                            (["directory_info"] if key == "lsv2" else original_api))
+            assert app.config()["selected_apis"] == expected_api
             assert app.config()["template"]
-            assert app.values["host"].get() == "192.0.2.10"
+            expected_host = "192.168.56.102" if key == "lsv2" else "192.0.2.10"
+            assert app.values["host"].get() == expected_host
             assert app.values["port"].get() == "8192"
             assert "保留 FOCAS 要求" in app.config()["full_template"]
-            assert app.capture_pane.winfo_ismapped()
+            assert app.capture_pane.winfo_manager() == "pack"
             assert not app.protocol_pending.winfo_ismapped()
-            assert app.protocol_environment.winfo_manager() == "pack"
+            if key == "ezsocket":
+                assert app.protocol_environment.winfo_manager() == ""
+                assert app.ezsocket_environment.winfo_manager() == "pack"
+                assert "Status_GetRunStatus" in app.visible_api_names
+                assert not app.ezsocket_api_test_button.instate(["disabled"])
+            else:
+                assert app.protocol_environment.winfo_manager() == "pack"
             assert app.start_buttons[0].instate(["disabled"])
             app.values["host"].set("192.0.2.20")
         app.protocol_choice.set(PROTOCOL_PROFILES["focas"]["label"])
@@ -641,7 +761,7 @@ def test_protocol_switch_inherits_focas_content_and_keeps_edits_independent():
         assert app.values["port"].get() == "8192"
         assert app.config()["selected_apis"] == original_api
         assert "保留 FOCAS 要求" in app.config()["full_template"]
-        assert app.capture_pane.winfo_ismapped()
+        assert app.capture_pane.winfo_manager() == "pack"
         assert app.start_buttons[0].instate(["!disabled"])
         app.protocol_choice.set(PROTOCOL_PROFILES["ezsocket"]["label"])
         app.change_protocol()

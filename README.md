@@ -4,7 +4,43 @@
 
 选择需要运行 NC 程序的 API 或场景后，启动前必须完成 Cycle Start 定位并启用。未完成时会提示并切到定位页面，不会启动采集进程；全部 API 模式也执行此检查。仅数据读写类目标不强制要求定位。
 
-连接页提供 FANUC FOCAS、三菱 EZSocket、西门子 S7Comm、海德汉 LSV/2 协议入口。当前 FOCAS 已接入真实采集；其余三种协议首次选择时继承当前 FOCAS 的完整配置、API 清单、场景、提示词及 Cycle Start 设置，全部显示并可编辑；之后各协议在本次会话中独立保留修改。继承内容明确标记为 FOCAS 模板，真实协议采集与连接测试仍待接入，不会误启动 FOCAS 后端。
+连接页提供 FANUC FOCAS、三菱 EZSocket、西门子 S7Comm、海德汉 LSV/2 协议入口。当前 FOCAS 已接入真实采集；三菱 EZSocket 已接入只读 TCP 连接测试，默认连接虚拟机 `192.168.139.130:683`；海德汉 LSV/2 已接入 TNC640 的协议原生只读采集（默认 TCP 19000，连接测试读取 `directory_info("TNC:")`），西门子仍为配置预览。各协议首次选择时继承当前 FOCAS 的完整配置、API 清单、场景和提示词，之后在本次会话中独立保留修改。EZSocket 当前只执行建连探测，不发送 CNC 指令；LSV/2 采集不启动 FOCAS C++ 后端，也不生成 FOCAS PCAP，而是保存每次 pyLSV2 请求/响应的结构化日志。
+
+安装海德汉适配依赖：
+
+```powershell
+python -m pip install -e .
+```
+
+在连接页选择“海德汉 · LSV/2”，填写机床 IP（默认端口 19000），点击“测试设备连接”。连接测试只读取 `TNC:` 目录信息并使用 pyLSV2 的 `safe_mode=True`。开始采集后，适配器使用固定的只读 API 白名单，并为需要 DNC、PLCDEBUG、DATA、INSPECT 或 SCOPE 权限的 API 单独记录失败原因；它不会调用写参数、删文件、发按键或其他远程控制 API。海德汉采集默认每个 API 调用一次，避免继承 FOCAS 的 30 次采样造成不必要的等待。
+
+三菱 EZSocket 知识库位于 `rag_indexes/ezsocket/`，由指定的 FCSB1224W000 参考手册和 `SimCNC-master/EZSockets/MitCom.cs` 生成，包含 364 个手册分块、31 个 API 条目、3 条连接与写入安全规则以及稳定向量索引。重新生成知识库：
+
+```powershell
+python -m smart_traffic_agent build-ezsocket-knowledge
+```
+
+使用只读 `Status_GetRunStatus` 做系统测试：
+
+```powershell
+python -m smart_traffic_agent test-ezsocket --host 192.168.139.130 --port 683 --api Status_GetRunStatus
+```
+
+测试会验证 TCP/683 端点和手册/源码中的 API 契约。FCSB1224W000 的真实 OLE/COM 调用还要求运行环境安装并注册 Mitsubishi EZSocket COM 运行库；当前工作站的本机 COM 激活返回 RPC 不可用，指向虚拟机的 DCOM 激活返回访问被拒绝，因此系统不会伪造 API 返回值，也不会把 TCP 建连结果当成 CNC 状态值。
+
+在已安装并注册 Mitsubishi EZSocket/FCSB1224W000、且 Python 安装了 `pywin32` 的 Windows 环境，可加 `--com` 真实调用一次只读 API：
+
+```powershell
+python -m smart_traffic_agent test-ezsocket --host 192.168.139.130 --port 683 --api Status_GetRunStatus --com
+```
+
+该调用按手册和 `SimCNC` 示例执行 `SetTCPIPProtocol` → `Open2` → `Status_GetRunStatus(1)` → `Close`，返回 `run_status`（0/1）及 COM 返回码；未注册 COM 时会给出明确错误，不会退化成伪造状态值。
+
+如果 EZSocket 运行库安装在仿真器虚拟机而不是当前工作站，可按手册的 DCOM 方式指定远程主机：
+
+```powershell
+python -m smart_traffic_agent test-ezsocket --host 192.168.139.130 --port 683 --com --com-machine 192.168.139.130
+```
 
 双击项目根目录的 `run_desktop.cmd` 启动原生 Windows 窗口，无需浏览器。
 也可执行 `.\.venv\Scripts\python.exe -m smart_traffic_agent.desktop`。

@@ -6,6 +6,8 @@ import os
 import time
 from pathlib import Path
 
+from smart_traffic_agent.focas_contracts import resolve_api_return_code
+
 
 DEFAULT_TASK = (
     "Generate high-quality FOCAS traffic around an NC coordinate motion program. "
@@ -22,6 +24,41 @@ VERBOSE_CONSOLE = False
 RUN_STARTED_AT: float | None = None
 AGENT_STARTED_AT: dict[str, float] = {}
 AGENT_DURATIONS: dict[str, list[float]] = {}
+
+
+def _failed_api_messages(result) -> list[str]:
+    """Return concise, deduplicated explanations for real failed API calls."""
+    messages: list[str] = []
+    seen: set[tuple[str, int, str]] = set()
+    for log in getattr(result, "api_logs", ()):
+        try:
+            code = int(log.status_code)
+        except (TypeError, ValueError):
+            continue
+        if code == 0:
+            continue
+        function = str(getattr(log, "protocol_function", "") or getattr(log, "interface_name", "")).strip()
+        if not function:
+            continue
+        response = getattr(log, "response", {}) or {}
+        return_text = str(response.get("return_text", "") or "").strip()
+        resolved = resolve_api_return_code(function, code)
+        names = list(resolved.get("api_code_names", ()))
+        code_name = return_text or (names[0] if names else f"FOCAS_RETURN_{code}")
+        explanations = list(resolved.get("api_explanations", ()))
+        explanation = " ".join((explanations[0] if explanations else "需要结合 SDK、控制器选项和调用参数判断").split())
+        if code_name == "EW_NOOPT":
+            explanation = (
+                "当前 NCGuide/控制器没有启用该 C Language Executor SRAM 功能"
+                if "cexesram" in function.casefold()
+                else "当前 NCGuide/控制器没有启用该 API 所需功能选项或扩展驱动"
+            )
+        key = (function, code, code_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        messages.append(f"{function} -> ret={code} -> {code_name} {explanation}")
+    return messages
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,7 +141,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--focas-port",
         type=int,
-        default=int(os.environ.get("FOCAS_PORT", "8193")),
+        default=int(os.environ.get("FOCAS_PORT", "8192")),
         help="FOCAS Ethernet TCP port used by NCGuide.",
     )
     parser.add_argument(
@@ -183,6 +220,24 @@ def main() -> int:
     # 2. 加载已经构建好的 FOCAS RAG 向量知识库，PlannerAgent 会从这里检索规则和API上下文。
     print("Loading RAG knowledge base...", flush=True)
     knowledge_base = KnowledgeBase(vector_db_dir=args.vector_db)
+    kb_status = knowledge_base.status
+    if kb_status["status"] == "vector":
+        print(f"[KnowledgeBase] RAG 向量库已连接：{kb_status['vector_db']['path']}", flush=True)
+    elif kb_status["status"] == "fallback":
+        print("\033[33m[KnowledgeBase] RAG 向量库未连接，当前使用本地降级知识\033[0m", flush=True)
+    else:
+        print("\033[31m[KnowledgeBase] 知识库不可用：RAG 向量库未加载且没有本地降级知识\033[0m", flush=True)
+    from smart_traffic_agent.traffic_graph import build_default_relationship_service
+    relationship_service = build_default_relationship_service()
+    relationship_service.ensure_local_server_started()
+    relationship_service.call("get_api_info", "cnc_statinfo")
+    graph_status = relationship_service.status
+    if graph_status["status"] == "error":
+        print(f"\033[31m[KnowledgeBase] Neo4j 关系图未连接：{graph_status['error']}\033[0m", flush=True)
+    elif graph_status["status"] == "unconfigured":
+        print("\033[33m[KnowledgeBase] Neo4j 关系图未配置，依赖关系不会被视为已验证\033[0m", flush=True)
+    else:
+        print("[KnowledgeBase] Neo4j 关系图已连接", flush=True)
 
     # 3. 接入大模型。默认使用项目本地 .env 中的 DEEPSEEK_API_KEY，不需要写到系统全局环境变量。
     print("Initializing LLM client...", flush=True)
@@ -209,6 +264,7 @@ def main() -> int:
             protocol=args.protocol,
             target_environment=args.target,
             permissions={
+                "allow_environment_writes": True,
                 "allow_delete_all_programs": args.allow_delete_all_programs,
                 "representative_scenario": args.representative_scenario,
                 "code_only_evaluation": args.code_only_evaluation,
@@ -860,7 +916,11 @@ def print_plan(state: WorkflowState) -> None:
     print(f"    retrieved_chunks: {len(state.retrieved_chunks)}")
     print("    rag_context_counts:")
     for key, rows in plan.rag_context.items():
-        print(f"      - {key}: {len(rows)}")
+        try:
+            count = len(rows)
+        except TypeError:
+            count = rows
+        print(f"      - {key}: {count}")
     print("    nc_program_requirements:")
     for item in plan.nc_program_requirements[:10]:
         print(f"      - {item}")
@@ -903,6 +963,13 @@ def print_execution(state: WorkflowState) -> None:
         print("    errors:")
         for error in result.errors:
             print(f"      - {error}")
+    if not result.success:
+        failed_api_messages = _failed_api_messages(result)
+        if failed_api_messages:
+            red, reset = "\033[91m", "\033[0m"
+            print(f"{red}    API failures:{reset}")
+            for message in failed_api_messages:
+                print(f"{red}      - {message}{reset}")
     if state.quality_assessment is not None:
         qa = state.quality_assessment
         print(f"    quality_passed: {qa.passed}")

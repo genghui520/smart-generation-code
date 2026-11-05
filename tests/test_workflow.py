@@ -379,6 +379,32 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(coverage["segment_metrics"]), 2)
         self.assertEqual(coverage["segment_metrics"][0]["segment_id"], "01_system")
 
+    def test_workflow_summary_accepts_scalar_rag_context_flags(self) -> None:
+        state = WorkflowState(
+            request=TaskRequest(description="scalar context", task_id="scalar-context"),
+        )
+        state.plan = ExecutionPlan(
+            plan_id="plan-scalar-context",
+            task_id="scalar-context",
+            scenario_type="read_only",
+            scenario_goal="summary regression",
+            target_environment="ncguide-generated-cpp",
+            nc_program_type="none",
+            nc_program_requirements=[],
+            nc_program_spec=NcProgramSpec(program_name=""),
+            steps=[],
+            expected_outputs=[],
+            rag_context={"enabled": True, "disabled": False, "optional": None, "items": [1, 2]},
+        )
+        summary = workflow_summary(state)
+
+        assert summary["rag_context_counts"] == {
+            "enabled": 1,
+            "disabled": 1,
+            "optional": 0,
+            "items": 2,
+        }
+
 
 if __name__ == "__main__":
     unittest.main()

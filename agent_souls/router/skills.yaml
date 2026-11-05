@@ -1,4 +1,6 @@
 version: 1
+display_name_zh: 路由智能体
+developer_notes_zh: 负责依据结构化错误证据选择规划、代码、执行修复或终态收敛。
 tools:
   - search_knowledge
   - search_memory

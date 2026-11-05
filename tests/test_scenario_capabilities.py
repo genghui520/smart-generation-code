@@ -6,6 +6,7 @@ from smart_traffic_agent.scenario_capabilities import (
     assess_scene_execution,
     build_cnc_skip_scene_steps,
     build_scene_capability_plan,
+    build_variation_contract,
     classify_api_variation,
     load_scenario_capabilities,
 )
@@ -88,6 +89,34 @@ def test_variation_requirements_split_input_and_response_state_obligations() -> 
     assert status["response_state_diversity"]["required"] is False
 
 
+def test_variation_contract_explains_input_response_and_state_evidence() -> None:
+    contract = build_variation_contract(
+        ["pmc_rdpmcrng", "cnc_statinfo", "cnc_accdecdly"],
+        task_description="采集输入多样性和输出变化",
+    )
+    pmc = contract["targets"]["pmc_rdpmcrng"]
+    assert pmc["input_diversity"]["required"] is True
+    assert "documented API inputs" in pmc["input_diversity"]["source"]
+    assert "input signatures" in pmc["input_diversity"]["success_metric"]
+    status = contract["targets"]["cnc_statinfo"]
+    assert status["input_diversity"]["required"] is False
+    assert status["state_diversity"]["acquisition"]
+    acc = contract["targets"]["cnc_accdecdly"]
+    assert acc["input_diversity"]["required"] is True
+    assert acc["response_diversity"]["required"] is False
+    assert acc["state_diversity"]["required"] is False
+
+
+def test_write_diversity_is_visible_but_blocked_without_permission() -> None:
+    contract = build_variation_contract(
+        ["pmc_wrpmcrng"], task_description="需要输入多样性采集", permissions={}
+    )
+    row = contract["targets"]["pmc_wrpmcrng"]
+    assert row["input_diversity"]["required"] is True
+    assert row["execution_gate"] == "blocked_until_explicit_permission"
+    assert "allow_environment_writes" in row["input_diversity"]["blocked_reason"]
+
+
 def test_dynamic_state_and_transfer_plans_expose_required_scene_helpers() -> None:
     position = build_scene_capability_plan("cnc_rdposition")
     assert position["scene_type"] == "runtime_motion_state"
@@ -99,7 +128,26 @@ def test_dynamic_state_and_transfer_plans_expose_required_scene_helpers() -> Non
 
     transfer = build_scene_capability_plan("cnc_download3")
     assert transfer["auxiliary_apis"] == ["cnc_rdprogdir3", "cnc_dwnstart3", "cnc_dwnend3"]
+    assert transfer["required_auxiliary_apis"] == ["cnc_dwnstart3", "cnc_dwnend3"]
+    assert transfer["optional_auxiliary_apis"] == ["cnc_rdprogdir3"]
+    assert transfer["session_chain"] == ["cnc_dwnstart3", "cnc_download3", "cnc_dwnend3"]
+    assert transfer["data_repeatable"] is True
     assert transfer["nc_program_required"] is None
+
+    transfer4 = build_scene_capability_plan("cnc_download4")
+    assert transfer4["selected_capability"]["transfer_version"] == "4"
+    assert transfer4["selected_capability"]["tools_or_apis"] == [
+        "cnc_rdprogdir3", "cnc_dwnstart4", "cnc_download4", "cnc_dwnend4"
+    ]
+    assert transfer4["selected_capability"]["session_chain"] == [
+        "cnc_dwnstart4", "cnc_download4", "cnc_dwnend4"
+    ]
+
+    upload = build_scene_capability_plan("cnc_upload3")
+    assert upload["transfer_direction"] == "upload_existing"
+    assert upload["required_auxiliary_apis"] == ["cnc_upstart3", "cnc_upend3"]
+    assert upload["optional_auxiliary_apis"] == ["cnc_rdprogdir3"]
+    assert upload["session_chain"] == ["cnc_upstart3", "cnc_upload3", "cnc_upend3"]
 
 
 def test_scene_plan_carries_mode_parameter_and_operator_gates() -> None:

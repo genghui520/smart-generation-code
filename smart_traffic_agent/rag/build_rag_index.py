@@ -78,7 +78,13 @@ def load_api_chunks(path: Path) -> list[dict[str, Any]]:
 
 def load_rule_chunks(path: Path) -> list[dict[str, Any]]:
     """Load final traffic generation rules (JSONL)."""
-    return load_jsonl(path)
+    rules = load_jsonl(path)
+    # Keep source-specific manual conversions separate from the large generated
+    # rule file while including them in every rebuilt knowledge index.
+    companion = path.with_name("f0id_manual_rules.jsonl")
+    if companion.is_file() and companion.resolve() != path.resolve():
+        rules.extend(load_jsonl(companion))
+    return rules
 
 
 def load_scenario_chunks(path: Path) -> list[dict[str, Any]]:

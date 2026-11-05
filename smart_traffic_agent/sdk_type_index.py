@@ -247,6 +247,65 @@ def validate_struct_member_access(source: str, index: SdkIndex, *, source_name: 
     return diagnostics
 
 
+def validate_sdk_type_declarations(source: str, index: SdkIndex, *, source_name: str = "scenario_fragment.inc") -> list[str]:
+    """Reject invented SDK struct/union names before MSVC compilation.
+
+    The generated fragment may use framework types and ordinary C++ scalar
+    types.  A declaration that looks like an all-caps SDK payload type must,
+    however, exist in the active header index.  This catches names such as
+    ``ODBPARAINFO`` deterministically instead of allowing the compiler/LLM
+    repair loop to guess a similar type.
+    """
+    code = _mask_cpp_literals_and_comments(source)
+    known = set(index.structs) | set(index.unions)
+    scalar = {
+        "BOOL", "BYTE", "CHAR", "DOUBLE", "DWORD", "FLOAT", "INT", "LONG",
+        "SHORT", "SIZE_T", "UCHAR", "UINT", "ULONG", "USHORT", "VOID",
+        "WCHAR", "WORD", "LONGLONG", "ULONGLONG", "HANDLE", "LPSTR",
+        "LPCSTR", "LPCTSTR", "TCHAR", "CHAR_T",
+    }
+    diagnostics: list[str] = []
+    # Restrict matching to declaration positions.  In particular, do not
+    # scan arbitrary expressions: ``if (ret == EW_OK)`` must never be parsed
+    # as a declaration of type ``EW_O`` and variable ``K``.  The delimiter
+    # prefix also keeps the match anchored to a source statement/block.
+    declaration = re.compile(
+        r"(?:^|[;{}])(?P<indent>\s*)"
+        r"(?P<qual>(?:(?:const|volatile|struct)\s+)*)"
+        r"(?P<type>[A-Z][A-Z0-9_]*)"
+        r"(?P<spacing>\s*\*+\s*|\s+)"
+        r"(?P<variable>[A-Za-z_]\w*)"
+        r"(?P<tail>\s*(?:\{\s*\}|\[[^\]]*\]|=[^;]+|;))",
+        re.MULTILINE,
+    )
+    seen: set[tuple[str, str, int]] = set()
+    for match in declaration.finditer(code):
+        variable = match.group("variable")
+        type_name = match.group("type").upper()
+        normalized = str(type_name).upper()
+        if normalized in known or normalized in scalar:
+            continue
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", normalized):
+            continue
+        type_offset = match.start("type")
+        line = source.count("\n", 0, type_offset) + 1
+        line_start = source.rfind("\n", 0, type_offset) + 1
+        line_end = source.find("\n", type_offset)
+        if line_end < 0:
+            line_end = len(source)
+        snippet = source[line_start:line_end].strip()
+        key = (normalized, variable, line)
+        if key in seen:
+            continue
+        seen.add(key)
+        diagnostics.append(
+            f"BLOCKING: SDK_TYPE_UNKNOWN: type={normalized} variable={variable} "
+            f"location={source_name}:{line}; code={snippet!r}; type is absent from active Fwlib32.h "
+            f"({index.header_path}); use only prototype-associated SDK types"
+        )
+    return diagnostics
+
+
 def sdk_index_prompt_context(index: SdkIndex, type_names: set[str] | None = None) -> str:
     selected = type_names or set(index.structs)
     rows = []

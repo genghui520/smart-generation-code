@@ -257,6 +257,19 @@ def test_local_library_api_resolves_without_network_traffic(tmp_path):
     assert mixed_status == "collected"
 
 
+def test_path_selection_apis_are_local_handle_operations(tmp_path):
+    for function, raw in (("cnc_getpath", "FlibHndl=1"), ("cnc_setpath", "FlibHndl=1;path_no=0")):
+        plan = _plan(function, minimum=1)
+        log = ApiCallLog("t", "t", "S", "during", function, {"raw": raw}, 0, {},
+                         protocol_function=function, invocation_id=f"{function}-1",
+                         traffic_status="no_corresponding_traffic")
+        state = WorkflowState(request=TaskRequest("capture", "t"), plan=plan,
+                              result=ExecutionResult("t", True, [log], [], tmp_path))
+        status, evidence = classify_collection_status(state, [log], True)
+        assert status == "local_success"
+        assert evidence["wire_evidence_status"] == "not_required"
+
+
 def test_zero_wire_target_is_partial_not_online_execution_failure():
     state = WorkflowState(request=TaskRequest(
         "capture", "t", permissions={"required_api_functions": ["cnc_rdparam"]}

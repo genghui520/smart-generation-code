@@ -30,6 +30,12 @@ NON_WIRE_OBSERVABLE_APIS = frozenset({
     "cnc_getlibopt",
     "cnc_setlibopt",
     "cnc_setdefnode",
+    # Multi-path selection is maintained by the FOCAS client handle.  The
+    # FANUC reference describes these as selecting/returning the path used by
+    # subsequent Data Window calls; on the verified 0i-D NCGuide run they
+    # complete locally and emit no CNC request/response of their own.
+    "cnc_getpath",
+    "cnc_setpath",
 })
 
 
@@ -127,6 +133,8 @@ def build_function_coverage_metrics(
         "parameter_coverage": parameter_report,
         "parameter_coverage_incomplete_functions": [name for name, row in parameter_report["functions"].items() if not row["passed"]],
         "source_manifest": manifest_context.get("source_manifest"),
+        "device_scope": manifest_context.get("device_scope") or plan.rag_context.get("task_permissions", {}).get("device_scope", ""),
+        "device_model": manifest_context.get("device_model") or plan.rag_context.get("task_permissions", {}).get("device_model", ""),
         "scenario_batch_id": manifest_context.get("scenario_batch_id"),
         "main_state_driver": manifest_context.get("main_state_driver"),
         "quality_target": manifest_context.get("quality_target"),
@@ -333,6 +341,10 @@ def merge_workflow_function_coverage_state(
             record["unavailable_evidence"] = "EW_NOOPT returned with matched request/response traffic"
         record["terminal"] = is_resolved(record)
         record["coverage_role"] = "target"
+        if metrics.get("device_scope"):
+            record["device_scope"] = metrics.get("device_scope")
+        if metrics.get("device_model"):
+            record["device_model"] = metrics.get("device_model")
         record["last_seen_at"] = now
         record["last_task_id"] = task_id
         record["last_scenario_batch_id"] = scenario_batch_id
@@ -396,6 +408,10 @@ def merge_workflow_function_coverage_state(
             record["terminal"] = False
         if record.get("coverage_role") != "target":
             record["coverage_role"] = "support"
+        if metrics.get("device_scope"):
+            record["device_scope"] = metrics.get("device_scope")
+        if metrics.get("device_model"):
+            record["device_model"] = metrics.get("device_model")
         if not record.get("status"):
             record["status"] = "support_observed"
             record["terminal"] = False
@@ -405,6 +421,8 @@ def merge_workflow_function_coverage_state(
         "timestamp": now,
         "task_id": task_id,
         "scenario_batch_id": scenario_batch_id,
+        "device_scope": metrics.get("device_scope", ""),
+        "device_model": metrics.get("device_model", ""),
         "target_batch_function_count": metrics.get("target_batch_function_count"),
         "attempted_target_function_count": metrics.get("attempted_target_function_count"),
         "successful_target_function_count": metrics.get("successful_target_function_count"),
@@ -519,6 +537,80 @@ def strongest_status(existing: str, new: str) -> str:
     return new if priority.get(new, 0) >= priority.get(existing, 0) else existing
 
 
+def merge_persisted_coverage_state(source_path: Path, target_path: Path) -> dict[str, Any]:
+    """Promote verified records from an output-local state into global history."""
+    source = load_function_coverage_state(source_path)
+    target = load_function_coverage_state(target_path)
+    functions = target.setdefault("functions", {})
+    changed: list[str] = []
+    for name, candidate in (source.get("functions", {}) or {}).items():
+        if not isinstance(candidate, dict):
+            continue
+        current = functions.get(name)
+        if not isinstance(current, dict):
+            current = {"function": name, "status": "unplanned", "terminal": False}
+        candidate_status = str(candidate.get("status", ""))
+        if candidate_status in {"covered_success", "covered_expected_error", "local_success",
+                                "option_unsupported", "export_missing", "unsupported_by_header",
+                                "blocked_permission_required"}:
+            merged = dict(current)
+            merged.update(candidate)
+            merged["status"] = strongest_status(str(current.get("status", "")), candidate_status)
+            merged["terminal"] = is_resolved(merged)
+            if merged != current:
+                functions[name] = merged
+                changed.append(str(name))
+    target["updated_at"] = utc_now()
+    runs = target.setdefault("runs", [])
+    for run in source.get("runs", []) or []:
+        if isinstance(run, dict) and run not in runs:
+            runs.append(run)
+    if isinstance(runs, list):
+        del runs[:-200]
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(json.dumps(target, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"source": str(source_path), "target": str(target_path), "changed": sorted(changed)}
+
+
+def sync_coverage_state_from_progress_csv(csv_path: Path, state_path: Path) -> dict[str, Any]:
+    """Use the verified desktop progress ledger to refresh global history."""
+    import csv
+
+    if not csv_path.is_file():
+        return {"changed": [], "missing": True}
+    state = load_function_coverage_state(state_path)
+    functions = state.setdefault("functions", {})
+    changed: list[str] = []
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as stream:
+        for row in csv.DictReader(stream):
+            name = str(row.get("function", "")).strip()
+            if not name or str(row.get("collected", "")).strip() != "✓":
+                continue
+            current = functions.get(name)
+            if not isinstance(current, dict):
+                current = {"function": name, "status": "unplanned", "terminal": False}
+            latest = str(row.get("latest_status", "")).strip()
+            status = "local_success" if latest == "local_success" else "covered_success"
+            merged = dict(current)
+            merged.update({
+                "function": name,
+                "status": strongest_status(str(current.get("status", "")), status),
+                "terminal": True,
+                "traffic_matched": status != "local_success",
+                "coverage_role": "target",
+                "progress_ledger": str(csv_path),
+                "evidence_runs": str(row.get("evidence_runs", "")),
+                "last_progress_run_id": str(row.get("latest_run_id", "")),
+            })
+            if merged != current:
+                functions[name] = merged
+                changed.append(name)
+    state["updated_at"] = utc_now()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"changed": sorted(changed), "missing": False, "source": str(csv_path)}
+
+
 def collect_attempted_functions(api_logs: list[ApiCallLog]) -> dict[str, list[dict[str, Any]]]:
     attempted: dict[str, list[dict[str, Any]]] = {}
     for index, log in enumerate(api_logs):
@@ -555,6 +647,35 @@ def is_planned_expected_error(plan: ExecutionPlan, function: str, row: dict[str,
             continue
         expected = step.parameters.get("expected_return_code")
         if expected is not None and str(expected) == str(code):
+            return True
+        # Planner-generated negative probes may serialize the expected FOCAS
+        # symbol in the structured expected state/coverage text instead of a
+        # scalar expected_return_code. Require the observed symbol to match
+        # that explicit plan text; an arbitrary nonzero return remains fatal.
+        expected_symbols = set(
+            re.findall(
+                r"\bEW_[A-Z0-9_]+\b",
+                " ".join(
+                    (
+                        str(step.expected_state or ""),
+                        str(step.action or ""),
+                        str((step.parameters.get("parameter_coverage_goal") or {}).get("coverage_scope", "")),
+                    )
+                ),
+            )
+        )
+        observed_symbols = set(
+            re.findall(
+                r"\bEW_[A-Z0-9_]+\b",
+                " ".join(
+                    (
+                        str(row.get("error") or ""),
+                        str((row.get("response") or {}).get("return_text", "")),
+                    )
+                ),
+            )
+        )
+        if expected_symbols & observed_symbols:
             return True
     return False
 

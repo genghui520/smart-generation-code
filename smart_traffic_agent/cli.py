@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import uuid
 from pathlib import Path
 
@@ -178,6 +179,37 @@ def main(argv: list[str] | None = None) -> int:
     vector_parser.add_argument("--scenario-chunks", type=Path, default=DEFAULT_SCENARIO_CHUNKS_PATH)
     vector_parser.add_argument("--out-dir", type=Path, default=Path("rag_indexes/focas/vector_db_pdf"))
     vector_parser.add_argument("--no-reset", action="store_true", help="do not delete the existing vector DB first")
+
+    ezsocket_parser = subparsers.add_parser(
+        "build-ezsocket-knowledge",
+        help="build the Mitsubishi EZSocket manual/API knowledge base",
+    )
+    ezsocket_parser.add_argument("--manual", type=Path, default=None)
+    ezsocket_parser.add_argument("--source", type=Path, default=None)
+    ezsocket_parser.add_argument("--out", type=Path, default=Path("rag_indexes/ezsocket"))
+    ezsocket_parser.add_argument("--no-vectors", action="store_true")
+
+    eztest_parser = subparsers.add_parser(
+        "test-ezsocket",
+        help="test one Mitsubishi EZSocket read-only API contract and endpoint",
+    )
+    eztest_parser.add_argument("--host", default="192.168.139.130")
+    eztest_parser.add_argument("--port", type=int, default=683)
+    eztest_parser.add_argument("--timeout", type=float, default=5.0)
+    eztest_parser.add_argument("--api", default="Status_GetRunStatus")
+    eztest_parser.add_argument(
+        "--com",
+        action="store_true",
+        help="通过 Mitsubishi OLE/COM 实际调用只读 API（需要已注册 EZSocket 运行库和 pywin32）",
+    )
+    eztest_parser.add_argument("--system-type", type=int, default=9, help="EZNC 系统类型，默认 M800M=9")
+    eztest_parser.add_argument("--machine", type=int, default=1, help="NC 控制单元编号，默认 1")
+    eztest_parser.add_argument("--com-timeout-units", type=int, default=10, help="Open2 超时值（100 ms 单位）")
+    eztest_parser.add_argument(
+        "--com-machine",
+        default="",
+        help="可选 DCOM 远程计算机名/IP；COM 运行库装在仿真器虚拟机时填写 192.168.139.130",
+    )
 
     organize_parser = subparsers.add_parser("organize-focas-scenarios", help="build scenario-centered FOCAS knowledge")
     organize_parser.add_argument("--api-chunks", type=Path, default=Path("rag_indexes/focas/chunks.jsonl"))
@@ -411,6 +443,46 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Vector documents: {count}")
         print(f"Output: {args.out_dir}")
         return 0
+
+    if args.command == "build-ezsocket-knowledge":
+        from scripts.build_ezsocket_knowledge import DEFAULT_MANUAL, DEFAULT_SOURCE, build, build_vectors
+
+        counts = build(args.manual or DEFAULT_MANUAL, args.source or DEFAULT_SOURCE, args.out)
+        if not args.no_vectors:
+            build_vectors(args.out)
+        print(json.dumps(counts, ensure_ascii=False))
+        print(f"Output: {args.out}")
+        return 0
+
+    if args.command == "test-ezsocket":
+        from .integrations.ezsocket import (
+            EzSocketError,
+            test_ezsocket_api_contract,
+            call_ezsocket_com_api,
+            test_ezsocket_connection,
+        )
+
+        try:
+            if args.com:
+                result = call_ezsocket_com_api(
+                    args.host,
+                    args.port,
+                    function=args.api,
+                    system_type=args.system_type,
+                    machine=args.machine,
+                    timeout_units=args.com_timeout_units,
+                    timeout=args.timeout,
+                    com_machine=args.com_machine or None,
+                )
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                endpoint = test_ezsocket_connection(args.host, args.port, timeout=args.timeout)
+                api = test_ezsocket_api_contract(args.api)
+                print(json.dumps({"endpoint": endpoint, "api": api}, ensure_ascii=False, indent=2))
+            return 0
+        except EzSocketError as exc:
+            print(f"EZSocket 测试失败：{exc}", file=sys.stderr)
+            return 2
 
     if args.command == "organize-focas-scenarios":
         payload = build_scenario_knowledge(

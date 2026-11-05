@@ -20,6 +20,13 @@ from ..tool_runtime import ToolRuntime
 from ..agent_roles import PlanSpec
 from ..code_spec import build_code_spec, build_official_abi_context
 from ..execution_contracts import MOTION_TARGET_APIS, motion_required_for_targets
+from ..execution_plan_schema import normalize_execution_plan, execution_plan_view, validate_execution_plan
+from ..nc_program_rules import (
+    apply_running_nc_program_rule,
+    build_accdecdly_running_steps,
+    extract_nc_program_requirement,
+    extract_nc_program_requirements,
+)
 from ..rag.focas_function_manifest import (
     DEFAULT_COVERAGE_BATCH_SIZE,
     DEFAULT_COVERAGE_SEGMENT_COUNT,
@@ -27,18 +34,29 @@ from ..rag.focas_function_manifest import (
     build_function_coverage_context,
 )
 from ..rag.scenario_templates import DEFAULT_FINAL_SCENARIO_TEMPLATES_PATH
-from ..fast_path import eligible_read_fast_path, build_fast_path_steps
-from ..scenario_capabilities import analyze_output_dependencies, build_scene_capability_plan, load_scenario_capabilities
+from ..fast_path import (
+    eligible_read_fast_path,
+    eligible_session_fast_path,
+    build_fast_path_steps,
+    build_session_fast_path_steps,
+)
+from ..scenario_capabilities import (
+    analyze_output_dependencies,
+    build_scene_capability_plan,
+    build_variation_contract,
+    load_scenario_capabilities,
+)
 from ..integrations.ncguide import default_focas_header_dir
+from ..sdk_type_index import build_sdk_type_index
 from ..agent_tools.traffic_graph import (
     ApiNameInput,
     ChainInput,
+    DependencyPlanInput,
     DiscoverParameterInput,
     FilterParameterInput,
     GenerateCombinationsInput,
     ParameterRulesInput,
 )
-from ..traffic_relationship_mining import seed_documented_relations
 from .prompts import PLANNING_REVIEW_JSON_SCHEMA, PLANNING_REVIEW_SYSTEM_PROMPT
 
 
@@ -50,14 +68,15 @@ SCENARIO_ALIASES = {
     "parameter_read_write": "parameter_write_simulated",
 }
 
+
 INTERFACE_TO_FOCAS = interface_to_focas_mapping()
 
 
 class PlanningAgent(AgentTemplate):
     role_name = "PlanningRole"
-    profile = "RAG planning agent"
-    goal = "Retrieve authoritative knowledge and produce an executable structured plan."
-    constraints = ("Use RAG evidence and official ABI facts.", "Keep API calls atomic.")
+    profile = "TRCM-first planning agent"
+    goal = "Use the Neo4j dependency graph first and produce an executable structured plan."
+    constraints = ("Use RAG only for graph-missing facts and official ABI binding.", "Keep API calls atomic.")
 
     def __init__(
         self,
@@ -87,30 +106,46 @@ class PlanningAgent(AgentTemplate):
         """Load verified graph facts and parameter rules before LLM planning."""
         if not api_names or self.tool_runtime is None:
             return {"available": False, "knowledge_status": "unknown", "apis": {}}
-        # Only documented SDK/session rules are migrated automatically. Runtime
-        # relations enter the graph through evidence verification later.
         service = getattr(self, "traffic_relationships", None)
-        if service is not None and service.available:
-            seed_documented_relations(service, api_names)
+        device_scope = str(state.request.permissions.get("device_scope", ""))
+        allowed_api_names = tuple(
+            str(item).strip()
+            for item in state.request.permissions.get("device_api_names", ())
+            if str(item).strip()
+        ) or None
         result: dict[str, Any] = {
             "available": False,
             "backend_configured": bool(service and service.available),
             "knowledge_status": "unknown",
             "apis": {},
+            "graph_missing_api_names": [],
+            "graph_no_relation_api_names": [],
         }
+        satisfied = set(str(item).strip() for item in state.request.permissions.get("satisfied_api_names", ()) if str(item).strip())
+        if state.result is not None:
+            satisfied.update(str(log.protocol_function).strip() for log in state.result.api_logs if log.status_code == 0 and str(log.protocol_function).strip())
         for api_name in dict.fromkeys(api_names):
             try:
                 api_info, _ = self.tool_runtime.call(
-                    self.role_name, "get_api_info", ApiNameInput(api_name)
+                    self.role_name, "get_api_info", ApiNameInput(api_name, device_scope=device_scope, allowed_api_names=allowed_api_names or ())
                 )
                 chain, _ = self.tool_runtime.call(
-                    self.role_name, "get_traffic_chain", ChainInput(api_name, max_depth=3)
+                    self.role_name, "get_traffic_chain", ChainInput(api_name, max_depth=3, device_scope=device_scope, allowed_api_names=allowed_api_names or ())
+                )
+                dependency_plan, _ = self.tool_runtime.call(
+                    self.role_name, "get_dependency_plan", DependencyPlanInput(
+                        api_name, max_depth=8, device_scope=device_scope,
+                        allowed_api_names=allowed_api_names or (), satisfied=tuple(sorted(satisfied)),
+                    )
                 )
                 dependencies, _ = self.tool_runtime.call(
-                    self.role_name, "get_api_dependencies", ApiNameInput(api_name)
+                    self.role_name, "get_api_dependencies", ApiNameInput(api_name, device_scope=device_scope, allowed_api_names=allowed_api_names or ())
+                )
+                parameter_prerequisites, _ = self.tool_runtime.call(
+                    self.role_name, "get_parameter_prerequisites", ParameterRulesInput(api_name, device_scope=device_scope, allowed_api_names=allowed_api_names or ())
                 )
                 rules, _ = self.tool_runtime.call(
-                    self.role_name, "get_parameter_rules", ParameterRulesInput(api_name)
+                    self.role_name, "get_parameter_rules", ParameterRulesInput(api_name, device_scope=device_scope, allowed_api_names=allowed_api_names or ())
                 )
             except Exception as exc:
                 result["apis"][api_name] = {"available": False, "knowledge_status": "unknown", "error": str(exc)}
@@ -118,16 +153,43 @@ class PlanningAgent(AgentTemplate):
             result["apis"][api_name] = {
                 "api_info": api_info,
                 "chain": chain,
+                "dependency_plan": dependency_plan,
                 "dependencies": dependencies,
+                "parameter_prerequisites": parameter_prerequisites,
                 "parameter_rules": rules,
+                "device_scope": device_scope,
+                "device_api_scope_count": len(allowed_api_names or ()),
             }
-            if any(bool(item.get("available")) for item in (chain, dependencies, rules) if isinstance(item, dict)):
+            # Neo4j is the authoritative dependency source when confirmed
+            # edges exist. A node with no incoming edges is a partial graph
+            # fact and is sent through the bounded knowledge-base fallback.
+            api_node = api_info.get("api") if isinstance(api_info, dict) else None
+            graph_role = "known" if api_info.get("available") and isinstance(api_node, dict) else "missing"
+            result["apis"][api_name]["graph_role"] = graph_role
+            result["apis"][api_name]["satisfied_api_names"] = sorted(satisfied)
+            result["apis"][api_name]["node_contract"] = api_node or {}
+            if graph_role == "missing":
+                result["graph_missing_api_names"].append(api_name)
+                result.setdefault("knowledge_fallback_targets", []).append({
+                    "api_name": api_name,
+                    "reason": "API 节点或 Neo4j 后端不可用",
+                })
+            else:
+                dependency_edges = dependency_plan.get("edges", []) if isinstance(dependency_plan, dict) else []
+                dependency_rows = dependencies.get("dependencies", []) if isinstance(dependencies, dict) else []
+                if not dependency_edges and not dependency_rows:
+                    # An API node without incoming relations is a partial
+                    # graph fact. Let the knowledge base propose a bounded
+                    # dependency plan; the Executor may promote it only after
+                    # a complete successful run with real call evidence.
+                    result["graph_no_relation_api_names"].append(api_name)
+                    result.setdefault("knowledge_fallback_targets", []).append({
+                        "api_name": api_name,
+                        "reason": "API 节点存在但没有已确认关系",
+                    })
+            if graph_role == "known":
                 result["available"] = True
-                result["knowledge_status"] = "known" if any(
-                    item.get("knowledge_status") == "known"
-                    for item in (chain, dependencies, rules)
-                    if isinstance(item, dict)
-                ) else "unknown"
+                result["knowledge_status"] = "known"
             # Apply deterministic filtering only when the caller supplied
             # observed values/domains. The Planner describes constraints; it
             # never invents device values from an empty context.
@@ -185,6 +247,51 @@ class PlanningAgent(AgentTemplate):
                     selections["_combinations"] = combinations
                 if selections:
                     result["apis"][api_name]["parameter_selections"] = selections
+            # cnc_prstwkcd has a documented two-case selector domain even when
+            # the request did not provide an observed parameter context.  Run
+            # that domain through the same audited parameter-tool chain so
+            # the tool history and the generated plan agree on the cases.
+            if api_name == "cnc_prstwkcd" and "parameter_selections" not in result["apis"][api_name]:
+                discovered_values = (-1, 1)
+                filtered, _ = self.tool_runtime.call(
+                    self.role_name,
+                    "filter_parameter_candidates",
+                    FilterParameterInput(
+                        api_name,
+                        "type",
+                        context={
+                            "candidates": list(discovered_values),
+                            "source": ["Fwlib32.h:IDBWRA.type", "controller axis selector contract"],
+                        },
+                        rules=(),
+                    ),
+                )
+                combinations, _ = self.tool_runtime.call(
+                    self.role_name,
+                    "generate_parameter_combinations",
+                    GenerateCombinationsInput(
+                        api_name,
+                        {"type": tuple(filtered.get("candidates", ()))},
+                        budget=min(20, max(1, len(filtered.get("candidates", ())))),
+                        constraint_descriptions=(
+                            "ALL_AXES=-1 and controller axis 1 are documented legal IDBWRA.type cases",
+                        ),
+                    ),
+                )
+                result["apis"][api_name]["parameter_selections"] = {
+                    "type": {
+                        "selected": list(filtered.get("candidates", ())),
+                        "candidates": list(filtered.get("candidates", ())),
+                        "excluded": list(filtered.get("excluded", ())),
+                        "success": bool(filtered.get("success")),
+                        "source": list(filtered.get("source", ())),
+                    },
+                    "_combinations": combinations,
+                }
+                result["apis"][api_name]["parameter_tool_trace"] = [
+                    "filter_parameter_candidates",
+                    "generate_parameter_combinations",
+                ]
         return result
 
     def run(self, state: WorkflowState) -> WorkflowState:
@@ -245,28 +352,140 @@ class PlanningAgent(AgentTemplate):
                     "tool_offset_management": "tool_offset_setting",
                     "spindle_control": "spindle_speed_change",
                 }.get(scene_name, scene_name or scenario)
-        # The deterministic local RAG pass below is sufficient for planning.
-        # Do not run a second LLM->search_knowledge loop: it duplicated context
-        # and consumed extra HTTP attempts before the actual plan request.
-        tool_retrieval = []
-        retrieval = retrieve_planning_context(
-            self.knowledge_base,
-            request.description,
-            scenario,
-            tool_runtime=self.tool_runtime,
-            agent_name=self.role_name,
-        )
         requested_targets = [str(item).strip() for item in (
             request.permissions.get("coverage_current_batch_functions")
             or request.permissions.get("required_api_functions") or ()
         ) if str(item).strip()]
+        # Resolve deterministic facts before broad semantic retrieval.  Exact
+        # API contracts, the active Manifest/SDK scope, and TRCM relations are
+        # the first planning source; generic RAG is only supplemental context
+        # for missing, partial, or conflicting facts.
+        manifest_rows = load_manifest_rows(self.function_manifest_path)
+        manifest_names = [
+            str(row.get("function", "")).strip()
+            for row in manifest_rows if isinstance(row, dict) and str(row.get("function", "")).strip()
+        ]
+        # The graph is consulted before any broad knowledge retrieval. APIs
+        # missing from the graph, or nodes with no confirmed incoming
+        # relations, are allowed to fall back to RAG.
         trcm_context = self._query_trcm(state, requested_targets)
+        running_nc_program_target = False
+        accdecdly_facts = (trcm_context.get("apis", {}) or {}).get("cnc_accdecdly", {})
+        if isinstance(accdecdly_facts, dict):
+            api_node = accdecdly_facts.get("api_info", {}).get("api", {}) if isinstance(accdecdly_facts.get("api_info", {}), dict) else {}
+            prerequisites = api_node.get("prerequisites", {}) if isinstance(api_node, dict) else {}
+            running_nc_program_target = (
+                "cnc_accdecdly" in requested_targets
+                and extract_nc_program_requirement(prerequisites) == "running"
+            )
+        graph_missing_targets = list(trcm_context.get("graph_missing_api_names", ()))
+        graph_no_relation_targets = list(trcm_context.get("graph_no_relation_api_names", ()))
+        graph_fallback_targets = list(dict.fromkeys([*graph_missing_targets, *graph_no_relation_targets]))
+        exact_api_rows = []
+        if graph_fallback_targets and hasattr(self.knowledge_base, "lookup_api_exact"):
+            exact_api_rows = self.knowledge_base.lookup_api_exact(graph_fallback_targets) or []
+        exact_resolved = sorted({
+            str(item.chunk.metadata.get("function", "")).strip()
+            for item in exact_api_rows
+            if getattr(item, "chunk", None) is not None
+            and str(item.chunk.metadata.get("function", "")).strip()
+        })
+        exact_missing = [name for name in graph_fallback_targets if name not in exact_resolved]
+        sdk_declared: list[str] = []
+        sdk_missing: list[str] = []
+        try:
+            sdk_index = build_sdk_type_index(default_focas_header_dir() / "Fwlib32.h")
+            sdk_declared = sorted(name for name in requested_targets if name in sdk_index.functions)
+            sdk_missing = [name for name in requested_targets if name not in sdk_index.functions]
+        except (OSError, ValueError, UnicodeError):
+            sdk_missing = list(requested_targets)
+        exact_lookup = {
+            "requested_functions": requested_targets,
+            "resolved_functions": exact_resolved,
+            "missing_functions": exact_missing,
+            "sdk_declared_functions": sdk_declared,
+            "sdk_missing_functions": sdk_missing,
+            "status": (
+                "known" if graph_missing_targets and not exact_missing and not sdk_missing
+                else "partially_known" if exact_resolved or sdk_declared
+                else "unknown"
+            ),
+            "source": ["Neo4j dependency graph", "knowledge_base.lookup_api_exact", "active_sdk_type_index"],
+            "manifest_function_count": len(manifest_names),
+            "graph_missing_functions": graph_missing_targets,
+            "graph_no_relation_functions": graph_no_relation_targets,
+        }
+        fast_targets = list(requested_targets)
+        requires_event_planning = any(
+            analyze_output_dependencies(name)["dependency_kind"] == "external_event_and_runtime_state"
+            for name in fast_targets
+        )
+        fast_ok, fast_facts = eligible_read_fast_path(
+            fast_targets,
+            header_path=default_focas_header_dir() / "Fwlib32.h",
+            manifest_functions=manifest_names,
+        )
+        if requires_event_planning and self.llm_client.enabled:
+            fast_ok = False
+        fast_kind = "read_only_api" if fast_ok else ""
+        exact_lookup["fast_path_eligible"] = fast_ok
+        session_fast_ok, session_fast_facts = eligible_session_fast_path(
+            fast_targets,
+            header_path=default_focas_header_dir() / "Fwlib32.h",
+            manifest_functions=manifest_names,
+            trcm_context=trcm_context,
+        )
+        # A session fast path is admitted only after the graph has supplied the
+        # matching Start/Data/End edges and the directory input rule.  This is
+        # intentionally separate from the read-only recipe check above.
+        if session_fast_ok:
+            fast_ok = True
+            fast_kind = "session"
+            fast_facts = session_fast_facts
+        if running_nc_program_target:
+            # The graph rule is complete enough for a deterministic plan. Do
+            # not spend an LLM round inventing an axis count or lifecycle.
+            fast_ok = True
+            fast_kind = "running_nc_program"
+            fast_facts = {
+                "recipe": "verified NC program lifecycle plus cnc_sysinfo-bound cnc_accdecdly sampling",
+                "target": "cnc_accdecdly",
+                "axis_source": "cnc_sysinfo.axes",
+                "axis_domain": "1..N",
+                "nc_program_requirements": extract_nc_program_requirements(prerequisites),
+            }
+        exact_lookup["session_fast_path_eligible"] = session_fast_ok
+        exact_lookup["session_fast_path"] = session_fast_facts
+        graph_only = (
+            bool(requested_targets)
+            and bool(trcm_context.get("backend_configured"))
+            and not graph_missing_targets
+            and not trcm_context.get("graph_no_relation_api_names")
+        )
+        exact_lookup["retrieval_mode"] = (
+            "neo4j_only" if graph_only else "deterministic_only" if fast_ok else "supplemental_rag"
+        )
+        # The deterministic local RAG pass is supplemental. Do not run a
+        # second LLM->search_knowledge loop; it duplicated context and consumed
+        # extra HTTP attempts before the actual plan request.
+        tool_retrieval = []
+        if graph_only:
+            retrieval = {"api": []}
+        elif fast_ok:
+            retrieval = {"api": list(exact_api_rows)}
+        else:
+            retrieval = retrieve_planning_context(
+                self.knowledge_base,
+                request.description,
+                scenario,
+                tool_runtime=self.tool_runtime,
+                agent_name=self.role_name,
+            )
         # Retrieve exact API evidence for every explicitly selected target.
         # Broad scenario similarity is not reliable enough to supply argument
         # domains or output dependencies for a specific function.
-        if requested_targets and hasattr(self.knowledge_base, "lookup_api_exact"):
-            exact_api_rows = self.knowledge_base.lookup_api_exact(requested_targets)
-            retrieval.setdefault("api", []).extend(exact_api_rows or [])
+        if exact_api_rows:
+            retrieval.setdefault("api", []).extend(exact_api_rows)
         retrieval = deduplicate_retrieval_context(retrieval)
         print(
             "[PlanningAgent] RAG results "
@@ -285,10 +504,37 @@ class PlanningAgent(AgentTemplate):
             retrieval,
             selected_templates=selected_templates,
         )
+        if requested_targets:
+            # The selected batch is the authoritative target scope.  Keep the
+            # primary target on ExecutionPlan so persisted plans, NC rules,
+            # generator context and coverage records cannot drift to a
+            # scenario representative such as cnc_actf.
+            plan.target_api = requested_targets[0]
+            plan.scenario = plan.scenario_type
+            plan.rag_context["explicit_target_functions"] = list(dict.fromkeys(requested_targets))
         if state.long_term_memories:
             plan.rag_context["long_term_memories"] = summarize_long_term_memories(state.long_term_memories)
             plan.llm_notes.append(f"Loaded {len(state.long_term_memories)} long-term repair memories.")
         plan.rag_context["traffic_relationships"] = trcm_context
+        # Preserve the audited parameter-tool output as the generator's only
+        # source of concrete parameter cases.  This is intentionally attached
+        # before the parameter contract is built below.
+        runtime_parameter_bindings: dict[str, Any] = {}
+        for api_name, facts in (trcm_context.get("apis", {}) or {}).items():
+            if not isinstance(facts, dict):
+                continue
+            selections = facts.get("parameter_selections")
+            if isinstance(selections, dict):
+                runtime_parameter_bindings[str(api_name)] = {
+                    "status": "ready",
+                    "success": True,
+                    "complete": True,
+                    "parameter_selections": selections,
+                    "parameter_tool_trace": list(facts.get("parameter_tool_trace", ())),
+                }
+        if runtime_parameter_bindings:
+            plan.rag_context["runtime_parameter_bindings"] = runtime_parameter_bindings
+        plan.rag_context["exact_lookup"] = exact_lookup
         soul_store = getattr(self, "soul_store", None)
         planner_soul = soul_store.prompt_context(
             self.role_name,
@@ -324,6 +570,8 @@ class PlanningAgent(AgentTemplate):
                 batch_size=self.coverage_batch_size,
                 scenario_type=scenario,
                 max_segments=self.coverage_segment_count,
+                device_scope=str(request.permissions.get("device_scope", "")),
+                device_model=str(request.permissions.get("device_model", "")),
             )
             plan.rag_context["function_coverage_manifest"] = coverage_context
             if coverage_context.get("enabled") and not request.permissions.get("code_only_evaluation"):
@@ -380,7 +628,6 @@ class PlanningAgent(AgentTemplate):
         if self.environment is not None:
             plan.rag_context["environment_shared_rules"] = self.environment.shared_rules
             plan.rag_context["official_abi_context"] = self.environment.official_abi(candidate_functions)
-        manifest_rows = load_manifest_rows(self.function_manifest_path)
         prerequisite_functions = set(candidate_functions)
         prerequisite_functions.update(
             str(row.get("function", "")).strip()
@@ -418,11 +665,6 @@ class PlanningAgent(AgentTemplate):
             prerequisite_functions, prerequisite_rules,
             environment=request.target_environment, permissions=request.permissions,
         )
-        fast_targets = [str(item).strip() for item in (
-            request.permissions.get("coverage_current_batch_functions")
-            or request.permissions.get("required_api_functions") or ()
-        ) if str(item).strip()]
-        manifest_names = [str(row.get("function", "")).strip() for row in manifest_rows if isinstance(row, dict)]
         plan.rag_context.setdefault("scenario_capabilities", load_scenario_capabilities())
         requested_scene_plans = [
             build_scene_capability_plan(name, plan.rag_context["scenario_capabilities"])
@@ -432,21 +674,14 @@ class PlanningAgent(AgentTemplate):
             plan.rag_context["scene_plans"] = requested_scene_plans
             if len(requested_scene_plans) == 1:
                 plan.rag_context["scene_plan"] = requested_scene_plans[0]
-        requires_event_planning = any(
-            analyze_output_dependencies(name)["dependency_kind"] == "external_event_and_runtime_state"
-            for name in fast_targets
-        )
-        fast_ok, fast_facts = eligible_read_fast_path(
-            fast_targets,
-            header_path=default_focas_header_dir() / "Fwlib32.h",
-            manifest_functions=manifest_names,
-        )
-        if requires_event_planning and self.llm_client.enabled:
-            fast_ok = False
         if fast_ok:
             target = fast_targets[0]
-            plan.steps = build_fast_path_steps(target)
-            plan.scenario_goal = f"Deterministic read-only capture of {target}"
+            if fast_kind == "session":
+                plan.steps = build_session_fast_path_steps(target, fast_facts)
+                plan.scenario_goal = f"Deterministic session capture of {target}"
+            else:
+                plan.steps = build_fast_path_steps(target)
+                plan.scenario_goal = f"Deterministic read-only capture of {target}"
             plan.nc_program_type = "not_required"
             plan.nc_program_requirements = []
             plan.nc_program_spec = NcProgramSpec(
@@ -455,11 +690,15 @@ class PlanningAgent(AgentTemplate):
             )
             plan.rag_context["known_knowledge"] = fast_facts
             plan.rag_context["fast_path"] = {
-                "enabled": True, "kind": "read_only_api", "target": target,
+                "enabled": True, "kind": fast_kind, "target": target,
+                "recipe": fast_facts.get("recipe", "") if isinstance(fast_facts, dict) else "",
                 "llm_calls_avoided": ["planning_decision", "nc_program_generation"],
                 "fallback": "Planner LLM when SDK/controller/parameter facts are incomplete",
             }
-            plan.llm_notes.append("Deterministic fast path selected from SDK/manifest/read-only recipe; Planner LLM decision skipped.")
+            plan.llm_notes.append(
+                "Deterministic fast path selected from SDK/Manifest/TRCM evidence; "
+                "Planner LLM decision skipped."
+            )
             if requires_event_planning:
                 plan.nc_program_type = "required_for_variation_after_gates"
                 plan.nc_program_requirements = [
@@ -497,6 +736,52 @@ class PlanningAgent(AgentTemplate):
             build_scene_capability_plan(name, plan.rag_context["scenario_capabilities"])
             for name in scene_targets
         ]
+        # Carry the API node's declarative NC contract into the plan.  The
+        # scene capability decides whether execution is needed; the graph
+        # requirement decides what the uploaded program must actually do.
+        # Keeping both in the plan prevents a generic LLM path from replacing
+        # a running spindle scene with an idle O-number/M30 payload.
+        graph_nc_requirements: list[str] = []
+        for target_name in scene_targets:
+            facts = (trcm_context.get("apis", {}) or {}).get(target_name, {})
+            prerequisites = {}
+            if isinstance(facts, dict):
+                api_node = facts.get("api", {})
+                if not isinstance(api_node, dict):
+                    api_node = {}
+                api_info = facts.get("api_info", {})
+                if not api_node and isinstance(api_info, dict):
+                    api_node = api_info.get("api", {})
+                prerequisites = facts.get("prerequisites", {}) or facts.get("prerequisites_json", {})
+                if not prerequisites and isinstance(api_node, dict):
+                    prerequisites = api_node.get("prerequisites", {}) or api_node.get("prerequisites_json", {})
+            for requirement in extract_nc_program_requirements(prerequisites):
+                if requirement not in graph_nc_requirements:
+                    graph_nc_requirements.append(requirement)
+        if graph_nc_requirements:
+            plan.nc_program_requirements = list(dict.fromkeys([
+                *plan.nc_program_requirements,
+                *graph_nc_requirements,
+            ]))
+            plan.nc_program_spec.constraints = list(dict.fromkeys([
+                *plan.nc_program_spec.constraints,
+                *graph_nc_requirements,
+            ]))
+            plan.nc_program_spec.generation_notes = list(dict.fromkeys([
+                *plan.nc_program_spec.generation_notes,
+                *graph_nc_requirements,
+            ]))
+            plan.rag_context["graph_nc_program_requirements"] = graph_nc_requirements
+        # The capability registry is conservative by default.  The desktop
+        # configuration supplies the explicit operator choice that Cycle Start
+        # may be used; without it, keep the gate closed and request setup.
+        if request.permissions.get("ncguide_cycle_start_allowed"):
+            for scene in plan.rag_context["scene_plans"]:
+                if isinstance(scene, dict):
+                    decision = scene.get("nc_execution_decision")
+                    if isinstance(decision, dict) and decision.get("cycle_start_required"):
+                        decision["cycle_start_allowed"] = True
+                        decision["requirements_source"] = "explicit desktop NCGuide Cycle Start configuration"
         if len(plan.rag_context["scene_plans"]) == 1:
             plan.rag_context["scene_plan"] = plan.rag_context["scene_plans"][0]
         if not request.permissions.get("code_only_evaluation"):
@@ -527,15 +812,58 @@ class PlanningAgent(AgentTemplate):
                 plan.llm_notes.append(
                     "Scene rule requires NC execution for response variation, but current capability/permission gates are unverified; retain the read-only target sample and defer Cycle Start."
                 )
+        if apply_running_nc_program_rule(plan, trcm_context, requested_targets):
+            plan.llm_notes.append(
+                "Applied the Neo4j nc_program=requirement=running rule for cnc_accdecdly; "
+                "axis numbers remain runtime-bound to cnc_sysinfo.sysinfo.axes."
+            )
         plan.rag_context["environment_preflight_policy"] = {
             "mode": "read_current_mode_before_any_mode_dependent_operation",
             "mode_change": "never_automatic; pause_and_request_operator_when_mismatched",
-            "parameter_write": "only exact sourced parameter/bit/value and applicability plus explicit allow_environment_writes permission; snapshot/write/readback; stop on mismatch or restart requirement",
+            "parameter_write": "only exact sourced parameter/bit/value and applicability; follow explicit plan steps and SDK constraints",
             "nc_execution": "only when output dependency requires runtime execution; do not infer Cycle Start permission from diversity goals",
             "operator_resume": "require operator confirmation followed by fresh read-only verification",
         }
         from ..execution_contracts import execution_contract, normalize_lifecycle_steps, analyze_api_interactions
+        _augment_steps_from_dependency_graph(plan, trcm_context)
         normalize_lifecycle_steps(plan.steps)
+        normalize_execution_plan(plan, trcm_context)
+        # ``apply_variation_contract`` needs the concrete target set, but the
+        # normal planning path does not pass through
+        # ``apply_llm_planning_decision`` (where the old local variable was
+        # initialized).  Derive it here from the current request/manifest so
+        # both fast and LLM planning paths have the same scope.
+        planned_targets = set(
+            request.permissions.get("coverage_current_batch_functions")
+            or request.permissions.get("required_api_functions")
+            or ()
+        )
+        if not planned_targets:
+            manifest = plan.rag_context.get("function_coverage_manifest", {})
+            if isinstance(manifest, dict):
+                planned_targets = {
+                    str(row.get("function", ""))
+                    for row in manifest.get("selected_batch", [])
+                    if isinstance(row, dict) and row.get("coverage_role", "target") == "target"
+                }
+        if not planned_targets:
+            planned_targets = {
+                name for step in plan.steps
+                for name in protocol_function_names_for_planner(step.protocol_function)
+            }
+        apply_variation_contract(
+            plan,
+            task_description=request.description,
+            permissions=request.permissions,
+            target_functions=sorted(planned_targets),
+        )
+        plan.rag_context["execution_plan"] = execution_plan_view(plan)
+        plan.rag_context["execution_plan_validation"] = validate_execution_plan(plan)
+        if not plan.rag_context["execution_plan_validation"]["valid"]:
+            plan.llm_notes.append(
+                "ExecutionPlan validation diagnostics: "
+                + "; ".join(plan.rag_context["execution_plan_validation"]["errors"])
+            )
         planned_functions = {
             name for step in plan.steps
             for name in protocol_function_names_for_planner(step.protocol_function)
@@ -563,10 +891,11 @@ class PlanningAgent(AgentTemplate):
             "write_execution_plan", "PlanSpec",
             plan_id=plan.plan_id, step_count=len(plan.steps), rag_chunk_count=len(state.retrieved_chunks),
             code_spec=asdict(plan.code_spec),
+            execution_plan=execution_plan_view(plan),
         )
         state.messages.append(message_to_dict(
             handoff,
-            PlanSpec(plan.plan_id, len(plan.steps), len(state.retrieved_chunks)),
+            PlanSpec(plan.plan_id, len(plan.steps), len(state.retrieved_chunks), execution_plan_view(plan)),
         ))
         state.stage = "code_generation"
         return state
@@ -766,6 +1095,143 @@ def print_rag_search_stats(filters: dict[str, Any] | None, results: list[Retriev
     )
 
 
+def _augment_steps_from_dependency_graph(plan: ExecutionPlan, trcm_context: dict[str, Any]) -> None:
+    """Materialize mandatory graph dependencies as PlanSteps.
+
+    The graph supplies API names and evidence-backed constraints; it does not
+    supply concrete values.  Existing plan steps win, and connection lifetime
+    helpers remain owned by the C++ harness template.
+    """
+    if not isinstance(trcm_context, dict):
+        return
+    ignored = {"cnc_allclibhndl3", "cnc_freelibhndl"}
+    existing = {
+        name for step in plan.steps
+        for name in protocol_function_names_for_planner(step.protocol_function)
+    }
+    dependency_context: dict[str, Any] = {}
+    for api_name, facts in (trcm_context.get("apis", {}) or {}).items():
+        if not isinstance(facts, dict):
+            continue
+        dep = facts.get("dependency_plan", {})
+        if not isinstance(dep, dict):
+            continue
+        dependency_context[api_name] = {
+            "required_calls": [str(item) for item in dep.get("required_calls", ()) if str(item).strip()],
+            "optional_calls": [str(item) for item in dep.get("optional_calls", ()) if str(item).strip()],
+            "satisfied_nodes": list(dep.get("satisfied_nodes", ()) or ()),
+            "edges": [item for item in dep.get("edges", ()) if isinstance(item, dict)],
+        }
+    if not dependency_context:
+        return
+    alarm_history_targeted = "cnc_rdalmhistry5" in dependency_context
+    if alarm_history_targeted:
+        # Alarm-history records are only meaningful after a fresh alarm has
+        # been created in the simulator.  Make the NC lifecycle explicit so
+        # CodeGenerationAgent/Executor cannot silently collect stale history.
+        existing_interfaces = {str(step.interface_name) for step in plan.steps}
+        alarm_nc_steps = [
+            PlanStep("ALARM_NC_001", "before", "upload alarm-triggering NC program", "UploadProgram", {}),
+            PlanStep("ALARM_NC_002", "before", "select alarm-triggering NC program", "SelectProgram", {}),
+            PlanStep("ALARM_NC_003", "before", "start alarm-triggering NC program", "StartProgram", {}),
+        ]
+        alarm_nc_steps = [step for step in alarm_nc_steps if step.interface_name not in existing_interfaces]
+        if alarm_nc_steps:
+            plan.steps = [*alarm_nc_steps, *plan.steps]
+        plan.nc_program_type = "required_for_alarm_history"
+        plan.nc_program_requirements = list(dict.fromkeys([
+            *plan.nc_program_requirements,
+            "NCGuide simulator must execute a documented alarm-triggering NC block before alarm-history reads",
+        ]))
+        plan.nc_program_spec.purpose = (
+            "Create a fresh simulator alarm before reading alarm history by selecting a documented controller-specific NC trigger."
+        )
+        plan.nc_program_spec.block_goals = list(dict.fromkeys([
+            *plan.nc_program_spec.block_goals,
+            "execute one documented controller-specific alarm-triggering NC block",
+            "end with M30 after the alarm-triggering block",
+        ]))
+        plan.nc_program_spec.constraints = list(dict.fromkeys([
+            *plan.nc_program_spec.constraints,
+            "NCGuide simulator only; do not send the alarm-triggering block to a physical machine",
+            "select the alarm trigger from retrieved controller/RAG evidence; do not invent or hard-code a G/M code",
+        ]))
+        plan.nc_program_spec.generation_notes = list(dict.fromkeys([
+            *plan.nc_program_spec.generation_notes,
+            "alarm_history_trigger=required;selection=documented_rag_rule;controller_specific=true",
+        ]))
+        plan.rag_context["alarm_history_trigger"] = {
+            "required": True,
+            "alarm_code": "",
+            "trigger": "",
+            "selection_policy": "documented_rag_rule",
+            "controller_specific": True,
+            "scope": "NCGuide simulator only",
+            "evidence_required": True,
+        }
+    required: list[str] = []
+    for facts in dependency_context.values():
+        for function in facts["required_calls"]:
+            if function not in required and function not in ignored and function not in existing:
+                required.append(function)
+    if required:
+        new_steps = [PlanStep(
+            step_id=f"TRCM_DEP_{index:03d}_{function}",
+            phase="before",
+            action="Execute graph prerequisite and expose its real outputs",
+            interface_name=function,
+            parameters={"runtime_binding": True, "dependency_source": "TRCM"},
+            protocol_function=function,
+            operation_kind="focas_api",
+        ) for index, function in enumerate(required, 1)]
+        plan.steps = [*new_steps, *plan.steps]
+    # Carry evidence-backed filters into the target step as declarative
+    # bindings.  The Generator can emit the binding in C++; the Executor also
+    # evaluates it from actual responses for repairs and audit artifacts.
+    for target_api, facts in dependency_context.items():
+        bindings: list[dict[str, Any]] = []
+        for edge in facts.get("edges", ()):
+            relation = edge.get("relation", {}) if isinstance(edge, dict) else {}
+            if str(relation.get("relation_type", "")) != "filters":
+                continue
+            attrs = relation.get("attributes", {}) if isinstance(relation.get("attributes", {}), dict) else {}
+            source_field = str(attrs.get("source_field", "")).strip()
+            if not source_field:
+                source_field = next((str(item) for item in attrs.get("source_fields", ()) if str(item).strip()), "")
+            target_parameter_path = str(attrs.get("dependency_path", "")).strip()
+            if not target_parameter_path:
+                target_parameter_path = next((str(item) for item in attrs.get("target_parameters", ()) if str(item).strip()), "")
+            bindings.append({
+                "source_api": edge.get("source_api", ""),
+                "target_api": target_api,
+                "rule_id": relation.get("rule_id", ""),
+                "source_field": source_field,
+                "target_parameter_path": target_parameter_path,
+                "source_fields": [source_field] if source_field else [],
+                "target_parameters": [target_parameter_path] if target_parameter_path else [],
+                "include": list(attrs.get("allowed_values", attrs.get("include", ())) or ()),
+                "exclude": list(attrs.get("excluded_values", attrs.get("exclude", ())) or ()),
+                "filter_strategy": attrs.get("filter_strategy", "identity"),
+                "filter_mode": attrs.get("filter_mode", "include"),
+                "transform": attrs.get("transform", ""),
+                "require_runtime_discovery": bool(attrs.get("require_runtime_discovery", True)),
+                "evidence_ids": list(relation.get("evidence_ids", ()) or ()),
+            })
+        if bindings:
+            for step in plan.steps:
+                names = protocol_function_names_for_planner(step.protocol_function)
+                if target_api in names or step.interface_name == target_api:
+                    current = step.parameters.get("runtime_bindings", [])
+                    step.parameters["runtime_bindings"] = [*current, *bindings]
+                    break
+    plan.rag_context["dependency_execution"] = {
+        "required_calls": required,
+        "conditional_calls": sorted({item for facts in dependency_context.values() for item in facts["optional_calls"] if item not in ignored}),
+        "satisfied_nodes": sorted({item for facts in dependency_context.values() for item in facts["satisfied_nodes"]}),
+        "value_policy": "select only from successful runtime outputs; never use a guessed concrete value",
+    }
+
+
 def deduplicate_retrieval_context(context: dict[str, list[RetrievedChunk]]) -> dict[str, list[RetrievedChunk]]:
     """Remove duplicate chunks returned by overlapping scenario/rule/API searches."""
     seen: set[str] = set()
@@ -936,7 +1402,8 @@ def apply_llm_planning_decision(
         "- Decide the NC program structure, the set of related FOCAS APIs to cover, each API's input parameter strategy, the execution order, timing, and safety constraints. Do not choose an O program number; CodeGenerationAgent allocates it.\n"
         "- First analyze the NC program scenario described by the task, then infer which FOCAS APIs are semantically related by reading the retrieved knowledge-base facts: function names, descriptions, prototypes, arguments, return data, examples, and error notes.\n"
         "- Before selecting each target API, inspect rag_context.api_prerequisites. For every matched rule, include the documented prerequisite conditions, source evidence, current-state checks, expected state, preparation operations, verification operations, restart requirement, and failure policy in the plan. Reuse one preparation/verification sequence for targets sharing a rule. Never invent a parameter number, bit, value, restart requirement, or controller capability when the rule does not provide evidence.\n"
-        "- Environment writes are allowed only when task permissions explicitly allow isolated-simulator writes and the rule marks them safe. Use read-original -> modify only the documented bit -> readback -> restore/snapshot; if restart is required, stop for operator/environment reinitialization and do not execute the target early.\n"
+        "- Also inspect traffic_relationships.apis.<target>.parameter_prerequisites when present. These graph facts are controller-scoped and carry parameter_number, bit, expected_value, read_api, optional write_api, readback_api, and safety policy. Use them as constraints only: Generator must follow the documented parameter value, type, scope, and any explicitly planned read/write sequence. A graph edge never grants permission to write.\n"
+        "- Environment writes are allowed only when task permissions explicitly allow isolated-simulator writes and the rule marks them safe. Use only the explicitly planned parameter sequence; if a required restart or mode transition is documented, stop and report it before the dependent target.\n"
         "- Do not rely on a local tool/interface registry as the API universe. The knowledge base is the source of API facts; you may plan any relevant FOCAS protocol_function found or inferable from retrieved API knowledge.\n"
         "- Build an API coverage set from api_candidate_pool plus any additional relevant API facts in RAG: include APIs that can produce relevant returned outputs, state transitions, lifecycle evidence, control/synchronization evidence, or intentionally varied simulator-side mutation evidence for this NC program scenario. Exclude APIs only with a brief reason.\n"
         "- When coverage_intent.full_traffic_coverage=true, optimize for broad/full traffic coverage rather than a minimal safe API subset. For a simulator/NCGuide target, do not exclude a RAG-retrieved write or control API merely because it mutates simulator state, creates lifecycle side effects, is not the shortest path, or is outside the narrowest scene core. Include it when it can generate distinguishable traffic and can be bracketed by setup/read-back/cleanup or bounded simulator values.\n"
@@ -948,7 +1415,8 @@ def apply_llm_planning_decision(
         "- Keep each selected protocol_function consistent with its retrieved prototype and arguments. Do not label a step cnc_rdprogdir while using cnc_rdprogdir2/cnc_rdprogdir3-style top_prog/num_prog pointer parameters; choose the exact documented family member whose prototype matches the planned parameter strategy.\n"
         "- Treat download lifecycles as versioned contracts: cnc_download3 requires cnc_dwnstart3 then cnc_dwnend3; cnc_download4 requires cnc_dwnstart4 then cnc_dwnend4. A non-EW_OK start blocks the data-transfer call.\n"
         "- Expand every documented api_sequence into an independent atomic session. If a batch contains both version 3 and version 4 targets, emit two separate sessions with separate target/support roles and one normalized input/output log pair per real call; never interleave or cross-pair versions.\n"
-        "- cnc_dncstart2 is a state query for an already active CNC-side DNC/M198 operation, not a command that starts DNC. Plan cnc_dnc2/cnc_dncend2 only behind an observed EW_OK result. DNC/M198 requires its own verified CNC mode/option/signal prerequisites; do not infer NCGuide incompatibility from EW_REJECT, which means no DNC/M198 was active at query time.\n"
+        "- cnc_dncstart2 is a state query for an already active CNC-side DNC/M198 operation, not a command that starts DNC. Plan it as the first observation. If it returns EW_REJECT and an authorized isolated M198/DNC scenario is required, plan a version-matched legal program download (directory discovery -> start/data/end), verify the resulting program, and defer selection/activation to the documented operator gate; uploading alone does not start DNC/M198. Plan cnc_dnc2/cnc_dncend2 only behind a later observed EW_OK result and confirmed session ownership. DNC/M198 requires its own verified CNC mode/option/signal prerequisites; do not infer NCGuide incompatibility from EW_REJECT, which means no DNC/M198 was active at query time.\n"
+        "- Treat traffic_relationships from Neo4j as the authoritative planning source. Use only confirmed canonical lowercase filters/prepares edges, recursively consume dependency_plan.required_calls before the target, omit satisfied_api_names, and stop on cycles. If an API node exists but graph_no_relation_api_names marks it as having no confirmed incoming relation, consult the retrieved SDK/RAG evidence and emit only evidence-backed candidate dependencies in ExecutionPlan.dependencies; do not invent values.\n"
         "- First analyze what will make the generated traffic high quality, distinguishable, and broad enough to cover the selected related API set.\n"
         "- Only for an actual NC-motion segment, use observable 2-5 second motion blocks and adequate sampling. Non-motion API quality is judged by target calls, return values, parameter variation, and matched PCAP transactions, not axis/feed variation.\n"
         "- Only if an NC-motion segment actually requires StartProgram/Cycle Start, explicitly require a trigger-readiness gate: before each Cycle Start, "
@@ -972,7 +1440,13 @@ def apply_llm_planning_decision(
         "- Return the complete planned API steps. The local draft is context only.\n"
         "- Return JSON only.\n\n"
         "# Output Schema\n"
+        "The legacy scenario_type/scenario_goal and interface_name fields remain compatible, but also emit the structured ExecutionPlan fields: target_api, scenario, dependencies, runtime_bindings, prerequisites, session, collection.\n"
         "{"
+        "\"target_api\":\"exact target API\",\"scenario\":\"采集场景\","
+        "\"dependencies\":[{\"source_api\":\"cnc_source\",\"target_api\":\"cnc_target\",\"relation\":\"filters|prepares\",\"dependency_path\":\"target.path\",\"source_field\":\"source.output\",\"filter_mode\":\"include|exclude\"}],"
+        "\"runtime_bindings\":[{\"source_step_id\":\"S001\",\"source_field\":\"output.field\",\"target_step_id\":\"S002\",\"target_parameter_path\":\"parameter\",\"filter_mode\":\"include|exclude\",\"transform\":\"documented_transform_or_empty\"}],"
+        "\"prerequisites\":{\"cnc_parameters\":[],\"pmc_signals\":[],\"cnc_mode\":[],\"cnc_state\":[],\"session\":[],\"status_by_category\":{}},"
+        "\"session\":{\"required\":false,\"order\":[]},\"collection\":{\"npcap\":{\"group_by\":[\"batch_id\",\"api_name\"]}},"
         "\"scenario_goal\":\"short goal\","
         "\"quality_analysis\":{\"traffic_goal\":\"what must vary\",\"risk\":\"why first run may fail\","
         "\"strategy\":[\"moderate-duration motion blocks / sufficient sampling frequency / avoid excessive runtime\"],"
@@ -1080,10 +1554,13 @@ def apply_llm_planning_decision(
         "Use historical_diversity_feedback in Explicit task permissions as prior observations, not as current device state. "
         "Exclude previously sampled valid input configurations when choosing new cases, unless replay is needed to verify reproducibility. "
         "Set a bounded maximum configuration budget and distinguish the planned target count from the hard execution budget. "
+        "Apply the collection budget rule: enumerate every documented legal configuration when the domain has 20 or fewer values; when it exceeds 20, collect an evidence-backed subset capped at 20; parameters documented as fixed use their fixed value once and are not treated as diversity dimensions. "
         "For independent inputs prefer controlled one-factor-at-a-time cases; for coupled inputs specify valid combinations and their relation. "
         "Name output fields expected to change and fields expected to remain stable; record a source-backed reason when response-state variation is not applicable. "
+        "For every target, explicitly state how diversity is obtained: input diversity comes from documented formal inputs and controller-discovered valid values; response diversity comes from normalized returned fields; state diversity comes from verified CNC state windows before/during/after an event. Record the acquisition API/log fields and the exact success metric. A repeated call, changed timestamp, handle, pointer, or buffer capacity is never diversity. "
         "Escalate response variation only through the lowest-cost supported strategy: input change, existing business data, authorized isolated data setup, validated NC execution, then supported event simulation. "
         "Never treat low diversity as execution failure, never retry unchanged configurations, and stop when the documented domain, planned budget, or verified environment capability is exhausted. "
+        "Normal collection plans must contain only successful documented calls; never add expected_return_code, expected error codes, negative probes, invalid parameter probes, or error-path test cases unless the user explicitly requests a separate documented error-probe task. "
         "Do not default minimum_distinct to 1 for a documented multi-value input domain: the parameter "
         "coverage contract enforces multiple successful combinations for axis inputs that allow ALL_AXES "
         "and controller-reported axis numbers. Use 1 only for callable-only coverage or a documented "
@@ -1092,11 +1569,11 @@ def apply_llm_planning_decision(
         "are not diversity dimensions. For no-variable-input APIs plan state_coverage with meaningful "
         "device states, transitions and expected output variation or explain why variation is inapplicable. "
         "Classify every target explicitly with variation_class=call_only|input_only|response_observation_only|response_state_only|input_and_response, plus input_diversity {applicable,required,reason} and response_state_diversity {applicable,required,reason}. Enforce input diversity only when the documented input domain is applicable; enforce response-state diversity only when the returned data depends on an observable state/event. For call-only and inherently stable APIs require only a real successful call and matched traffic. "
-        "For every target, decide whether output diversity needs an NC program and whether that program must execute; justify this from output dependencies, not generic templates. cnc_skip is a read API: vary its documented axis selector using controller-reported axis count; it does not require a G31 program or SKIP signal to call. For runtime-motion targets, if execution gates are unverified, retain a read-only baseline, omit upload/select/start steps, and record a deferred manual Cycle Start action before any state-changing operation. Never infer execution from a plan. Identify required CNC mode/parameter conditions only from exact applicable evidence. Observe mode first; on mismatch request operator action and stop that target, never switch automatically. Parameter writes require exact sourced number/bit/value/scope, explicit allow_environment_writes permission, snapshot/write/read-back, and stop on mismatch or restart requirement. Unknown requirements remain unknown and block only dependent state-changing operations while retaining safe read-only samples. Never request Cycle Start just to increase diversity. "
+        "For every target, decide whether output diversity needs an NC program and whether that program must execute; justify this from output dependencies, not generic templates. cnc_skip is a read API: vary its documented axis selector using controller-reported axis count; it does not require a G31 program or SKIP signal to call. For runtime-motion targets, if execution gates are unverified, retain a read-only baseline, omit upload/select/start steps, and record a deferred manual Cycle Start action before any state-changing operation. Never infer execution from a plan. Identify required CNC mode/parameter conditions only from exact applicable evidence. Observe mode first; on mismatch request operator action and stop that target, never switch automatically. Parameter writes require exact sourced number/bit/value/scope and SDK constraints. Do not add snapshot, read-back, restoration, or permission gates solely from the write classification; execute only explicitly planned operations. Unknown requirements remain unknown and block only dependent state-changing operations while retaining safe read-only samples. Never request Cycle Start just to increase diversity. "
         "For cnc_skip, plan cnc_rdaxisname discovery and aggregate plus per-axis reads; no G31/SKIP event is a prerequisite for the API call. "
         "Do not delegate selection of coverage dimensions to CodeGenerationAgent, but delegate concrete value "
         "selection within the documented constraints. Do not generate unsafe "
-        "Cartesian products; state changes require snapshot, verification and restoration. "
+        "Cartesian products; state changes follow only explicitly planned lifecycle and SDK verification steps. "
         "Do not write C++, G-code blocks, Fwlib declarations, capture code, validators, or full API documentation. "
         "Do not omit required headings. Do not wrap the whole response in a code fence."
     )
@@ -1123,7 +1600,7 @@ def apply_llm_planning_decision(
         "# Quality Targets\n"
         "- input_diversity_required: false\n"
         "- response_state_diversity_required: false\n"
-        "- max_configurations: 1\n"
+        "- max_configurations: <deterministic budget derived from the legal domain; do not default to 1 for write APIs>\n"
         "- response_fields_expected_to_change: []\n"
         "- response_fields_expected_stable: []\n"
         "- response_variation_strategy: \"only when classification requires it\"\n\n"
@@ -1133,7 +1610,7 @@ def apply_llm_planning_decision(
         "- constraints: [\"constraint 1\"]\n"
         "- generation_notes: []\n\n"
         "# Scene Requirements\n"
-        "- item: {\"target_api\":\"<exact target>\",\"variation_class\":\"call_only|input_only|response_observation_only|response_state_only|input_and_response\",\"input_diversity\":{\"applicable\":false,\"required\":false,\"reason\":\"...\"},\"response_state_diversity\":{\"applicable\":false,\"required\":false,\"reason\":\"...\"},\"output_dependencies\":[\"<field and dependency>\"],\"nc_program_required\":false,\"execution_required\":false,\"nc_behavior\":[],\"required_mode\":\"unknown or documented mode\",\"mode_evidence\":\"<exact source or unknown>\",\"parameter_preconditions\":[],\"operator_action_if_mismatch\":true,\"safe_fallback\":\"<read-only sample or stop reason>\"}\n\n"
+        "- item: {\"target_api\":\"<exact target>\",\"variation_class\":\"call_only|input_only|response_observation_only|response_state_only|input_and_response\",\"input_diversity\":{\"applicable\":false,\"required\":false,\"source\":\"documented inputs or none\",\"acquisition\":\"exact discovery/logging method\",\"success_metric\":\"distinct successful input signatures or one call\",\"reason\":\"...\"},\"response_diversity\":{\"applicable\":false,\"required\":false,\"source\":\"returned fields\",\"acquisition\":\"normalized output comparison\",\"success_metric\":\"distinct returned values or not applicable\"},\"state_diversity\":{\"applicable\":false,\"required\":false,\"source\":\"verified CNC state\",\"acquisition\":\"before/during/after evidence\",\"success_metric\":\"distinct state windows\"},\"output_dependencies\":[\"<field and dependency>\"],\"nc_program_required\":false,\"execution_required\":false,\"nc_behavior\":[],\"required_mode\":\"unknown or documented mode\",\"mode_evidence\":\"<exact source or unknown>\",\"parameter_preconditions\":[],\"operator_action_if_mismatch\":true,\"safe_fallback\":\"<read-only sample or stop reason>\"}\n\n"
         "# Steps\n"
         "## S001\n"
         "- phase: before\n"
@@ -1303,6 +1780,10 @@ def apply_llm_planning_decision(
     else:
         plan.rag_context["api_coverage_analysis"] = []
 
+    # Dependency discovery is an offline audit concern. Planner consumes only
+    # confirmed graph facts and never carries candidate relations forward.
+    plan.rag_context["relation_discovery_plan"] = []
+
     coverage_segments = payload.get("coverage_segments", [])
     scene_requirements = payload.get("scene_requirements", [])
     if isinstance(scene_requirements, list):
@@ -1340,6 +1821,23 @@ def apply_llm_planning_decision(
             raise ValueError("PlanningAgent LLM response did not include any valid steps.")
     if not code_only:
         plan.steps = materialize_included_api_candidates(plan)
+    # cnc_prstwkcd is handled by the fixed IDBWRA direct-call recipe.  Any
+    # generic write-safety helper suggested by RAG (especially cnc_wrzofs or
+    # cnc_rdzofs) is outside this target's contract and must not be handed to
+    # CodeGenerationAgent as a required restore chain.
+    planned_target_names = {
+        name for step in plan.steps
+        for name in protocol_function_names_for_planner(step.protocol_function)
+    }
+    if "cnc_prstwkcd" in planned_target_names:
+        plan.steps = [
+            step for step in plan.steps
+            if not (set(protocol_function_names_for_planner(step.protocol_function))
+                    & {"cnc_wrzofs", "cnc_rdzofs", "cnc_wrzofsr", "cnc_rdzofsr"})
+        ]
+        plan.llm_notes.append(
+            "cnc_prstwkcd uses the direct IDBWRA call; work-offset snapshot/readback/restore helpers removed by target contract."
+        )
     # Enforce the same motion prerequisite used by ExecutionContract. A target
     # such as cnc_rdaxisdata may be selected inside the comprehensive batch,
     # where the scenario name alone is not coordinate_motion. In that case the
@@ -1362,6 +1860,14 @@ def apply_llm_planning_decision(
             plan.steps,
             plan.nc_program_spec.program_name,
         )
+        coverage_segments = [item for item in plan.rag_context.get("coverage_segments", []) if isinstance(item, dict)]
+        nc_required = any(bool(item.get("nc_program_required")) for item in coverage_segments)
+        nc_execution_required = any(
+            bool(item.get("cycle_start_required") or item.get("execution_required"))
+            for item in coverage_segments
+        )
+        if nc_required:
+            ensure_nc_program_transfer_steps(plan.steps, execute=nc_execution_required)
         attach_protocol_functions(plan.steps)
         plan.steps = audit_and_repair_task_api_coverage(
             plan,
@@ -1638,7 +2144,7 @@ def plan_steps_from_llm_rows(rows: list[Any]) -> list[PlanStep]:
     for index, row in enumerate(rows, 1):
         if not isinstance(row, dict):
             continue
-        interface_name = str(row.get("interface_name", "")).strip()
+        interface_name = str(row.get("interface_name", row.get("api", ""))).strip()
         if not interface_name:
             continue
         parameters = row.get("parameters", {})
@@ -1692,6 +2198,14 @@ def plan_steps_from_llm_rows(rows: list[Any]) -> list[PlanStep]:
                 protocol_function=protocol_function,
                 operation_kind=str(row.get("operation_kind", "focas_api")).strip() or "focas_api",
                 api_calls=api_calls,
+                api=str(row.get("api", protocol_function or interface_name)).strip(),
+                role=str(row.get("role", "auxiliary")).strip() if str(row.get("role", "auxiliary")).strip() in {"target", "auxiliary"} else "auxiliary",
+                parameter_sources=[item for item in row.get("parameter_sources", []) if isinstance(item, dict)] if isinstance(row.get("parameter_sources", []), list) else [],
+                dependencies=[item for item in row.get("dependencies", []) if isinstance(item, dict)] if isinstance(row.get("dependencies", []), list) else [],
+                required_inputs=[item for item in row.get("required_inputs", []) if isinstance(item, dict)] if isinstance(row.get("required_inputs", []), list) else [],
+                outputs=[item for item in row.get("outputs", []) if isinstance(item, dict)] if isinstance(row.get("outputs", []), list) else [],
+                failure_policy=str(row.get("failure_policy", "block_dependents")).strip() or "block_dependents",
+                blocks_dependents=bool(row.get("blocks_dependents", True)),
             )
         )
     return steps
@@ -1790,6 +2304,78 @@ def normalize_parameter_constraints(rows: list[Any]) -> list[dict[str, Any]]:
                 item[key] = row[key]
         constraints.append(item)
     return constraints
+
+
+def apply_variation_contract(
+    plan: ExecutionPlan,
+    *,
+    task_description: str,
+    permissions: dict[str, Any] | None = None,
+    target_functions: list[str] | tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Make diversity dimensions explicit in the Planner hand-off.
+
+    LLM prose remains useful for rationale, but the executable contract is
+    derived from API dependency facts and is attached to each matching step.
+    This prevents a missing or contradictory ``quality_targets`` field from
+    turning a documented input domain into a repeated call-only sample.
+    """
+    requested = [str(name).strip() for name in target_functions if str(name).strip()]
+    if not requested:
+        requested = [
+            name for step in plan.steps
+            for name in protocol_function_names_for_planner(step.protocol_function)
+        ]
+    contract = build_variation_contract(
+        requested,
+        task_description=task_description,
+        permissions=permissions or {},
+    )
+    plan.rag_context["variation_contract"] = contract
+    summary = contract.get("quality_summary", {})
+    existing_quality = plan.rag_context.get("quality_targets", {})
+    if not isinstance(existing_quality, dict):
+        existing_quality = {}
+    plan.rag_context["quality_targets"] = {
+        **existing_quality,
+        "input_diversity_required": bool(existing_quality.get("input_diversity_required", False))
+        or bool(summary.get("input_diversity_required", False)),
+        "response_state_diversity_required": bool(existing_quality.get("response_state_diversity_required", False))
+        or bool(summary.get("response_diversity_required", False)),
+        "state_diversity_required": bool(existing_quality.get("state_diversity_required", False))
+        or bool(summary.get("state_diversity_required", False)),
+        "variation_sources": summary.get("sources", []),
+    }
+    for step in plan.steps:
+        names = protocol_function_names_for_planner(step.protocol_function)
+        matches = [contract["targets"][name] for name in names if name in contract.get("targets", {})]
+        if not matches:
+            continue
+        # A step can contain one atomic target plus lifecycle metadata. Keep
+        # the target-specific rows visible to CodeGenerationAgent and Router.
+        step.parameters["variation_contract"] = matches[0] if len(matches) == 1 else {
+            "targets": matches,
+            "variation_class": "input_and_response",
+        }
+        for row in matches:
+            if not row.get("input_diversity", {}).get("required"):
+                continue
+            goal = step.parameters.get("parameter_coverage_goal")
+            if not isinstance(goal, dict):
+                goal = {}
+            minimum = 4 if row.get("target_api") == "pmc_rdpmcrng" else 2
+            try:
+                minimum = max(minimum, int(goal.get("minimum_distinct", 0)))
+            except (TypeError, ValueError):
+                pass
+            step.parameters["parameter_coverage_goal"] = {
+                **goal,
+                "minimum_distinct": minimum,
+                "coverage_scope": goal.get("coverage_scope") or "documented valid input domain",
+                "evidence": goal.get("evidence") or "; ".join(row.get("evidence", [])),
+                "on_insufficient": goal.get("on_insufficient") or "retain successful samples and report the limitation",
+            }
+    return contract
 
 
 def normalize_api_coverage_analysis(rows: list[Any]) -> list[dict[str, Any]]:
@@ -1989,6 +2575,8 @@ def compact_rag_context(rag_context: dict) -> dict:
             compact[key] = {
                 "enabled": rows.get("enabled"),
                 "source_manifest": rows.get("source_manifest"),
+                "device_scope": rows.get("device_scope"),
+                "device_model": rows.get("device_model"),
                 "target_function_count": rows.get("target_function_count"),
                 "covered_function_count": rows.get("covered_function_count"),
                 "remaining_function_count": rows.get("remaining_function_count"),
@@ -2390,7 +2978,7 @@ def build_plan(
     if selected_templates:
         rag_context["selected_scenario_templates"] = summarize_selected_templates(selected_templates)
     strip_planner_program_number_decisions(nc_program_spec, steps)
-    return ExecutionPlan(
+    plan = ExecutionPlan(
         plan_id=f"plan-{task_id}",
         task_id=task_id,
         scenario_type=scenario,
@@ -2410,6 +2998,9 @@ def build_plan(
         retrieved_chunk_ids=[item.chunk.chunk_id for item in flatten_retrieval(retrieval)],
         rag_context=rag_context,
     )
+    # Populate the additive schema even for deterministic/template plans that
+    # do not pass through the LLM planning branch.
+    return normalize_execution_plan(plan, rag_context.get("traffic_relationships"))
 
 
 def plan_nc_program_spec(scenario: str, selected_templates: list[dict[str, Any]], task_id: str = "") -> NcProgramSpec:
@@ -2553,6 +3144,23 @@ def ensure_nc_program_lifecycle_steps(scenario: str, steps: list[PlanStep], prog
     if missing_prefix:
         steps[:0] = missing_prefix
     normalize_lifecycle_steps(steps)
+
+
+def ensure_nc_program_transfer_steps(steps: list[PlanStep], *, execute: bool) -> None:
+    """Add upload/select for NC payloads; add StartProgram only when required."""
+    existing = {str(step.interface_name) for step in steps}
+    protocol_names = {
+        name for step in steps for name in protocol_function_names_for_planner(step.protocol_function)
+    }
+    prefix: list[PlanStep] = []
+    if "UploadProgram" not in existing and not {"cnc_dwnstart3", "cnc_download3", "cnc_dwnend3"}.issubset(protocol_names):
+        prefix.append(PlanStep("NC-TRANSFER-001", "before", "upload generated NC program", "UploadProgram", {}))
+    if "SelectProgram" not in existing and "cnc_search" not in protocol_names:
+        prefix.append(PlanStep("NC-TRANSFER-002", "before", "select uploaded NC program", "SelectProgram", {}))
+    if execute and "StartProgram" not in existing:
+        prefix.append(PlanStep("NC-EXEC-001", "during", "run uploaded NC program", "StartProgram", {}))
+    if prefix:
+        steps[:0] = prefix
 
 
 def classify_block_goal(goal: str) -> str:

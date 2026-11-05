@@ -6,6 +6,7 @@ typed hand-off messages so each stage has an explicit artifact boundary.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from .orchestration.roles import ActionSpec, AgentMessage, AgentTemplate, Role, message_to_dict
 
@@ -22,6 +23,7 @@ class PlanSpec:
     plan_id: str
     step_count: int
     rag_chunk_count: int
+    execution_plan: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

@@ -10,6 +10,7 @@ from smart_traffic_agent.agents.router import (
     summarize_plan_for_router,
     summarize_quality_for_router,
     valid_next_stages,
+    target_generation_after_runtime_binding,
 )
 from smart_traffic_agent.knowledge import sample_knowledge
 from pathlib import Path
@@ -45,6 +46,20 @@ def state_with_plan_without_artifacts() -> WorkflowState:
 
 
 class RouterAgentTests(unittest.TestCase):
+    def test_runtime_binding_requests_target_generation_without_replanning(self):
+        state = state_with_plan_without_artifacts()
+        state.plan.target_api = "cnc_wrpm_item"
+        state.plan.rag_context["runtime_parameter_bindings"] = {
+            "cnc_wrpm_item": {"success": True, "complete": True, "selected_parameters": {"axis": [1, 2]}}
+        }
+        state.result = ExecutionResult(
+            task_id="router001", success=True, api_logs=[], capture_events=[], output_dir=Path(".")
+        )
+        message = target_generation_after_runtime_binding(state)
+        self.assertIn("without replanning", message)
+        self.assertTrue(state.plan.rag_context["parameter_binding_generation_requested"])
+        self.assertEqual(target_generation_after_runtime_binding(state), "")
+
     def test_code_generation_compile_failure_deterministically_routes_to_repair_code(self) -> None:
         state = state_with_plan_without_artifacts()
         state.stage = "repair_code"

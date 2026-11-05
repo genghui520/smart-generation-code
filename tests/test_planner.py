@@ -23,6 +23,7 @@ from smart_traffic_agent.agents.planner import (
     select_scenario_templates,
     summarize_retrieval,
     summarize_long_term_memories,
+    ensure_nc_program_transfer_steps,
 )
 from smart_traffic_agent.models import ExecutionPlan, KnowledgeChunk, NcProgramSpec, PlanStep, RetrievedChunk
 from smart_traffic_agent.code_spec import build_code_spec
@@ -95,6 +96,18 @@ class ErrorExperienceSummaryTests(unittest.TestCase):
         self.assertEqual(summary[0]["fix"], "Pass the requested axis count.")
 
 class PlannerTests(unittest.TestCase):
+    def test_nc_payload_uploads_without_running_unless_execution_required(self) -> None:
+        transfer_steps: list[PlanStep] = []
+        ensure_nc_program_transfer_steps(transfer_steps, execute=False)
+        self.assertEqual([step.interface_name for step in transfer_steps], ["UploadProgram", "SelectProgram"])
+
+        execute_steps: list[PlanStep] = []
+        ensure_nc_program_transfer_steps(execute_steps, execute=True)
+        self.assertEqual(
+            [step.interface_name for step in execute_steps],
+            ["UploadProgram", "SelectProgram", "StartProgram"],
+        )
+
     def test_llm_planning_uses_plan_permissions_and_preserves_motion_lifecycle(self) -> None:
         for target, use_permissions, needs_motion in (
             ("cnc_rdaxisdata", True, True),

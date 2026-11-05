@@ -171,6 +171,44 @@ def test_missing_response_is_explicit_and_not_bound() -> None:
     assert transactions[0]["traffic_status"] == "no_corresponding_traffic"
     assert transactions[0]["request_response_associated"] is False
     assert mapping["inv-1"]["application_messages"] == []
+    assert mapping["inv-1"]["wire_evidence_diagnostic"]["association_reason"] == "incomplete_request_response_exchange"
+
+
+def test_no_wire_packets_in_call_window_is_explicitly_diagnosed() -> None:
+    rows = [invocation(1, 100, 199)]
+    packets = [
+        packet(300, 10, b"Q"),
+        packet(310, 20, b"A", response=True),
+    ]
+    records, _ = build_protocol_transactions(rows, packets)
+    diagnostic = records[0]["wire_evidence_diagnostic"]
+    assert records[0]["traffic_status"] == "no_corresponding_traffic"
+    assert diagnostic["endpoint_packet_count"] == 2
+    assert diagnostic["invocation_window_packet_count"] == 0
+    assert diagnostic["association_reason"] == "no_endpoint_packets_in_invocation_window"
+    assert diagnostic["nearest_endpoint_packet_before_ns"] is None
+    assert diagnostic["nearest_endpoint_packet_after_ns"] == 300
+    assert diagnostic["window_end_gap_ns"] == 101
+
+
+def test_capture_metadata_is_preserved_without_turning_a_file_into_match() -> None:
+    row = invocation(1, 100, 199)
+    row["api"] = "cnc_setpath"
+    records, _ = build_protocol_transactions(
+        [row], [],
+        capture_metadata={
+            "cnc_setpath": {
+                "api_pcap_file": "by_api/batch_cnc_setpath.pcap",
+                "api_pcap_payload_count": 0,
+                "capture_source": "top_level_plus_runtime_per_api",
+            }
+        },
+    )
+    diagnostic = records[0]["wire_evidence_diagnostic"]
+    assert records[0]["traffic_status"] == "no_corresponding_traffic"
+    assert diagnostic["api_pcap_file"].endswith("cnc_setpath.pcap")
+    assert diagnostic["api_pcap_payload_count"] == 0
+    assert diagnostic["capture_source"] == "top_level_plus_runtime_per_api"
 
 
 def test_segmented_download_request_is_explained_by_lifecycle_end() -> None:

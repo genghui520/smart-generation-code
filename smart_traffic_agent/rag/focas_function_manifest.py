@@ -191,6 +191,8 @@ def build_function_coverage_context(
     scenario_type: str = "comprehensive_focas_traffic",
     support_batch_size: int = DEFAULT_SUPPORT_BATCH_SIZE,
     max_segments: int = DEFAULT_COVERAGE_SEGMENT_COUNT,
+    device_scope: str = "",
+    device_model: str = "",
 ) -> dict[str, Any]:
     all_rows = dedupe_manifest_rows(load_function_manifest(manifest_path))
     rows = all_rows
@@ -215,6 +217,8 @@ def build_function_coverage_context(
     return {
         "enabled": bool(rows),
         "source_manifest": str(manifest_path),
+        "device_scope": device_scope,
+        "device_model": device_model,
         "scenario_batch_id": primary_segment["scenario_batch_id"],
         "main_state_driver": primary_segment["main_state_driver"],
         "quality_target": primary_segment["quality_target"],

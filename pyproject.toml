@@ -12,7 +12,16 @@ dependencies = [
   "langgraph>=0.2",
   "sentence-transformers>=5.0",
   "neo4j>=5.0",
+  "pyLSV2 @ git+https://github.com/drunsinn/pyLSV2.git@97a3d69184f63e6190d981f587bd0fc98acf200a",
+]
+
+[project.optional-dependencies]
+ezsocket = [
+  "pywin32>=312; sys_platform == 'win32'",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["smart_traffic_agent*"]

@@ -28,8 +28,11 @@ _DYNAMIC_STATE_TARGETS = {
     "cnc_rdposition", "cnc_absolute", "cnc_absolute2", "cnc_machine",
     "cnc_relative", "cnc_relative2", "cnc_distance", "cnc_actf", "cnc_acts",
     "cnc_rdspeed", "cnc_rddynamic", "cnc_rddynamic2", "cnc_rdsvmeter",
-    "cnc_srvdelay", "cnc_accdecdly",
+    "cnc_srvdelay", "cnc_rdspcss", "cnc_rdspmeter",
+    "cnc_rdspeed", "cnc_rdspload",
 }
+
+_DNC_TARGETS = {"cnc_dncstart2", "cnc_dnc2", "cnc_dncend2"}
 
 # Variation is split into two independent obligations.  The target API may
 # have a documented input domain without requiring a state-changing scene;
@@ -43,7 +46,8 @@ _CALL_ONLY_APIS = {
 _DOCUMENTED_INPUT_VARIATION_APIS = {
     "cnc_rdposition", "cnc_absolute", "cnc_absolute2", "cnc_machine",
     "cnc_relative", "cnc_relative2", "cnc_distance", "cnc_skip",
-    "cnc_srvdelay", "cnc_accdecdly", "cnc_rdaxisdata",
+    "cnc_srvdelay", "cnc_accdecdly", "cnc_rdaxisdata", "pmc_rdpmcrng",
+    "cnc_prstwkcd",
 }
 
 
@@ -52,6 +56,38 @@ def classify_api_variation(target: str, dependency: dict[str, Any] | None = None
     name = str(target).strip().lower()
     dependency = dependency or analyze_output_dependencies(target)
     kind = str(dependency.get("dependency_kind", "unknown"))
+    if name == "cnc_accdecdly":
+        return {
+            "variation_class": "input_and_response",
+            "input_diversity": {
+                "applicable": True,
+                "required": True,
+                "dimension": "axis_and_length",
+                "reason": "use ALL_AXES and each controller-reported legal axis with the SDK-matched length",
+            },
+            "response_state_diversity": {
+                "applicable": True,
+                "required": False,
+                "reason": "reads configured acceleration/deceleration delay values; motion does not imply response change",
+            },
+            "state_change_scene": "not_applicable",
+        }
+    if name == "cnc_prstwkcd":
+        return {
+            "variation_class": "input_only",
+            "input_diversity": {
+                "applicable": True,
+                "required": True,
+                "dimension": "IDBWRA.type",
+                "reason": "documented ALL_AXES selector and controller-valid individual axis selectors",
+            },
+            "response_state_diversity": {
+                "applicable": False,
+                "required": False,
+                "reason": "status result is sufficient; coordinate-state variation is not required",
+            },
+            "state_change_scene": "bounded_authorized_preset",
+        }
     if name in _CALL_ONLY_APIS or kind == "unknown":
         return {
             "variation_class": "call_only",
@@ -93,6 +129,93 @@ def classify_api_variation(target: str, dependency: dict[str, Any] | None = None
         "input_diversity": {"applicable": False, "required": False, "reason": "no reliable variation domain"},
         "response_state_diversity": {"applicable": False, "required": False, "reason": "no reliable response-state dependency"},
         "state_change_scene": "not_applicable",
+    }
+
+
+def build_variation_contract(
+    targets: Iterable[str],
+    *,
+    task_description: str = "",
+    permissions: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the Planner-owned contract for how diversity is obtained.
+
+    ``variation_requirements`` says whether a dimension is meaningful.  This
+    contract adds the operational source and success evidence so downstream
+    agents cannot confuse a repeated call, a changed response, and a changed
+    CNC state.  It never authorizes a write or an NC run.
+    """
+    permissions = permissions or {}
+    text = str(task_description).lower()
+    diversity_requested = any(token in text for token in (
+        "多样性", "多样化", "diversity", "distinct input", "variation",
+    ))
+    allow_writes = bool(permissions.get("allow_environment_writes", False))
+    rows: dict[str, dict[str, Any]] = {}
+    for target in dict.fromkeys(str(item).strip() for item in targets if str(item).strip()):
+        facts = analyze_output_dependencies(target)
+        variation = facts.get("variation_requirements") or classify_api_variation(target, facts)
+        input_rule = dict(variation.get("input_diversity", {}))
+        response_rule = dict(variation.get("response_state_diversity", {}))
+        is_write = target.lower().startswith(("cnc_wr", "pmc_wr"))
+        input_applicable = bool(input_rule.get("applicable", False))
+        input_required = bool(input_rule.get("required", False))
+        blocked_reason = ""
+        if is_write and diversity_requested and input_applicable and not allow_writes:
+            # Keep the requested obligation visible, while making the safety
+            # gate explicit.  Executor must report blocked, never execute.
+            input_required = True
+            blocked_reason = "input diversity requires explicit allow_environment_writes; no write is authorized"
+        response_contract = {
+            "applicable": bool(response_rule.get("applicable", False)),
+            "required": bool(response_rule.get("required", False)),
+            "source": "actual returned fields/data payload",
+            "acquisition": "compare normalized response fields for successful calls; retain unchanged values as real evidence",
+            "success_metric": "distinct normalized response values" if response_rule.get("applicable", False) else "not applicable",
+        }
+        rows[target] = {
+            "target_api": target,
+            "variation_class": variation.get("variation_class", "call_only"),
+            "input_diversity": {
+                "applicable": input_applicable,
+                "required": input_required,
+                "source": "documented API inputs and controller-discovered valid domain" if input_applicable else "none",
+                "acquisition": (
+                    "vary only documented coupled input fields; log every formal value in the invocation input row"
+                    if input_applicable else "no semantic input dimension; do not vary handles, pointers or buffer capacity"
+                ),
+                "success_metric": "distinct successful input signatures with matched traffic" if input_applicable else "one successful matched call",
+                "blocked_reason": blocked_reason,
+            },
+            "response_diversity": response_contract,
+            "response_state_diversity": response_contract,
+            "state_diversity": {
+                "applicable": facts.get("dependency_kind") in {"runtime_motion_state", "runtime_state"},
+                "required": facts.get("dependency_kind") == "runtime_motion_state",
+                "source": "cnc_statinfo and target samples before/during/after a verified event",
+                "acquisition": "use real controller run/motion/state evidence; never infer state from delay or program existence",
+                "success_metric": "distinct observed state windows" if facts.get("dependency_kind") == "runtime_motion_state" else "observation only",
+            },
+            "evidence": list(facts.get("dependencies", [])),
+            "execution_gate": "blocked_until_explicit_permission" if blocked_reason else "normal_contract",
+        }
+    input_required = any(row["input_diversity"]["required"] for row in rows.values())
+    response_required = any(row["response_diversity"]["required"] for row in rows.values())
+    state_required = any(row["state_diversity"]["required"] for row in rows.values())
+    return {
+        "version": 1,
+        "targets": rows,
+        "requested": diversity_requested,
+        "quality_summary": {
+            "input_diversity_required": input_required,
+            "response_diversity_required": response_required,
+            "state_diversity_required": state_required,
+            "sources": [
+                "logged documented input signatures",
+                "actual returned response fields",
+                "verified controller state windows",
+            ],
+        },
     }
 
 _FALLBACK_CAPABILITIES: list[dict[str, Any]] = [
@@ -139,6 +262,34 @@ _FALLBACK_CAPABILITIES: list[dict[str, Any]] = [
         "tools_or_apis": ["cnc_rdprogdir3", "cnc_dwnstart3", "cnc_download3", "cnc_dwnend3"],
         "execution_limits": ["no automatic cleanup", "no guessed O-number", "preserve real call and PCAP logs"],
         "observable_results": ["start/data/end return codes", "directory read-back"],
+        "verified_in_current_simulator": False,
+    },
+    {
+        "capability_id": "dnc_m198_session_activation",
+        "output_types": ["dnc_activity_state", "m198_program_request", "dnc_transfer_status"],
+        "preconditions": [
+            "cnc_dncstart2 read-before-action observation",
+            "controller-supported DNC/M198 option and applicable mode",
+            "for M198: a confirmed resident program, optionally prepared by a legal download session",
+            "isolated NCGuide execution permission and bounded NC text when activation is attempted",
+        ],
+        "tools_or_apis": [
+            "cnc_statinfo", "cnc_rdprogdir3", "cnc_dncstart2", "cnc_dnc2", "cnc_dncend2",
+            "cnc_dwnstart3/cnc_download3/cnc_dwnend3 or version-matched download chain",
+        ],
+        "execution_limits": [
+            "cnc_dncstart2 only observes an already active DNC/M198 operation",
+            "uploading a program does not by itself start DNC/M198",
+            "never write CNC parameters or inject PMC signals to force activation",
+            "pause for operator mode/selection/Cycle Start when activation gates are not verified",
+            "call cnc_dnc2/cnc_dncend2 only after cnc_dncstart2 returned EW_OK and ownership is confirmed",
+        ],
+        "observable_results": [
+            "EW_OK with filename/program request when DNC/M198 is active",
+            "EW_REJECT when no DNC/M198 operation is active",
+            "actual upload session and directory evidence for a prepared M198 program",
+            "matched DNC data/end traffic only for an owned, successfully started session",
+        ],
         "verified_in_current_simulator": False,
     },
     {
@@ -196,6 +347,38 @@ def load_scenario_capabilities(path: Path = DEFAULT_CAPABILITIES_PATH) -> list[d
 def analyze_output_dependencies(target: str) -> dict[str, Any]:
     """Return conservative dependency facts for Planner scene selection."""
     name = str(target).strip().lower()
+    if name in _DNC_TARGETS:
+        result = {
+            "target": target,
+            "output_fields": ["DNC/M198 activity state", "requested program filename"],
+            "dependency_kind": "dnc_session_state",
+            "dependencies": [
+                "cnc_dncstart2 must observe an already active DNC/M198 operation",
+                "controller mode/option and DNC/M198 activation state",
+                "optional resident M198 program; download only prepares it",
+            ],
+            "event_capability": "dnc_m198_session_activation",
+            "event_verified": False,
+            "variation_requires_nc_program": True,
+            "variation_requires_cycle_start": True,
+            "fallback": "always retain a read-only cnc_dncstart2 sample; on EW_REJECT record no active operation and defer upload/selection/Cycle Start until the isolated scene is authorized",
+            "activation_requires_operator": True,
+            "upload_is_preparation_only": True,
+        "followup_on_reject": {
+            "condition": "cnc_dncstart2 returns EW_REJECT and an authorized isolated M198/DNC scenario is requested",
+            "steps": [
+                "re-read cnc_statinfo and cnc_rdprogdir3",
+                "choose a legal unused/unprotected program number from the returned directory",
+                "download a bounded no-motion NC payload using the version-matched start/data/end chain",
+                "verify the directory/program state and request operator-controlled selection/activation",
+                "re-run cnc_dncstart2; only on EW_OK may cnc_dnc2/cnc_dncend2 be considered",
+            ],
+            "automatic_execution": False,
+            "reason": "upload prepares an M198 candidate but does not start DNC/M198 by itself",
+        },
+        }
+        result["variation_requirements"] = classify_api_variation(target, result)
+        return result
     if name == "cnc_skip":
         result = {
             "target": target,
@@ -222,12 +405,24 @@ def analyze_output_dependencies(target: str) -> dict[str, Any]:
         }
         result["variation_requirements"] = classify_api_variation(target, result)
         return result
-    if name in {"cnc_dwnstart3", "cnc_download3", "cnc_dwnend3", "cnc_dwnstart4", "cnc_download4", "cnc_dwnend4"}:
+    if name in {
+        "cnc_dwnstart3", "cnc_download3", "cnc_dwnend3",
+        "cnc_dwnstart4", "cnc_download4", "cnc_dwnend4",
+        "cnc_upstart3", "cnc_upload3", "cnc_upend3",
+        "cnc_upstart4", "cnc_upload4", "cnc_upend4",
+    }:
+        upload = name in {"cnc_upstart3", "cnc_upload3", "cnc_upend3", "cnc_upstart4", "cnc_upload4", "cnc_upend4"}
         result = {
             "target": target,
-            "output_fields": ["transfer return code", "program directory read-back"],
+            "output_fields": ["transfer return code", "program directory or content"],
             "dependency_kind": "program_transfer",
-            "dependencies": ["cnc_rdprogdir3", "idle legal program number", "matching start/data/end session"],
+            "transfer_direction": "upload_existing" if upload else "download_new",
+            "dependencies": [
+                "optional cnc_rdprogdir3 input discovery",
+                "registered readable program" if upload else "legal unused unprotected program number",
+                "matching start/data/end session",
+            ],
+            "program_discovery_required": False,
             "event_capability": "program_transfer_and_directory_change",
             "event_verified": False,
             "fallback": "plan session and directory verification; do not execute without confirmed target and permissions",
@@ -255,6 +450,38 @@ def analyze_output_dependencies(target: str) -> dict[str, Any]:
             "event_capability": "input_parameter_variation",
             "event_verified": False,
             "fallback": "retain successful static reads when safe variation is unknown",
+        }
+        result["variation_requirements"] = classify_api_variation(target, result)
+        return result
+    if name == "pmc_rdpmcrng":
+        result = {
+            "target": target,
+            "output_fields": ["IODBPMC type/address header", "PMC union data"],
+            "dependency_kind": "input_or_business_data",
+            "dependencies": [
+                "documented PMC address kind and data type",
+                "controller-supported address range from pmc_rdpmcinfo",
+                "length derived from data_type and element count",
+            ],
+            "event_capability": "input_parameter_variation",
+            "event_verified": False,
+            "fallback": "retain read-only ranges and report unsupported address/type combinations",
+        }
+        result["variation_requirements"] = classify_api_variation(target, result)
+        return result
+    if name == "pmc_wrpmcrng":
+        result = {
+            "target": target,
+            "output_fields": ["write return code"],
+            "dependency_kind": "controlled_business_data",
+            "dependencies": [
+                "documented PMC address kind and data type",
+                "controller-supported address range from pmc_rdpmcinfo",
+                "snapshot/read-back/restore and explicit write permission",
+            ],
+            "event_capability": "controlled_business_data",
+            "event_verified": False,
+            "fallback": "plan-only; never execute PMC writes without explicit isolated-simulator permission",
         }
         result["variation_requirements"] = classify_api_variation(target, result)
         return result
@@ -301,7 +528,7 @@ def build_cnc_skip_scene_steps() -> list[PlanStep]:
         PlanStep("SKIP_STATUS_BEFORE", "before", "Observe CNC status before any event", "ReadRunStatus",
                  protocol_function="cnc_statinfo"),
         PlanStep("SKIP_READ", "during", "Read current skip position without injecting an event", "cnc_skip",
-                 parameters={"axis": -1, "length": "sizeof(ODBAXIS)", "event_execution": "not_attempted"},
+                 parameters={"axis": -1, "length": "4 + 4 * MAX_AXIS", "length_rule": "axis=-1: 4 + 4 * MAX_AXIS; axis=1..N: 8", "event_execution": "not_attempted"},
                  protocol_function="cnc_skip"),
         PlanStep("SKIP_STATUS_AFTER", "after", "Observe CNC status after the read-only sample", "ReadRunStatus",
                  protocol_function="cnc_statinfo"),
@@ -322,35 +549,79 @@ def build_scene_capability_plan(target: str, capabilities: Iterable[dict[str, An
     # Keep the target separate from operations that establish its inputs or
     # lifecycle.  These helpers are evidence-bearing calls, not target
     # coverage, and are listed explicitly for code generation and auditing.
-    if transfer_scene:
+    dnc_scene = dependencies["dependency_kind"] == "dnc_session_state"
+    if dnc_scene:
+        auxiliary_apis = ["cnc_statinfo", "cnc_alarm2", "cnc_rdprogdir3"]
+        required_auxiliary_apis = ["cnc_statinfo"]
+        optional_auxiliary_apis = ["cnc_alarm2", "cnc_rdprogdir3", "cnc_dwnstart3", "cnc_download3", "cnc_dwnend3"]
+        session_chain = ["cnc_dncstart2", "cnc_dnc2", "cnc_dncend2"]
+        scene_start_apis = ["cnc_dncstart2"]
+    elif transfer_scene:
         version = "4" if str(target).endswith("4") else "3"
-        auxiliary_apis = ["cnc_rdprogdir3", f"cnc_dwnstart{version}", f"cnc_dwnend{version}"]
-        scene_start_apis = ["cnc_rdprogdir3"]
+        upload = dependencies.get("transfer_direction") == "upload_existing"
+        prefix = "up" if upload else "dwn"
+        data_api = f"cnc_{'upload' if upload else 'download'}{version}"
+        start_api = f"cnc_{prefix}start{version}"
+        end_api = f"cnc_{prefix}end{version}"
+        auxiliary_apis = ["cnc_rdprogdir3", start_api, end_api]
+        required_auxiliary_apis = [start_api, end_api]
+        optional_auxiliary_apis = ["cnc_rdprogdir3"]
+        session_chain = [start_api, data_api, end_api]
+        scene_start_apis = [start_api]
     elif skip_scene:
         auxiliary_apis = ["cnc_rdaxisname"]
+        required_auxiliary_apis = []
+        optional_auxiliary_apis = []
+        session_chain = []
         scene_start_apis = [target]
     elif dynamic_motion:
         auxiliary_apis = ["cnc_statinfo"]
+        required_auxiliary_apis = ["cnc_statinfo"]
+        optional_auxiliary_apis = []
+        session_chain = []
         scene_start_apis = ["cnc_statinfo"]
     else:
         auxiliary_apis = []
+        required_auxiliary_apis = []
+        optional_auxiliary_apis = []
+        session_chain = []
         scene_start_apis = [target] if read_only_observation else []
+    selected_capability = dict(selected or {})
+    if transfer_scene and selected_capability:
+        # The capability catalog describes the generic program-transfer
+        # operation.  Bind its API list to the target's ABI version before it
+        # reaches Planner/Generator; otherwise a v4 target can inherit the
+        # v3 start/data/end names from the generic catalog.
+        selected_capability["transfer_version"] = version
+        selected_capability["tools_or_apis"] = [
+            "cnc_rdprogdir3", start_api, data_api, end_api,
+        ]
+        selected_capability["session_chain"] = list(session_chain)
+        selected_capability["data_repeatable"] = True
+        selected_capability["version_binding"] = "target_api_suffix"
     return {
         "target_api": target,
         "output_dependency_analysis": dependencies,
+        "transfer_direction": dependencies.get("transfer_direction") if transfer_scene else None,
         "variation_requirements": variation,
-        "selected_capability": selected or {},
+        "selected_capability": selected_capability,
         "scene_type": "axis_input_variation" if skip_scene else dependencies["dependency_kind"],
         "selection_reason": "vary the documented axis input using the controller-reported axis count; no NC program or SKIP event is required for the read call" if skip_scene else
             "prefer documented input variation and read-only observation before state-changing scenes",
         "auxiliary_apis": auxiliary_apis,
+        "required_auxiliary_apis": required_auxiliary_apis,
+        "optional_auxiliary_apis": optional_auxiliary_apis,
+        "session_chain": session_chain,
+        "data_repeatable": bool(transfer_scene),
+        "directory_discovery_required": False if transfer_scene else None,
         "before": (["read controlled-axis names and count with cnc_rdaxisname"]
                    if skip_scene else ["verify applicable prerequisites"]),
         "during": (["call cnc_skip with documented aggregate and controller-reported single-axis selectors"]
                    if skip_scene else ["call target at planned observation points"]),
         "after": ["retain real API/PCAP data and report undiscovered axes"] if skip_scene else ["read back and verify actual state"],
-        "nc_program_required": False if skip_scene else (False if read_only_observation else (True if dynamic_motion else None)),
-        "nc_program_spec": "not required for documented axis-input variation" if skip_scene else "only when a verified scene requires NC execution",
+        "nc_program_required": False if skip_scene else (True if dnc_scene else (False if read_only_observation else (True if dynamic_motion else None))),
+        "nc_program_spec": "not required for documented axis-input variation" if skip_scene else ("conditional: upload/validate a bounded NC program only as preparation for an authorized M198/DNC activation; upload alone does not start the session" if dnc_scene else "only when a verified scene requires NC execution"),
+        "followup_on_reject": dependencies.get("followup_on_reject") if dnc_scene else None,
         "target_sampling_phase": ["during"],
         "scene_start_apis": scene_start_apis,
         "operation_apis": scene_start_apis,
@@ -363,6 +634,8 @@ def build_scene_capability_plan(target: str, capabilities: Iterable[dict[str, An
         "execution_policy": (
             "read_only_axis_input_variation"
             if skip_scene else
+            "observe_then_authorized_dnc_activation"
+            if dnc_scene else
             "plan_only_until_nc_simulation_capability_is_verified"
             if dynamic_motion else "execute_only_when_preconditions_are_verified"
         ),

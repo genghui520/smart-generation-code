@@ -159,6 +159,7 @@ def build_protocol_transactions(
     tcp_payloads: list[TcpPayload],
     *,
     focas_port: int = 8193,
+    capture_metadata: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Map payloads to non-overlapping API call intervals.
 
@@ -170,6 +171,10 @@ def build_protocol_transactions(
     invocation_id_counts = Counter(str(row.get("invocation_id") or "") for row in rows)
     transaction_id_counts = Counter(str(row.get("transaction_id") or "") for row in rows)
     packet_owners: dict[int, list[int]] = {}
+    endpoint_packets = [
+        packet for packet in tcp_payloads
+        if packet.source_port == focas_port or packet.destination_port == focas_port
+    ]
     for packet_index, packet in enumerate(tcp_payloads):
         if packet.source_port != focas_port and packet.destination_port != focas_port:
             continue
@@ -193,6 +198,16 @@ def build_protocol_transactions(
             for index, owners in packet_owners.items()
             if owners == [invocation_order]
         ]
+        endpoint_packet_count = len(endpoint_packets)
+        window_packet_count = sum(
+            1
+            for packet in endpoint_packets
+            if start_ns > 0 and start_ns <= packet.timestamp_ns <= end_ns
+        )
+        before_packets = [packet.timestamp_ns for packet in endpoint_packets if start_ns > 0 and packet.timestamp_ns < start_ns]
+        after_packets = [packet.timestamp_ns for packet in endpoint_packets if end_ns > 0 and packet.timestamp_ns > end_ns]
+        nearest_before_ns = max(before_packets) if before_packets else None
+        nearest_after_ns = min(after_packets) if after_packets else None
         packets = [tcp_payloads[index] for index in candidate_indexes]
         # Each socket has independent sequence spaces. Connection allocation
         # can exchange data on multiple sockets during one library invocation.
@@ -238,6 +253,26 @@ def build_protocol_transactions(
         for message_order, message in enumerate(messages):
             message["message_order"] = message_order
         transaction_id = candidate_transaction_id if associated else None
+        if associated:
+            association_reason = "matched_request_response"
+        elif any(len(owners) > 1 and invocation_order in owners for owners in packet_owners.values()):
+            association_reason = "overlapping_invocation_windows"
+        elif not window_packet_count:
+            association_reason = (
+                "no_endpoint_packets_in_invocation_window"
+                if endpoint_packet_count
+                else "no_endpoint_packets_in_capture"
+            )
+        elif not streams:
+            association_reason = "exclusive_packet_ownership_failed"
+        elif not correct_order or not all(
+            stream["request_payload_hex"] and stream["response_payload_hex"] for stream in streams
+        ):
+            association_reason = "incomplete_request_response_exchange"
+        elif not invocation_id or not candidate_transaction_id:
+            association_reason = "missing_invocation_or_candidate_transaction_id"
+        else:
+            association_reason = "request_response_association_failed"
         record = {
             "transaction_id": transaction_id,
             "candidate_transaction_id": candidate_transaction_id or None,
@@ -266,6 +301,18 @@ def build_protocol_transactions(
             "request_payload_hex": streams[0]["request_payload_hex"] if associated and len(streams) == 1 else None,
             "response_payload_hex": streams[0]["response_payload_hex"] if associated and len(streams) == 1 else None,
             "tcp_streams": streams,
+            "wire_evidence_diagnostic": {
+                "focas_port": focas_port,
+                "endpoint_packet_count": endpoint_packet_count,
+                "invocation_window_packet_count": window_packet_count,
+                "exclusive_packet_count": len(packets),
+                "association_reason": association_reason,
+                "nearest_endpoint_packet_before_ns": nearest_before_ns,
+                "nearest_endpoint_packet_after_ns": nearest_after_ns,
+                "window_start_gap_ns": (start_ns - nearest_before_ns) if nearest_before_ns is not None else None,
+                "window_end_gap_ns": (nearest_after_ns - end_ns) if nearest_after_ns is not None else None,
+                **(capture_metadata or {}).get(api, {}),
+            },
             "annotation": row.get("annotation"),
             "traffic_status": "matched" if associated else (
                 "ambiguous_overlapping_invocation_windows"

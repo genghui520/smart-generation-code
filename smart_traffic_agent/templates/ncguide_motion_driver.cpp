@@ -46,7 +46,7 @@ static short wait_runtime_ready(FocasApi& api, unsigned short handle, CaptureCon
             }
             ctx.block("CycleStart", "controller_alarm_or_emergency"); return 12;
         }
-        bool ready = runtime_ready(status) && (!completion || status.run == 0 || status.run == 1);
+        bool ready = runtime_ready(status) && (!completion || status.run == 0);
         stable = ready ? stable + 1 : 0;
         if (stable == 3) {
             ctx.host(completion ? "program_completion_gate" : "cycle_start_ready_gate", 0, "EW_OK",

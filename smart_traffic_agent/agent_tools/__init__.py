@@ -14,6 +14,7 @@ from .cpp_execution import (
 )
 from .knowledge import KnowledgeSearchInput, KnowledgeSearchOutput, KnowledgeSearchTool
 from .sdk_search import FocasSdkSearchInput, FocasSdkSearchOutput, FocasSdkSearchTool
+from .sdk_type_contract import SdkTypeContractInput, GetSdkTypeContractTool
 from .memory import MemorySearchInput, MemorySearchTool, RememberWorkflowTool
 from .artifacts import WriteGeneratedArtifactInput, WriteGeneratedArtifactOutput, WriteGeneratedArtifactTool
 from .render_focas_cpp import RenderFocasCppInput, RenderFocasCppOutput, RenderFocasCppTool
@@ -22,19 +23,25 @@ from .traffic_graph import (
     AgentExperienceInput,
     ApiNameInput,
     ChainInput,
+    DependencyPlanInput,
     DiscoverParameterInput,
     FilterParameterInput,
     GenerateCombinationsInput,
+    SelectParameterInput,
     GetAgentExperienceTool,
     GetApiDependenciesTool,
     GetApiInfoTool,
     GetParameterRulesTool,
     GetTrafficChainTool,
+    GetDependencyPlanTool,
     GenerateParameterCombinationsTool,
+    SelectParameterValuesTool,
     DiscoverParameterValuesTool,
     FilterParameterCandidatesTool,
     ProposeRelationInput,
     ProposeTrafficRelationTool,
+    RecordTrafficRelationsInput,
+    RecordTrafficRelationsTool,
     SubmitAgentExperienceTool,
     ValidateChainInput,
     ValidateTrafficChainTool,
@@ -61,6 +68,7 @@ __all__ = [
     "FocasSdkSearchInput",
     "FocasSdkSearchOutput",
     "FocasSdkSearchTool",
+    "SdkTypeContractInput", "GetSdkTypeContractTool",
     "MemorySearchInput",
     "MemorySearchTool",
     "RememberWorkflowTool",
@@ -73,11 +81,11 @@ __all__ = [
     "ValidateFocasCppInput",
     "ValidateFocasCppOutput",
     "ValidateFocasCppTool",
-    "AgentExperienceInput", "ApiNameInput", "ChainInput", "DiscoverParameterInput",
+    "AgentExperienceInput", "ApiNameInput", "ChainInput", "DependencyPlanInput", "DiscoverParameterInput",
     "FilterParameterInput", "GenerateCombinationsInput", "GetAgentExperienceTool",
-    "GetApiDependenciesTool", "GetApiInfoTool", "GetParameterRulesTool", "GetTrafficChainTool",
-    "GenerateParameterCombinationsTool", "DiscoverParameterValuesTool", "FilterParameterCandidatesTool",
-    "ProposeRelationInput", "ProposeTrafficRelationTool", "SubmitAgentExperienceTool",
+    "GetApiDependenciesTool", "GetApiInfoTool", "GetParameterRulesTool", "GetTrafficChainTool", "GetDependencyPlanTool",
+    "GenerateParameterCombinationsTool", "SelectParameterInput", "SelectParameterValuesTool", "DiscoverParameterValuesTool", "FilterParameterCandidatesTool",
+    "ProposeRelationInput", "ProposeTrafficRelationTool", "RecordTrafficRelationsInput", "RecordTrafficRelationsTool", "SubmitAgentExperienceTool",
     "ValidateChainInput", "ValidateTrafficChainTool", "VerifyRelationInput", "VerifyTrafficRelationTool",
     "register_traffic_tools",
 ]

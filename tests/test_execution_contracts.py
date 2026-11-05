@@ -7,12 +7,13 @@ import unittest
 
 from smart_traffic_agent.execution_contracts import (
     analyze_api_interactions, dependency_closure, execution_contract,
-    normalize_lifecycle_steps,
+    api_sequence_rules, normalize_lifecycle_steps, program_operation_chain,
     validate_api_lifecycle_fragment,
 )
 from smart_traffic_agent.focas_capture_runtime import (
     guarded_core, motion_read_core, render_capture_harness,
     validate_production_source, wrap_capture_fragment,
+    _validate_write_snapshot_restore,
 )
 from smart_traffic_agent.integrations.ncguide import default_focas_header_dir
 from smart_traffic_agent.models import ExecutionPlan, NcProgramSpec, PlanStep
@@ -42,11 +43,25 @@ def step(name: str, phase: str = "during", interface: str = "ReadValue") -> Plan
 
 
 class ExecutionContractTests(unittest.TestCase):
+    def test_rdparar_contract_includes_live_parameter_discovery(self):
+        contract = execution_contract(
+            plan(step("cnc_rdparar"), targets=("cnc_rdparar",))
+        )
+        self.assertIn("cnc_sysinfo", contract.functions)
+        self.assertIn("cnc_rdparanum", contract.functions)
+        self.assertIn("cnc_rdparainfo", contract.functions)
+
     def test_read_target_is_not_forced_into_motion_by_scenario_label(self):
         contract = execution_contract(plan(step("cnc_rdparam"), targets=("cnc_rdparam",)))
         self.assertFalse(contract.motion)
         self.assertEqual(contract.targets, ("cnc_rdparam",))
         self.assertNotIn("cnc_download3", contract.functions)
+
+    def test_declared_plan_target_overrides_stale_coverage_manifest(self):
+        candidate = plan(step("cnc_wrrelpos"), targets=("cnc_tofs_rnge",))
+        candidate.target_api = "cnc_wrrelpos"
+        contract = execution_contract(candidate)
+        self.assertEqual(contract.targets, ("cnc_wrrelpos",))
 
     def test_motion_comes_from_operation_and_does_not_replace_target(self):
         contract = execution_contract(plan(
@@ -130,6 +145,58 @@ class ExecutionContractTests(unittest.TestCase):
         auto end = ctx.call("E", "cnc_dwnend4", "", api.cnc_dwnend4,
             [&]{ return api.cnc_dwnend4(handle); }, [](short){ return ""; });'''
         self.assertEqual(validate_api_lifecycle_fragment(fragment), [])
+
+    def test_program_transfer_sequences_expose_upload_and_download_chains(self):
+        rows = api_sequence_rules(("cnc_upload3", "cnc_download3"))
+        self.assertIn({"cnc_upstart3", "cnc_upload3", "cnc_upend3"},
+                      [set(row["calls"]) for row in rows])
+        self.assertIn({"cnc_dwnstart3", "cnc_download3", "cnc_dwnend3"},
+                      [set(row["calls"]) for row in rows])
+        upload_interaction = analyze_api_interactions(["cnc_upload3"])["cnc_upload3"]
+        self.assertEqual(upload_interaction["before"], ["cnc_upstart3"])
+        self.assertEqual(upload_interaction["optional_before"], ["cnc_rdprogdir3"])
+        self.assertIsNone(program_operation_chain("cnc_rdprogdir3"))
+
+    def test_upload_lifecycle_requires_start_and_end(self):
+        missing_start = r'''auto data = ctx.call("D", "cnc_upload3", "", api.cnc_upload3,
+            [&]{ return api.cnc_upload3(handle, &len, buffer); }, [](short){ return ""; });
+        auto end = ctx.call("E", "cnc_upend3", "", api.cnc_upend3,
+            [&]{ return api.cnc_upend3(handle); }, [](short){ return ""; });'''
+        errors = validate_api_lifecycle_fragment(missing_start)
+        self.assertTrue(any("requires matching cnc_upstart3" in error for error in errors))
+
+        valid = r'''short start_rc = ctx.call("S", "cnc_upstart3", "", api.cnc_upstart3,
+            [&]{ return api.cnc_upstart3(handle, 0, program, program); }, [](short){ return ""; });
+        if (start_rc != EW_OK) return start_rc;
+        auto data = ctx.call("D", "cnc_upload3", "", api.cnc_upload3,
+            [&]{ return api.cnc_upload3(handle, &len, buffer); }, [](short){ return ""; });
+        auto end = ctx.call("E", "cnc_upend3", "", api.cnc_upend3,
+            [&]{ return api.cnc_upend3(handle); }, [](short){ return ""; });'''
+        self.assertEqual(validate_api_lifecycle_fragment(valid), [])
+
+    def test_upload_lifecycle_rejects_zero_program_numbers(self):
+        fragment = r'''short start_rc = ctx.call("S", "cnc_upstart3", "", api.cnc_upstart3,
+            [&]{ return api.cnc_upstart3(handle, 0, 0, 0); }, [](short){ return ""; });
+        if (start_rc != EW_OK) return start_rc;
+        auto data = ctx.call("D", "cnc_upload3", "", api.cnc_upload3,
+            [&]{ return api.cnc_upload3(handle, &len, buffer); }, [](short){ return ""; });
+        auto end = ctx.call("E", "cnc_upend3", "", api.cnc_upend3,
+            [&]{ return api.cnc_upend3(handle); }, [](short){ return ""; });'''
+        errors = validate_api_lifecycle_fragment(fragment)
+        self.assertTrue(any("s_number" in error and "literal zero" in error for error in errors))
+        self.assertTrue(any("e_number" in error and "literal zero" in error for error in errors))
+
+    def test_upload_lifecycle_rejects_zero_initialized_selection(self):
+        fragment = r'''const long selected = 0;
+        short start_rc = ctx.call("S", "cnc_upstart3", "", api.cnc_upstart3,
+            [&]{ return api.cnc_upstart3(handle, 0, selected, selected); }, [](short){ return ""; });
+        if (start_rc != EW_OK) return start_rc;
+        auto data = ctx.call("D", "cnc_upload3", "", api.cnc_upload3,
+            [&]{ return api.cnc_upload3(handle, &len, buffer); }, [](short){ return ""; });
+        auto end = ctx.call("E", "cnc_upend3", "", api.cnc_upend3,
+            [&]{ return api.cnc_upend3(handle); }, [](short){ return ""; });'''
+        errors = validate_api_lifecycle_fragment(fragment)
+        self.assertTrue(any("initialized to zero" in error for error in errors))
 
     def test_lifecycle_validator_rejects_dnc_calls_outside_success_gate(self):
         fragment = r'''short start_rc = ctx.call("S", "cnc_dncstart2", "", api.cnc_dncstart2,
@@ -243,6 +310,91 @@ int main() {
         errors = validate_production_source(source + "\n// framework_owned", fragment, header, contract, NC)
         self.assertTrue(any("differs from the framework" in item for item in errors))
         self.assertTrue(any("no logged invocation" in item for item in errors))
+
+    def test_unplanned_reset_and_alarm_clear_are_rejected(self):
+        header_file = default_focas_header_dir() / "Fwlib32.h"
+        if not header_file.is_file():
+            self.skipTest("FOCAS SDK header not installed")
+        header = header_file.read_text(encoding="latin-1")
+        contract = execution_contract(plan(step("cnc_statinfo"), targets=("cnc_statinfo",)))
+        self.assertEqual(contract.planned_functions, ("cnc_statinfo",))
+        fragment = wrap_capture_fragment(
+            'ctx.call("TARGET", "cnc_statinfo", "", api.cnc_statinfo, '
+            '[&]{ return api.cnc_statinfo(handle, nullptr); }, [](short){ return ""; });\n'
+            'ctx.call("RECOVERY", "cnc_reset", "", api.cnc_reset, '
+            '[&]{ return api.cnc_reset(handle); }, [](short){ return ""; });'
+        )
+        source = render_capture_harness(contract.functions, header, fragment, contract=contract, nc_program="")
+        errors = validate_production_source(source, fragment, header, contract, "")
+        self.assertTrue(any("unplanned API call cnc_reset" in item for item in errors))
+
+    def test_unresolved_call_placeholder_is_blocked_for_multiple_targets(self):
+        header_file = default_focas_header_dir() / "Fwlib32.h"
+        if not header_file.is_file():
+            self.skipTest("FOCAS SDK header not installed")
+        header = header_file.read_text(encoding="latin-1")
+        for target in ("cnc_wrpm_item", "cnc_sysinfo_ex"):
+            with self.subTest(target=target):
+                contract = execution_contract(plan(step(target), targets=(target,)))
+                fragment = wrap_capture_fragment(
+                    f'ctx.call("TARGET", "{target}", "", api.function, '
+                    f'[&]{{ return api.function(handle); }}, [](short){{ return ""; }});'
+                )
+                source = render_capture_harness(contract.functions, header, fragment, contract=contract, nc_program="")
+                errors = validate_production_source(source, fragment, header, contract, "")
+                self.assertTrue(any("unresolved production call placeholder" in item for item in errors))
+                self.assertTrue(any("no logged invocation paired" in item for item in errors))
+
+    def test_target_name_in_log_without_real_call_is_blocked(self):
+        header_file = default_focas_header_dir() / "Fwlib32.h"
+        if not header_file.is_file():
+            self.skipTest("FOCAS SDK header not installed")
+        header = header_file.read_text(encoding="latin-1")
+        contract = execution_contract(plan(step("cnc_sysinfo_ex"), targets=("cnc_sysinfo_ex",)))
+        fragment = wrap_capture_fragment(
+            'ctx.call("TARGET_cnc_sysinfo_ex", "cnc_sysinfo_ex", "", '
+            'api.cnc_statinfo, [&]{ return api.cnc_statinfo(handle, nullptr); }, [](short){ return ""; });'
+        )
+        source = render_capture_harness(contract.functions, header, fragment, contract=contract, nc_program="")
+        errors = validate_production_source(source, fragment, header, contract, "")
+        self.assertTrue(any("no logged invocation paired" in item for item in errors))
+
+    def test_write_requires_real_snapshot_and_restore_value(self):
+        fragment = (
+            'api.cnc_rdparam(handle, 1, 0, &before); '
+            'api.cnc_wrparam(handle, 1, 0, &changed); '
+            'api.cnc_rdparam(handle, 1, 0, &after);'
+        )
+        errors = _validate_write_snapshot_restore(fragment, ("cnc_wrparam",))
+        self.assertTrue(any("second call" in item for item in errors))
+
+        zero_restore = (
+            'api.cnc_rdparam(handle, 1, 0, &before); '
+            'api.cnc_wrparam(handle, 1, 0, &changed); '
+            'api.cnc_rdparam(handle, 1, 0, &after); '
+            'ODBPARA restore{}; restore.data = 0; '
+            'api.cnc_wrparam(handle, 1, 0, &restore); '
+            'api.cnc_rdparam(handle, 1, 0, &verified);'
+        )
+        zero_errors = _validate_write_snapshot_restore(zero_restore, ("cnc_wrparam",))
+        self.assertTrue(any("zero-valued restore" in item for item in zero_errors))
+
+    def test_wrrelpos_uses_documented_relative_read_api(self):
+        interaction = analyze_api_interactions(["cnc_wrrelpos"])["cnc_wrrelpos"]
+        self.assertEqual(interaction["before"], [])
+        self.assertEqual(interaction["after"], [])
+        fragment = (
+            "api.cnc_wrrelpos(handle, sizeof(IDBWRR), &changed);"
+        )
+        errors = _validate_write_snapshot_restore(fragment, ("cnc_wrrelpos",))
+        self.assertFalse(errors)
+
+    def test_write_without_read_pair_is_safely_blocked(self):
+        errors = _validate_write_snapshot_restore(
+            'api.cnc_wrpm_item(handle, 1, 2, 1, &item);',
+            ("cnc_wrpm_item",),
+        )
+        self.assertTrue(any("requires a real cnc_rdpm_item" in item for item in errors))
 
 
 if __name__ == "__main__":

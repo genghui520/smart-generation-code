@@ -45,11 +45,74 @@ CONTROLLER_MODELS = {
     "Power Mate i-H": "pmih", "Power Mate i-D": "pmid", "Power Motion i-A": "pmia",
 }
 
+# F0i-D scope is deliberately derived from the two authoritative local
+# sources.  The compatibility matrix contains APIs that are not in the
+# current Manifest (for example Ethernet/PMC families), while the Manifest
+# also contains APIs for other controller families.  The intersection is the
+# only valid target universe for this device in the capture workflow.
+F0ID_MODEL = "0i-D"
+F0ID_SCOPE_ID = "fanuc:0i-D"
+F0ID_COMPATIBILITY_COLUMN = "e0id"
+
 
 @lru_cache(maxsize=1)
 def compatibility_data():
     path = Path(__file__).resolve().parents[1] / "rag_indexes/focas/api_compatibility.json"
     return json.loads(path.read_text(encoding="utf-8"))["functions"]
+
+
+def _manifest_function_names(manifest_rows=None):
+    if manifest_rows is None:
+        path = Path(__file__).resolve().parents[1] / "rag_indexes/focas/function_manifest.jsonl"
+        try:
+            rows = (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+        except (OSError, json.JSONDecodeError):
+            return set()
+    else:
+        rows = manifest_rows
+    return {
+        str(row.get("function", "")).strip()
+        for row in rows
+        if isinstance(row, dict) and str(row.get("function", "")).strip()
+    }
+
+
+@lru_cache(maxsize=1)
+def _default_f0id_api_names():
+    return _f0id_api_names(None)
+
+
+def _f0id_api_names(manifest_rows=None):
+    """Return the exact F0i-D target set: Manifest functions with e0id=O.
+
+    ``manifest_rows`` is accepted for callers/tests that already loaded a
+    custom manifest.  The cached default path is used by production callers.
+    Compatibility is never inferred from an API name or from header symbols.
+    """
+    manifest_names = _manifest_function_names(manifest_rows)
+    compatible = {
+        str(name).strip()
+        for name, row in compatibility_data().items()
+        if isinstance(row, dict) and str(row.get(F0ID_COMPATIBILITY_COLUMN, "")).upper() == "O"
+    }
+    return frozenset(manifest_names.intersection(compatible))
+
+
+def f0id_api_names(manifest_rows=None):
+    return _default_f0id_api_names() if manifest_rows is None else _f0id_api_names(manifest_rows)
+
+
+def f0id_scope_metadata(manifest_rows=None):
+    names = f0id_api_names(manifest_rows)
+    return {
+        "scope_id": F0ID_SCOPE_ID,
+        "device_model": F0ID_MODEL,
+        "compatibility_column": F0ID_COMPATIBILITY_COLUMN,
+        "source_manifest": "rag_indexes/focas/function_manifest.jsonl",
+        "source_compatibility": "rag_indexes/focas/api_compatibility.json",
+        "api_count": len(names),
+        "api_names": sorted(names),
+    }
 
 
 def unavailable_reason(function, config):

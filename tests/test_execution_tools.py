@@ -13,7 +13,13 @@ from smart_traffic_agent.agent_tools import (
     RunExecutableOutput,
     RunGeneratedExecutableTool,
 )
-from smart_traffic_agent.agents.executor import ExecutionAgent, generated_cpp_log_is_nonfatal
+from smart_traffic_agent.agents.executor import (
+    ExecutionAgent,
+    classify_collection_status,
+    collection_status_fields,
+    execution_timeout_for_source,
+    generated_cpp_log_is_nonfatal,
+)
 from smart_traffic_agent.models import (
     ApiCallLog,
     ExecutionPlan,
@@ -28,6 +34,7 @@ from smart_traffic_agent.agent_tools.cpp_execution import (
     pcap_sdk_include_paths,
     pcap_sdk_lib_paths,
     read_cpp_csv_logs,
+    parameter_payload_only,
     safe_csv_filename,
     validate_pcap_artifacts,
 )
@@ -49,6 +56,100 @@ class RecordingCompileTool(CompileGeneratedCppTool):
             executable_path=tool_input.executable_path,
             command=["cl.exe"],
         )
+
+
+def test_parameter_payload_excludes_focas_session_handle_only():
+    assert parameter_payload_only("FlibHndl=32769;number=8132;type=0") == "number=8132;type=0"
+    # A domain field named ``handle`` is not implicitly the FOCAS library
+    # handle and must remain available to API-specific consumers.
+    assert parameter_payload_only("handle=1;axis=0") == "handle=1;axis=0"
+
+
+def test_remote_operator_gate_waits_for_manual_verification():
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "remote.cpp"
+        source.write_text(
+            'ctx.wait_for_operator(api, handle, "remote", "selected_DNC_APIs");',
+            encoding="utf-8",
+        )
+        assert execution_timeout_for_source(source) is None
+
+        mode_source = Path(tmp) / "mode.cpp"
+        mode_source.write_text(
+            'ctx.wait_for_cnc_mode(api, handle, 10, "REMOTE", "selected_DNC_APIs");',
+            encoding="utf-8",
+        )
+        assert execution_timeout_for_source(mode_source) is None
+
+        ordinary = Path(tmp) / "ordinary.cpp"
+        ordinary.write_text("return 0;", encoding="utf-8")
+        assert execution_timeout_for_source(ordinary) == 600
+
+
+def test_dncstart2_expected_negative_observation_is_nonfatal_when_matched():
+    log = ApiCallLog(
+        timestamp="t", task_id="batch", step_id="TARGET_CNC_DNCSTART2",
+        phase="during", interface_name="cnc_dncstart2", input_parameters={},
+        status_code=13, response={"return_text": "EW_REJECT"},
+        protocol_function="cnc_dncstart2", error="EW_REJECT",
+        traffic_status="matched",
+    )
+    assert generated_cpp_log_is_nonfatal(log)
+    log.traffic_status = "no_corresponding_traffic"
+    assert not generated_cpp_log_is_nonfatal(log)
+
+
+def test_planned_expected_return_code_does_not_hide_successful_collection():
+    from smart_traffic_agent.models import PlanStep
+
+    state = WorkflowState(
+        request=TaskRequest(
+            description="expected negative branch",
+            task_id="expected-negative",
+            permissions={"required_api_functions": ["cnc_rdpm_item"]},
+        )
+    )
+    state.plan = ExecutionPlan(
+        plan_id="p",
+        task_id="expected-negative",
+        scenario_type="test",
+        scenario_goal="test expected error",
+        target_environment="ncguide-generated-cpp",
+        nc_program_type="test",
+        nc_program_requirements=[],
+        nc_program_spec=NcProgramSpec(program_name=""),
+        steps=[PlanStep(
+            step_id="S009",
+            phase="during",
+            action="invalid length probe",
+            interface_name="cnc_rdpm_item",
+            protocol_function="cnc_rdpm_item",
+            parameters={"expected_return_code": 2},
+        )],
+        expected_outputs=[],
+    )
+    logs = [
+        ApiCallLog(
+            timestamp="t", task_id="expected-negative", step_id="S001",
+            phase="during", interface_name="cnc_rdpm_item",
+            input_parameters={"raw": "start_num=1;data_num=1"},
+            status_code=0, response={}, protocol_function="cnc_rdpm_item",
+            traffic_status="matched",
+        ),
+        ApiCallLog(
+            timestamp="t", task_id="expected-negative", step_id="S009",
+            phase="during", interface_name="cnc_rdpm_item",
+            input_parameters={"raw": "start_num=1;data_num=0;expected_return_code=2"},
+            status_code=2, response={"return_text": "EW_LENGTH"},
+            protocol_function="cnc_rdpm_item", error="EW_LENGTH",
+            traffic_status="matched",
+        ),
+    ]
+    status, evidence = classify_collection_status(state, logs, True)
+    assert status == "collected"
+    assert evidence["target_apis_with_wire_evidence"] == ["cnc_rdpm_item"]
+    fields = collection_status_fields(state, logs, True, status)
+    assert fields["api_execution_status"] == "success"
 
 
 class RecordingRunTool(RunGeneratedExecutableTool):

@@ -74,6 +74,18 @@ class ToolProtocolTests(unittest.TestCase):
 
         self.assertEqual(tool_calls_from_step(step), [])
 
+    def test_planner_explanation_saying_no_call_is_not_split_into_fake_tools(self) -> None:
+        step = PlanStep(
+            "S-NONE", "before", "inspect prototype", "FOCAS",
+            protocol_function="none (Fwlib32.h prototype; DLL export; counterpart resolution)",
+            api_calls=[
+                {"call_id": "call-01-01", "protocol_function": "none"},
+                {"call_id": "call-01-02", "protocol_function": "DLL export"},
+                {"call_id": "call-02", "protocol_function": "no FOCAS call"},
+            ],
+        )
+        self.assertEqual(tool_calls_from_step(step), [])
+
 
 if __name__ == "__main__":
     unittest.main()

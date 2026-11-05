@@ -59,6 +59,16 @@ class PlanStep:
     protocol_function: str = ""
     operation_kind: Literal["focas_api", "focas_sequence", "host_helper", "ncguide_ui"] = "focas_api"
     api_calls: list[dict[str, Any]] = field(default_factory=list)
+    # Structured execution-plan fields.  The legacy fields above remain the
+    # source-compatible interface used by existing templates and tests.
+    api: str = ""
+    role: Literal["target", "auxiliary"] = "auxiliary"
+    parameter_sources: list[dict[str, Any]] = field(default_factory=list)
+    dependencies: list[dict[str, Any]] = field(default_factory=list)
+    required_inputs: list[dict[str, Any]] = field(default_factory=list)
+    outputs: list[dict[str, Any]] = field(default_factory=list)
+    failure_policy: str = "block_dependents"
+    blocks_dependents: bool = True
 
 
 @dataclass(slots=True)
@@ -86,6 +96,16 @@ class ExecutionPlan:
     rag_context: dict[str, Any] = field(default_factory=dict)
     llm_notes: list[str] = field(default_factory=list)
     code_spec: Any | None = None
+    # Versioned structured hand-off.  These fields are populated from the
+    # existing TRCM/RAG plan and are additive to the original schema.
+    target_api: str = ""
+    scenario: str = ""
+    dependencies: list[dict[str, Any]] = field(default_factory=list)
+    runtime_bindings: list[dict[str, Any]] = field(default_factory=list)
+    prerequisites: dict[str, Any] = field(default_factory=dict)
+    session: dict[str, Any] = field(default_factory=dict)
+    collection: dict[str, Any] = field(default_factory=dict)
+    schema_version: int = 2
 
 
 @dataclass(slots=True)
@@ -162,6 +182,50 @@ class ExecutionResult:
 
 
 @dataclass(slots=True)
+class ExecutionContext:
+    """Runtime values shared by dependent API calls and repair decisions.
+
+    The C++ harness remains responsible for the real call and value selection;
+    this Python context is the persisted evidence view used by later steps or
+    a bounded repair.  It never fabricates a value when an API did not return
+    one.
+    """
+
+    values_by_api: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    statuses_by_api: dict[str, list[int]] = field(default_factory=dict)
+    inputs_by_api: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    invocation_ids_by_api: dict[str, list[str]] = field(default_factory=dict)
+    evidence_by_step: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    selected_parameters: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
+    def record(self, log: ApiCallLog) -> None:
+        api = str(log.protocol_function or log.interface_name or "").strip()
+        if not api:
+            return
+        self.values_by_api.setdefault(api, []).append(dict(log.response or {}))
+        self.statuses_by_api.setdefault(api, []).append(int(log.status_code))
+        self.inputs_by_api.setdefault(api, []).append(dict(log.input_parameters or {}))
+        self.invocation_ids_by_api.setdefault(api, []).append(str(log.invocation_id or ""))
+        step_id = str(log.step_id or "").strip()
+        if step_id:
+            self.evidence_by_step.setdefault(step_id, []).append({
+                "api": api,
+                "invocation_id": str(log.invocation_id or ""),
+                "status_code": int(log.status_code),
+                "input": dict(log.input_parameters or {}),
+                "output": dict(log.response or {}),
+                "transaction_id": log.transaction_id,
+                "start_timestamp_ns": log.start_timestamp_ns,
+                "end_timestamp_ns": log.end_timestamp_ns,
+                "traffic_status": log.traffic_status,
+            })
+
+    def successful_apis(self) -> set[str]:
+        return {api for api, statuses in self.statuses_by_api.items() if any(status == 0 for status in statuses)}
+
+
+@dataclass(slots=True)
 class QualityAssessment:
     passed: bool
     issues: list[str] = field(default_factory=list)
@@ -199,6 +263,7 @@ class WorkflowState:
     long_term_memories: list[dict[str, Any]] = field(default_factory=list)
     messages: list[dict[str, Any]] = field(default_factory=list)
     tool_call_history: list[ToolCallRecord] = field(default_factory=list)
+    execution_context: ExecutionContext = field(default_factory=ExecutionContext)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

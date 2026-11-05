@@ -16,8 +16,10 @@ from .focas_contracts import _api_docs, documented_parameter_names, named_protot
 from .function_coverage import is_non_wire_observable
 from .scenario_capabilities import analyze_output_dependencies
 from .traffic_transactions import valid_session_segment_evidence
+from .pmc_parameter_profiles import PMC_RANGE_PROFILES, pmc_profile_inputs
 
 KEY = "parameter_coverage_contract"
+MAX_PARAMETER_CONFIGURATIONS = 20
 # These values must be logged, but changing them is not semantic API diversity.
 TRANSPORT = {"flibhndl", "handle", "library_handle", "ipaddr", "port", "timeout"}
 SHAPE = {"length", "len", "size", "capacity", "data_len", "bufsize", "buffer_size"}
@@ -93,12 +95,62 @@ def build_parameter_contract(plan, targets=()) -> dict:
         for scene in (plan.rag_context.get("scene_plans", []) if plan else [])
         if isinstance(scene, dict) and scene.get("target_api")
     }
+    explicit_variations = (
+        (plan.rag_context.get("variation_contract", {}) or {}).get("targets", {})
+        if plan else {}
+    )
     for function in functions:
         schema = input_schema(function)
-        variation = scene_variations.get(function)
+        # Read and write range APIs share the same documented coupled PMC
+        # profiles. A write API must not be collapsed to one candidate just
+        # because its operation kind is state changing.
+        pmc_profiles = list(PMC_RANGE_PROFILES) if function in {"pmc_rdpmcrng", "pmc_wrpmcrng"} else []
+        variation = explicit_variations.get(function) or scene_variations.get(function)
         if not variation:
             variation = analyze_output_dependencies(function).get("variation_requirements", {})
+        if function in {"pmc_rdpmcrng", "pmc_wrpmcrng"}:
+            # A scene label must not downgrade the documented four-shape PMC
+            # domain to call_only. Both APIs use the same profile set; writes
+            # retain their SDK snapshot/readback/restore constraints.
+            variation = {
+                **variation,
+                "variation_class": "input_and_response",
+                "input_diversity": {
+                    "applicable": True,
+                    "required": True,
+                    "reason": "four documented IODBPMC address/type/length profiles",
+                },
+            }
         strategies, cases, constraints, goals, states = [], [], [], [], []
+        filtered_candidates: dict[str, Any] = {}
+        if function == "cnc_prstwkcd":
+            # Planner's audited parameter tools own this domain.  Keep a
+            # compatibility fallback only for direct unit callers that build a
+            # plan without running Planner; production workflow data must come
+            # from traffic_relationships/runtime_parameter_bindings.
+            traffic = (plan.rag_context.get("traffic_relationships", {})
+                       if plan and isinstance(plan.rag_context, dict) else {})
+            facts = (traffic.get("apis", {}) or {}).get(function, {}) if isinstance(traffic, dict) else {}
+            tool_selections = facts.get("parameter_selections", {}) if isinstance(facts, dict) else {}
+            type_selection = tool_selections.get("type", {}) if isinstance(tool_selections, dict) else {}
+            values = type_selection.get("selected", []) if isinstance(type_selection, dict) else []
+            if not values:
+                runtime = (plan.rag_context.get("runtime_parameter_bindings", {})
+                           if plan and isinstance(plan.rag_context, dict) else {})
+                row = runtime.get(function, {}) if isinstance(runtime, dict) else {}
+                selections = row.get("parameter_selections", {}) if isinstance(row, dict) else {}
+                type_selection = selections.get("type", {}) if isinstance(selections, dict) else {}
+                values = type_selection.get("selected", []) if isinstance(type_selection, dict) else []
+            if values:
+                filtered_candidates["type"] = {
+                    "candidates": list(values),
+                    "excluded": list(type_selection.get("excluded", [])) if isinstance(type_selection, dict) else [],
+                    "success": bool(type_selection.get("success", True)) if isinstance(type_selection, dict) else True,
+                    "source": list(type_selection.get("source", [])) if isinstance(type_selection, dict) else [],
+                    "tool_chain": ["filter_parameter_candidates", "generate_parameter_combinations"],
+                }
+                for value in values:
+                    cases.append({"type": value})
         for step in plan.steps:
             names = step_functions(step)
             if function not in names:
@@ -123,6 +175,32 @@ def build_parameter_contract(plan, targets=()) -> dict:
                         case = {k: v for k, v in params.items() if k in schema["inputs"]}
                         if case:
                             cases.append(case)
+            bound = step.parameters.get("bound_parameters", {})
+            if isinstance(bound, dict) and (function in names or len(names) == 1):
+                # Runtime filters are already validated by the deterministic
+                # binding tool. Preserve every legal value as an explicit
+                # case so the next CodeGenerationAgent pass can enumerate it
+                # without asking PlanningAgent to re-plan.
+                for name, values in bound.items():
+                    if name not in schema["inputs"] or not isinstance(values, (list, tuple)):
+                        continue
+                    for value in values:
+                        cases.append({name: value})
+        # Runtime binding is an execution artifact. Keep the static plan
+        # unchanged and expose the selected cases through the same contract
+        # consumed by CodeGenerationAgent on the next pass.
+        runtime_results = (plan.rag_context.get("runtime_parameter_bindings", {})
+                           if plan and isinstance(plan.rag_context, dict) else {})
+        runtime_row = runtime_results.get(function) if isinstance(runtime_results, dict) else None
+        if isinstance(runtime_row, dict):
+            selections = runtime_row.get("parameter_selections", {})
+            if isinstance(selections, dict):
+                for name, selection in selections.items():
+                    if not isinstance(selection, dict) or not isinstance(selection.get("selected"), list):
+                        continue
+                    for value in selection["selected"]:
+                        if str(name) in schema["inputs"]:
+                            cases.append({str(name): value})
         expected, minimum_values, ranges = {}, {}, {}
         for row in strategies:
             name = str(row.get("name", ""))
@@ -137,6 +215,27 @@ def build_parameter_contract(plan, targets=()) -> dict:
                         minimum_values[name] = max(minimum_values.get(name, 1), 3 if has_interior else 2)
                         if has_interior:
                             ranges.setdefault(name, []).append((low, high))
+        # PMC range reads have a documented, coupled IODBPMC domain.  Keep
+        # the four examples as deterministic cases so an otherwise empty
+        # Planner response cannot silently degrade to one zero-filled call.
+        if pmc_profiles:
+            for profile in pmc_profiles:
+                case = pmc_profile_inputs(profile)
+                if function == "pmc_wrpmcrng":
+                    case = {
+                        "length": profile["length"],
+                        "buf": {
+                            "type_a": profile["type_a"],
+                            "type_d": profile["type_d"],
+                            "datano_s": profile["datano_s"],
+                            "datano_e": profile["datano_e"],
+                            "union": profile["union"],
+                            "values": list(profile["values"]),
+                        },
+                    }
+                cases.append(case)
+                for name, value in case.items():
+                    expected.setdefault(name, set()).add(value_key(value))
         # Invocation validity and diversity are separate. Planner goals may
         # raise the bar, but cannot lower a multi-value domain documented by
         # the API contract itself.
@@ -147,7 +246,13 @@ def build_parameter_contract(plan, targets=()) -> dict:
             and goal["minimum_distinct"] > 0
         ]
         enforced_minimum = max(requested_minimum, default=1)
+        if pmc_profiles:
+            enforced_minimum = max(enforced_minimum, len(pmc_profiles))
         if schema["axis_domain_documented"]:
+            enforced_minimum = max(enforced_minimum, 2)
+        if function == "cnc_prstwkcd":
+            # The documented IDBWRA selector has at least two legal cases in
+            # this collection contract: ALL_AXES and one controller axis.
             enforced_minimum = max(enforced_minimum, 2)
         planned_domain_size = max(
             [enforced_minimum, len(cases), *(
@@ -169,11 +274,21 @@ def build_parameter_contract(plan, targets=()) -> dict:
             sample_budget = 0
         if sample_budget > 0:
             configuration_budget = min(configuration_budget, sample_budget)
+        # Collection policy: enumerate the full documented domain when it has
+        # at most 20 legal configurations; for larger domains collect a
+        # bounded evidence-backed subset. Fixed inputs keep their fixed value
+        # and never become artificial diversity dimensions.
+        configuration_budget = min(configuration_budget, MAX_PARAMETER_CONFIGURATIONS)
         contracts[function] = {**schema,
             "mode": "parameter_variation" if schema["dimensions"] else "state_observation",
             "minimum_distinct": enforced_minimum,
             "planned_configuration_target": planned_domain_size,
             "configuration_budget": configuration_budget,
+            "configuration_policy": {
+                "full_domain_threshold": MAX_PARAMETER_CONFIGURATIONS,
+                "large_domain_mode": "bounded_subset",
+                "fixed_value_policy": "use_documented_fixed_value_once",
+            },
             "variation_requirements": variation,
             "input_diversity_applicable": bool(variation.get("input_diversity", {}).get("applicable", bool(schema["dimensions"]))),
             "input_diversity_required": bool(variation.get("input_diversity", {}).get("required", False)),
@@ -186,7 +301,9 @@ def build_parameter_contract(plan, targets=()) -> dict:
             "planner_strategies": strategies, "planner_constraints": constraints,
             "planner_goals": goals, "state_coverage": states,
             "expected_values": {name: sorted(values) for name, values in expected.items()},
+            "filtered_candidates": filtered_candidates,
             "cases": cases, "minimum_values": minimum_values, "ranges": ranges,
+            "pmc_profiles": pmc_profiles,
             "policy": "Documented safe inputs only; discover device-dependent values at runtime; "
                       "preserve coupled parameters; verify and restore state changes. "
                       "Invocation validity is distinct from diversity. Require extra combinations only "

@@ -197,28 +197,65 @@ class ParameterCoverageTests(unittest.TestCase):
     def test_variable_motion_target_does_not_bypass_generator(self):
         from smart_traffic_agent.agents.code_generator import generate_capture_fragment
         p = plan_for("cnc_absolute")
+        p.steps[0].parameters["parameter_cases"] = [{"axis": -1, "length": 132}]
         p.steps.append(PlanStep("start", "before", "start", "StartProgram"))
         state = WorkflowState(request=TaskRequest("capture", "t"), plan=p)
-        client = Mock(); client.invoke_json.return_value = {"core_cpp": "return EW_OK;"}
-        generate_capture_fragment(state, p.steps, "", client)
+        client = Mock(); client.enabled = True
+        client.invoke_json.return_value = {"api_fragments": [{
+            "step_id": "sample",
+            "apis": ["cnc_absolute"],
+            "core_cpp": 'ret = ctx.call("TARGET", "cnc_absolute", "axis=-1", api.cnc_absolute, [&] { return api.cnc_absolute(handle, static_cast<short>(-1), static_cast<short>(132), &value); }, [&](short) { return ""; });',
+        }]}
+        fragment = generate_capture_fragment(state, p.steps, "", client)
         client.invoke_json.assert_called_once()
-        self.assertIn("Parameter coverage contract", client.invoke_json.call_args.args[1])
+        self.assertIn("api.cnc_absolute", fragment)
 
     def test_repair_accepts_complete_callback_and_preserves_log_contract(self):
         from smart_traffic_agent.agents.code_generator import generate_capture_fragment
-        from smart_traffic_agent.focas_capture_runtime import wrap_capture_fragment, validate_capture_fragment
         p = plan_for("cnc_search")
         state = WorkflowState(request=TaskRequest("capture", "t"), plan=p)
-        fragment = wrap_capture_fragment('std::string inputs = "FlibHndl=32769;number=3329";')
         client = Mock()
-        client.invoke_json.return_value = {"core_cpp": fragment}
-        repaired = generate_capture_fragment(state, p.steps, "", client,
-                                             previous=fragment, diagnostics="repair logging")
-        self.assertEqual(repaired, fragment)
-        self.assertEqual(validate_capture_fragment(repaired), [])
-        prompt = client.invoke_json.call_args.args[0]
-        self.assertIn("semicolon-separated key=value", prompt)
-        self.assertIn("Do not define run_generated_scenario", prompt)
+        client.enabled = True
+        with self.assertRaisesRegex(ValueError, "API_FRAGMENT_GENERATION_FAILED"):
+            generate_capture_fragment(state, p.steps, "", client,
+                                      previous="old fragment", diagnostics="repair logging")
+        client.invoke_json.assert_called()
+
+    def test_api_without_deterministic_recipe_uses_one_plan_bundle_call(self):
+        from smart_traffic_agent.agents.code_generator import generate_capture_fragment
+        p = plan_for("cnc_rdopmsg")
+        state = WorkflowState(request=TaskRequest("capture", "t"), plan=p)
+        client = Mock(); client.enabled = True
+        client.invoke_json.return_value = {"api_fragments": [{
+            "step_id": "sample",
+            "apis": ["cnc_rdopmsg"],
+            "core_cpp": 'ret = ctx.call("TARGET", "cnc_rdopmsg", "FlibHndl=" + std::to_string(handle), api.cnc_rdopmsg, [&] { return api.cnc_rdopmsg(handle, &msg); }, [&](short) { return ""; });',
+        }]}
+        fragment = generate_capture_fragment(state, p.steps, "", client)
+        self.assertIn("api.cnc_rdopmsg", fragment)
+        self.assertEqual(client.invoke_json.call_count, 1)
+
+    def test_repair_regenerates_only_named_api_fragment(self):
+        from smart_traffic_agent.agents.code_generator import generate_capture_fragment
+        p = plan_for("cnc_statinfo")
+        p.steps.append(PlanStep("S2", "during", "read message", "cnc_rdopmsg", {}, protocol_function="cnc_rdopmsg"))
+        state = WorkflowState(request=TaskRequest("capture", "t"), plan=p)
+        client = Mock(); client.enabled = True
+        client.invoke_json.side_effect = [
+            {"api_fragments": [
+                {"step_id": "sample", "apis": ["cnc_statinfo"], "core_cpp": 'ret = ctx.call("S1", "cnc_statinfo", "", api.cnc_statinfo, [&] { return api.cnc_statinfo(handle, &status); }, [&](short) { return ""; });'},
+                {"step_id": "S2", "apis": ["cnc_rdopmsg"], "core_cpp": 'ret = ctx.call("S2", "cnc_rdopmsg", "", api.cnc_rdopmsg, [&] { return api.cnc_rdopmsg(handle, &msg); }, [&](short) { return ""; });'},
+            ]},
+            {"api_fragments": [
+                {"step_id": "S2", "apis": ["cnc_rdopmsg"], "core_cpp": 'ret = ctx.call("S2_REPAIRED", "cnc_rdopmsg", "", api.cnc_rdopmsg, [&] { return api.cnc_rdopmsg(handle, &msg2); }, [&](short) { return ""; });'},
+            ]},
+        ]
+        first = generate_capture_fragment(state, p.steps, "", client)
+        second = generate_capture_fragment(state, p.steps, "", client, previous=first, diagnostics="BLOCKING: cnc_rdopmsg call")
+        self.assertIn('"S1"', second)
+        self.assertIn('"S2_REPAIRED"', second)
+        self.assertNotIn('"S2"', second)
+        self.assertEqual(client.invoke_json.call_count, 2)
 
 
 if __name__ == "__main__":

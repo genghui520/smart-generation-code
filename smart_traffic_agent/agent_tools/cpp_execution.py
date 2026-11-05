@@ -15,6 +15,7 @@ from typing import Any
 from ..integrations.ncguide import default_focas_header_dir
 from ..dataset_export import export_legacy_dataset, remove_previous_export_files
 from ..models import ApiCallLog, CaptureEvent, utc_now
+from ..api_log_templates import api_metadata, write_fixed_logs
 from ..traffic_transactions import (
     FOCAS_API,
     build_protocol_transactions,
@@ -122,7 +123,9 @@ class RunExecutableInput:
     executable_path: Path
     work_dir: Path
     environment: dict[str, str] = field(default_factory=dict)
-    timeout_seconds: int = 600
+    # None means the generated harness owns the wait lifecycle. This is used
+    # only for an explicit operator prerequisite such as REMOTE mode.
+    timeout_seconds: int | None = 600
 
 
 @dataclass(slots=True)
@@ -131,7 +134,7 @@ class RunExecutableOutput:
     stdout: str
     stderr: str
     timed_out: bool
-    timeout_seconds: int
+    timeout_seconds: int | None
 
     @property
     def success(self) -> bool:
@@ -419,8 +422,31 @@ def read_cpp_csv_logs(task_id: str, execution_dir: Path) -> CollectExecutionArti
     schema_errors.extend(validate_pcap_artifacts(execution_dir / "data", output_path=output_path))
     inputs = read_csv_by_index(input_path)
     outputs = read_csv_by_index(output_path)
+    # Keep the legacy CSVs as the execution/audit source of truth, and expose
+    # deterministic fixed-column projections for the desktop and exports.
+    # This is deliberately done before transaction matching so a partial
+    # capture still leaves a complete input/output evidence trail.
+    try:
+        write_fixed_logs(execution_dir / "data", inputs.values(), outputs.values())
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        schema_errors.append(f"fixed API log generation failed: {exc}")
     combined_path = execution_dir / "data" / "focas_api_calls.csv"
     per_api_dir = execution_dir / "data" / "by_api"
+    runtime_api_pcaps: dict[str, str] = {}
+    runtime_api_pcap_paths: dict[str, Path] = {}
+    runtime_marker = per_api_dir / ".runtime_per_api_capture"
+    if runtime_marker.is_file():
+        for path in sorted(per_api_dir.glob("*.pcap")):
+            stem = path.stem
+            for row in inputs.values():
+                api = str(row.get("protocol_function") or row.get("api_name") or "")
+                if not api or api in runtime_api_pcaps:
+                    continue
+                safe_api = re.sub(r"[^A-Za-z0-9_.-]+", "_", api).strip("._") or "unknown_api"
+                if stem.endswith("_" + safe_api):
+                    relative = path.relative_to(execution_dir / "data")
+                    runtime_api_pcaps[api] = str(relative)
+                    runtime_api_pcap_paths[api] = path
     export_prefix = descriptive_csv_prefix(task_id, inputs, outputs)
     if schema_errors:
         remove_derived_api_csvs(combined_path, per_api_dir)
@@ -445,7 +471,7 @@ def read_cpp_csv_logs(task_id: str, execution_dir: Path) -> CollectExecutionArti
         step_id = out_row.get("step_id") or in_row.get("step_id") or f"CPP-{index}"
         phase = normalize_phase(in_row.get("phase", "during"))
         params = {
-            "raw": in_row.get("parameters", ""),
+            "raw": parameter_payload_only(in_row.get("parameters", "")),
             "api_parameter_count": safe_status_code(
                 in_row.get("api_parameter_count")
                 or in_row.get("parameter_count")
@@ -542,10 +568,33 @@ def read_cpp_csv_logs(task_id: str, execution_dir: Path) -> CollectExecutionArti
             })
     pcap_path, pcap_discovery_errors = discover_capture_pcap(execution_dir / "data", outputs)
     schema_errors.extend(pcap_discovery_errors)
-    tcp_payloads = read_classic_pcap_tcp_payloads(pcap_path) if pcap_path else []
+    # The top-level capture remains the authoritative raw capture.  Runtime
+    # per-API captures are an independent evidence channel; merge their real
+    # TCP payloads into the audit input and de-duplicate exact packet copies.
+    # This lets a correctly captured short call be matched even when the
+    # top-level artifact is incomplete, while never inventing packets from a
+    # filename or adjacent API invocation.
+    top_level_payloads = read_classic_pcap_tcp_payloads(pcap_path) if pcap_path else []
+    runtime_payloads: list = []
+    runtime_payload_counts: dict[str, int] = {}
+    for api_name, api_path in runtime_api_pcap_paths.items():
+        payloads = read_classic_pcap_tcp_payloads(api_path) if api_path.exists() else []
+        runtime_payload_counts[api_name] = len(payloads)
+        runtime_payloads.extend(payloads)
+    tcp_payloads = _merge_capture_payloads(top_level_payloads, runtime_payloads)
     focas_port = infer_focas_port(invocation_rows)
+    capture_metadata = {
+        api_name: {
+            "api_pcap_file": runtime_api_pcaps.get(api_name),
+            "api_pcap_payload_count": runtime_payload_counts.get(api_name, 0),
+            "top_level_payload_count": len(top_level_payloads),
+            "capture_source": "top_level_plus_runtime_per_api",
+        }
+        for api_name in runtime_api_pcaps
+    }
     transactions, transaction_by_invocation = build_protocol_transactions(
-        invocation_rows, tcp_payloads, focas_port=focas_port
+        invocation_rows, tcp_payloads, focas_port=focas_port,
+        capture_metadata=capture_metadata,
     )
     write_transaction_jsonl(execution_dir / "protocol_transactions.jsonl", transactions)
     if not schema_errors:
@@ -555,6 +604,13 @@ def read_cpp_csv_logs(task_id: str, execution_dir: Path) -> CollectExecutionArti
             focas_port=focas_port,
         )
     for log in api_logs:
+        # Runtime per-API PCAP ownership is independent from transaction
+        # matching.  Attach it before the early continue so unmatched calls
+        # remain traceable to the single dumper file for their API.
+        if log.protocol_function in runtime_api_pcaps:
+            log.response["api_pcap_file"] = runtime_api_pcaps[log.protocol_function]
+            log.response["api_pcap_payload_count"] = runtime_payload_counts.get(log.protocol_function, 0)
+            log.response["capture_source"] = "top_level_plus_runtime_per_api"
         transaction = transaction_by_invocation.get(log.invocation_id)
         if transaction is None:
             continue
@@ -564,18 +620,51 @@ def read_cpp_csv_logs(task_id: str, execution_dir: Path) -> CollectExecutionArti
             log.response["traffic_analysis"] = transaction["traffic_analysis"]
         if transaction.get("session_traffic"):
             log.response["session_traffic"] = transaction["session_traffic"]
+    # Rewrite the structured fixed-log projection with the final transaction
+    # association.  The display tables intentionally keep their four/five
+    # stable columns; api_calls.jsonl retains the evidence fields needed to
+    # trace each invocation to a real PCAP transaction.
+    fixed_inputs = []
+    for row in inputs.values():
+        enriched = dict(row)
+        invocation_id = str(row.get("invocation_id") or "")
+        transaction = transaction_by_invocation.get(invocation_id)
+        if transaction:
+            enriched["transaction_id"] = transaction.get("transaction_id", "")
+            enriched["traffic_status"] = transaction.get("traffic_status", "no_corresponding_traffic")
+        fixed_inputs.append(enriched)
+    fixed_outputs = []
+    for row in outputs.values():
+        enriched = dict(row)
+        invocation_id = str(row.get("invocation_id") or "")
+        transaction = transaction_by_invocation.get(invocation_id)
+        if transaction:
+            enriched["transaction_id"] = transaction.get("transaction_id", "")
+            enriched["traffic_status"] = transaction.get("traffic_status", "no_corresponding_traffic")
+        fixed_outputs.append(enriched)
+    try:
+        write_fixed_logs(execution_dir / "data", fixed_inputs, fixed_outputs)
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        schema_errors.append(f"fixed API log finalization failed: {exc}")
     for index, in_row in inputs.items():
         if index in outputs:
             continue
         api_name = in_row.get("protocol_function") or in_row.get("api_name") or ""
         if not FOCAS_API.fullmatch(api_name):
             continue
+        incomplete_response = {
+            "executor": "generated_cpp",
+            "output_valid": False,
+            "incomplete_call": True,
+        }
+        if api_name in runtime_api_pcaps:
+            incomplete_response["api_pcap_file"] = runtime_api_pcaps[api_name]
         api_logs.append(ApiCallLog(
             timestamp=in_row.get("timestamp") or utc_now(), task_id=task_id,
             step_id=in_row.get("step_id") or f"CPP-{index}", phase="during",
             interface_name=interface_from_focas(api_name), protocol_function=api_name,
-            input_parameters={"raw": in_row.get("parameters", "")}, status_code=500,
-            response={"executor": "generated_cpp", "output_valid": False, "incomplete_call": True},
+            input_parameters={"raw": parameter_payload_only(in_row.get("parameters", ""))}, status_code=500,
+            response=incomplete_response,
             semantic_label=semantic_label_for(interface_from_focas(api_name)),
             error=f"API_CALL_INCOMPLETE: {api_name} input recorded but no return row; process crashed or was interrupted",
             invocation_id=in_row.get("invocation_id") or f"{task_id}-incomplete-{index}",
@@ -620,6 +709,33 @@ def discover_capture_pcap(data_dir: Path, outputs: dict[str, dict[str, str]]) ->
     if len(candidates) > 1:
         return None, ["PCAP capture validation: multiple capture files without one unambiguous declared artifact."]
     return None, []
+
+
+def _merge_capture_payloads(primary: list, secondary: list) -> list:
+    """Merge real payload observations without duplicating packets.
+
+    Runtime per-API dumpers and the batch capture normally contain the same
+    packet.  A stable packet key prevents duplicate TCP sequence data from
+    being reassembled twice, which would otherwise create false gaps or
+    duplicated application messages.  No payload is synthesized here.
+    """
+    merged = []
+    seen: set[tuple[Any, ...]] = set()
+    for packet in [*primary, *secondary]:
+        key = (
+            packet.timestamp_ns,
+            packet.source_ip,
+            packet.source_port,
+            packet.destination_ip,
+            packet.destination_port,
+            packet.sequence,
+            packet.payload,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(packet)
+    return sorted(merged, key=lambda packet: (packet.timestamp_ns, packet.source_port, packet.destination_port, packet.sequence))
 
 
 def safe_int(value: Any) -> int:
@@ -751,6 +867,9 @@ def parameter_payload_only(value: str) -> str:
     arguments/results and workflow metadata.  Dataset CSVs should expose only
     the API-facing parameter payload; fields such as phase and segment index
     remain available in internal logs but are not input/output parameters.
+    ``FlibHndl`` is retained in the raw row so the logged call can be matched
+    exactly to the actual FOCAS invocation.  Coverage logic may still exclude
+    it as a diversity dimension separately.
     """
 
     if not value:
@@ -834,6 +953,11 @@ def safe_csv_filename(name: str, max_length: int = 96) -> str:
 
 
 def api_parameter_count_for_name(api_name: str) -> int:
+    if api_name == "cnc_prstwkcd":
+        return 4  # length;datano;type;data0 in the normalized capture row
+    metadata_count = api_metadata(api_name).parameter_count
+    if metadata_count is not None:
+        return metadata_count
     counts = {
         "cnc_allclibhndl3": 4,
         "cnc_freelibhndl": 1,
@@ -868,7 +992,7 @@ def api_parameter_count_for_name(api_name: str) -> int:
         "LoadLibraryW": 1,
         "ncguide_ui_cycle_start": 2,
     }
-    return counts.get(api_name, 0)
+    return counts.get(api_name, -1)
 
 
 def validate_pcap_artifacts(data_dir: Path, output_path: Path | None = None) -> list[str]:

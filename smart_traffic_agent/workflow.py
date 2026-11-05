@@ -33,6 +33,7 @@ from .agent_tools import (
     WriteGeneratedArtifactTool,
     RenderFocasCppTool,
     ValidateFocasCppTool,
+    GetSdkTypeContractTool,
     register_traffic_tools,
 )
 from .tool_runtime import ToolRuntime, ToolRegistry
@@ -42,6 +43,7 @@ from .rag.focas_function_manifest import DEFAULT_COVERAGE_BATCH_SIZE, DEFAULT_CO
 from .utils import ensure_dir, write_json
 from .agent_soul import AgentSoulStore
 from .traffic_graph import TrafficRelationshipService, build_default_relationship_service
+from .display_text import write_human_summary
 
 
 @dataclass
@@ -91,6 +93,7 @@ class TrafficGenerationWorkflow:
             WriteGeneratedArtifactTool(),
             RenderFocasCppTool(),
             ValidateFocasCppTool(),
+            GetSdkTypeContractTool(),
         ):
             self.tool_registry.register(tool)
         register_traffic_tools(self.tool_registry, self.traffic_relationships, self.memory_store)
@@ -191,7 +194,27 @@ class TrafficGenerationWorkflow:
         summary["agent_graph"] = self.agent_graph.describe()
         if coverage_state_update:
             summary["coverage_state_update"] = coverage_state_update
+        soul_updates: list[dict[str, Any]] = []
+        try:
+            soul_updates = self.soul_store.learn_from_workflow(
+                state,
+                workflow_success=workflow_success(state),
+            )
+            summary["agent_soul_updates"] = [
+                {
+                    "agent_name": item.get("agent_name"),
+                    "experience_id": item.get("experience_id"),
+                    "status": item.get("status"),
+                    "version": item.get("version"),
+                }
+                for item in soul_updates
+            ]
+        except Exception as exc:
+            # Learning must never change the execution result.  Preserve the
+            # failure in the summary so the self-improvement path is auditable.
+            summary["agent_soul_update_error"] = f"{type(exc).__name__}: {exc}"
         write_json(output_dir / "summary.json", summary)
+        write_human_summary(output_dir / "summary_zh.txt", summary)
         try:
             if historical_memory_enabled:
                 if state.error_memory_id:
@@ -216,6 +239,7 @@ class TrafficGenerationWorkflow:
             if coverage_state_update:
                 summary["coverage_state_update"] = coverage_state_update
             write_json(output_dir / "summary.json", summary)
+            write_human_summary(output_dir / "summary_zh.txt", summary)
         finally:
             self.memory_store.close()
         self._emit(
@@ -472,6 +496,18 @@ def workflow_summary(state: WorkflowState) -> dict:
             "nc_program_path": str(state.artifacts.nc_program_path) if state.artifacts.nc_program_path else None,
             "diagnostics": state.artifacts.diagnostics,
         }
+    collection_evidence = state.result.collection_evidence if state.result else {}
+    status_fields = collection_evidence.get("status_fields", {}) if isinstance(collection_evidence, dict) else {}
+    def context_size(value: Any) -> int:
+        """Return a stable summary size for list-like and scalar context values."""
+        if value is None:
+            return 0
+        if isinstance(value, (str, bytes, list, tuple, set, dict)):
+            return len(value)
+        # RAG context may contain scalar flags such as ``enabled``.  A scalar
+        # is present, but it is not a collection whose length can be measured.
+        return 1
+
     return {
         "task_id": state.request.task_id,
         "stage": state.stage,
@@ -479,11 +515,16 @@ def workflow_summary(state: WorkflowState) -> dict:
         "scenario_type": state.plan.scenario_type if state.plan else None,
         "plan_steps": len(state.plan.steps) if state.plan else 0,
         "retrieved_chunks": len(state.retrieved_chunks),
-        "rag_context_counts": {key: len(value) for key, value in rag_context.items()},
+        "rag_context_counts": {key: context_size(value) for key, value in rag_context.items()},
         "api_log_count": len(state.result.api_logs) if state.result else 0,
         "capture_event_count": len(state.result.capture_events) if state.result else 0,
         "collection_status": state.result.collection_status if state.result else "not_run",
-        "collection_evidence": state.result.collection_evidence if state.result else {},
+        "collection_evidence": collection_evidence,
+        "workflow_status": status_fields.get("workflow_status", "not_run"),
+        "api_execution_status": status_fields.get("api_execution_status", "not_run"),
+        "capture_status": status_fields.get("capture_status", "not_run"),
+        "annotation_status": status_fields.get("annotation_status", "not_run"),
+        "capture_reason": status_fields.get("capture_reason", ""),
         "offline_audit_status": state.result.offline_audit_status if state.result else "not_run",
         "execution_tool_calls": [call.to_dict() for call in state.result.tool_calls] if state.result else [],
         "tool_call_history": [call.to_dict() for call in state.tool_call_history],
@@ -493,6 +534,7 @@ def workflow_summary(state: WorkflowState) -> dict:
         "quality_assessment": state.quality_assessment,
         "scene_plan": rag_context.get("scene_plan", {}),
         "scene_execution_evidence": rag_context.get("scene_execution_evidence", {}),
+        "plan_execution_evidence": rag_context.get("plan_execution_evidence", {}),
         "function_coverage": build_function_coverage_metrics(state.plan, state.result),
         "repair_attempts": state.repair_attempts,
         "repair_history": state.repair_history,

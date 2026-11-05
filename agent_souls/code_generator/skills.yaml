@@ -1,4 +1,6 @@
 version: 1
+display_name_zh: 代码生成智能体
+developer_notes_zh: 负责把执行合同和参数约束生成可编译代码，并保留真实调用、日志和会话保护。
 tools:
   - search_knowledge
   - search_memory

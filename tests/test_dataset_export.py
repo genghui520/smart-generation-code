@@ -223,3 +223,58 @@ def test_reexport_removes_stale_api_files_from_previous_attempt() -> None:
         assert not (root / f"{old_stem}.pcap").exists()
         assert not (root / f"{old_stem}_input.csv").exists()
         assert not (root / f"{old_stem}_output.csv").exists()
+
+
+def test_runtime_per_api_pcaps_are_preferred_and_include_unmatched_calls() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        execution = Path(temporary)
+        root = execution / "data" / "by_api"
+        root.mkdir(parents=True)
+        (root / ".runtime_per_api_capture").write_text(
+            "mode=runtime_per_api_dumper;batch_id=batch_001\n", encoding="utf-8"
+        )
+        _pcap(root / "batch_001_cnc_actf.pcap")
+        _pcap(root / "batch_001_cnc_statinfo.pcap")
+        calls = [
+            _invocation("actf-1", "tx-actf", api="cnc_actf"),
+            _invocation("actf-2", "tx-actf-2", api="cnc_actf"),
+            _invocation("stat-1", "tx-stat", api="cnc_statinfo"),
+        ]
+        transactions = [
+            _transaction("actf-1", "tx-actf"),
+            {"invocation_id": "actf-2", "transaction_id": None, "request_response_associated": False,
+             "request_response_order_valid": False, "tcp_reassembled": True},
+            _transaction("stat-1", "tx-stat"),
+        ]
+        export_legacy_dataset(execution, calls, transactions, None, output_root=root)
+        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["pcap_mode"] == "runtime_per_api_dumper"
+        assert manifest["pcap_files"] == ["batch_001_cnc_actf.pcap", "batch_001_cnc_statinfo.pcap"]
+        assert (root / "batch_001_cnc_actf.pcap").exists()
+        with (root / "20260911_focas_actf_input.csv").open(encoding="utf-8-sig", newline="") as source:
+            rows = list(csv.DictReader(source))
+        assert len(rows) == 2
+        assert rows[1]["traffic_status"] == "no_corresponding_traffic"
+
+
+def test_runtime_marker_does_not_fallback_to_time_window_pcaps_when_dumper_missing() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        execution = Path(temporary)
+        root = execution / "data" / "by_api"
+        root.mkdir(parents=True)
+        (root / ".runtime_per_api_capture").write_text(
+            "mode=runtime_per_api_dumper;batch_id=batch_missing\n", encoding="utf-8"
+        )
+        batch_pcap = execution / "data" / "focas_capture.pcap"
+        _pcap(batch_pcap)
+        export_legacy_dataset(
+            execution,
+            [_invocation("missing-1", "tx-missing", api="cnc_statinfo")],
+            [_transaction("missing-1", "tx-missing")],
+            batch_pcap,
+            output_root=root,
+        )
+        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["pcap_mode"] == "runtime_per_api_dumper"
+        assert manifest["pcap_files"] == []
+        assert not list(root.glob("*.pcap"))

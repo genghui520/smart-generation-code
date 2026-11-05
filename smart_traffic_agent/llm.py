@@ -57,6 +57,9 @@ class LlmClient:
         self.http_config = http_config
         self.last_usage: dict[str, Any] = {}
         self.usage_history: list[dict[str, Any]] = []
+        self.last_json_text: str = ""
+        self.last_json_payload: dict[str, Any] = {}
+        self.last_json_parse_error: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -327,9 +330,15 @@ class LlmClient:
         repair_invalid_json: bool = True,
     ) -> dict[str, Any]:
         text = self.invoke_text(system_prompt, user_prompt, agent_name=agent_name, diagnostics_context=diagnostics_context)
+        self.last_json_text = text if isinstance(text, str) else str(text)
+        self.last_json_payload = {}
+        self.last_json_parse_error = ""
         try:
-            return parse_json_object_response(text)
-        except ValueError:
+            payload = parse_json_object_response(text)
+            self.last_json_payload = dict(payload)
+            return payload
+        except ValueError as exc:
+            self.last_json_parse_error = str(exc)
             if not repair_invalid_json:
                 raise
             repair_prompt = (
@@ -349,7 +358,11 @@ class LlmClient:
                 agent_name=agent_name,
                 diagnostics_context=diagnostics_context,
             )
-            return parse_json_object_response(repaired)
+            self.last_json_text = repaired if isinstance(repaired, str) else str(repaired)
+            payload = parse_json_object_response(repaired)
+            self.last_json_payload = dict(payload)
+            self.last_json_parse_error = ""
+            return payload
 
 
 @contextmanager

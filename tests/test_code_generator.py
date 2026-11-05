@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from smart_traffic_agent.agents.code_generator import (
     CodeGenerationAgent,
+    generate_nc_program,
     blocking_codegen_diagnostics,
     hard_blocking_codegen_diagnostics,
     normalize_focas_header_include,
@@ -25,6 +26,7 @@ from smart_traffic_agent.agents.code_generator import (
     validate_generated,
     validate_focas_loader_type_safety,
     validate_focas_position_abi,
+    validate_focas_argument_semantics,
     validate_official_output_usage,
     validate_poselem_scalar_access,
     validate_all_focas_symbols_against_header,
@@ -34,6 +36,9 @@ from smart_traffic_agent.agents.code_generator import (
     normalize_capture_core,
     validate_scenario_fragment,
     validate_semantic_api_bindings,
+    _ensure_parameter_combinations,
+    should_skip_nc_program_generation,
+    should_defer_nc_program_generation,
 )
 from smart_traffic_agent.agent_tools import (
     CompileCppOutput,
@@ -79,6 +84,96 @@ def hard_pcap_valid_cpp(extra: str = "") -> str:
 
 
 class CodeGenerationAgentTests(unittest.TestCase):
+    def test_running_nc_fast_path_still_generates_motion_program(self) -> None:
+        plan = ExecutionPlan(
+            "p", "task", "coordinate_motion", "goal", "env", "test", [],
+            NcProgramSpec(program_name=""), [], [],
+            rag_context={"fast_path": {"enabled": True, "kind": "running_nc_program"}},
+        )
+        self.assertFalse(should_skip_nc_program_generation(plan))
+
+    def test_read_only_fast_path_skips_nc_program(self) -> None:
+        plan = ExecutionPlan(
+            "p", "task", "read", "goal", "env", "test", [],
+            NcProgramSpec(program_name=""), [], [],
+            rag_context={"fast_path": {"enabled": True, "kind": "read_only_api"}},
+        )
+        self.assertTrue(should_skip_nc_program_generation(plan))
+
+    def test_deferred_running_nc_plan_keeps_program_payload(self) -> None:
+        plan = ExecutionPlan(
+            "p", "task", "coordinate_motion", "goal", "env",
+            "required_for_running_state", [], NcProgramSpec(program_name=""), [], [],
+        )
+        self.assertFalse(should_defer_nc_program_generation(plan, True))
+
+    def test_deferred_read_only_motion_plan_can_skip_program(self) -> None:
+        plan = ExecutionPlan(
+            "p", "task", "coordinate_motion", "goal", "env",
+            "coordinate_motion", [], NcProgramSpec(program_name=""), [], [],
+        )
+        self.assertTrue(should_defer_nc_program_generation(plan, True))
+
+    def test_alarm_history_requires_controller_specific_ncguide_trigger(self) -> None:
+        spec = NcProgramSpec(program_name="O9123")
+        fake_llm = FakeCodegenLlm()
+        fake_llm.invoke_json = lambda *_args, **_kwargs: {
+            "nc_program": "\nO9123\nG90 G54\nG04 P1\nM30\n%",
+            "notes": ["controller-specific alarm rule: PS0010; evidence=manual:test"],
+            "alarm_trigger": {
+                "alarm_code": "PS0010",
+                "condition": "controller-specific documented NC condition",
+                "evidence": "manual:test",
+            },
+        }
+        program, diagnostics = generate_nc_program(
+            "collect cnc_rdalmhistry5",
+            "alarm_query",
+            spec,
+            {"alarm_history_trigger": {
+                "required": True,
+                "alarm_code": "PS0010",
+                "trigger": "G999",
+                "scope": "NCGuide simulator only",
+            }},
+            fake_llm,
+        )
+        self.assertNotIn("G999", program)
+        self.assertIn("M30", program)
+        self.assertTrue(program.startswith("\nO9123"))
+
+    def test_pending_runtime_dependency_does_not_raise_empty_combinations(self) -> None:
+        plan = ExecutionPlan(
+            "p", "task", "scenario", "goal", "env", "test", [], NcProgramSpec("O1"),
+            [PlanStep("S1", "before", "read source", "cnc_sysinfo", {}, protocol_function="cnc_sysinfo"),
+             PlanStep("S2", "during", "read target", "cnc_accdecdly", {}, protocol_function="cnc_accdecdly")],
+            [], runtime_bindings=[{
+                "target_api": "cnc_accdecdly", "target_parameter_path": "axis",
+                "source_api": "cnc_sysinfo", "filter_mode": "include",
+            }],
+        )
+        plan.rag_context["parameter_coverage_contract"] = {
+            "functions": {"cnc_accdecdly": {"dimensions": ["axis"], "cases": [], "planner_strategies": []}}
+        }
+        plan.rag_context["execution_plan_validation"] = {"valid": True}
+        _ensure_parameter_combinations(plan, None, {"cnc_accdecdly"})
+
+    def test_runtime_axis_domain_declared_on_step_is_not_empty(self) -> None:
+        plan = ExecutionPlan(
+            "p", "task", "scenario", "goal", "env", "test", [], NcProgramSpec("O1"),
+            [PlanStep(
+                "S1", "during", "read target", "cnc_accdecdly",
+                {"axis_source": "cnc_sysinfo.sysinfo.axes", "axis_domain": "1..N"},
+                protocol_function="cnc_accdecdly",
+            )],
+            [],
+        )
+        plan.rag_context["parameter_coverage_contract"] = {
+            "functions": {"cnc_accdecdly": {"dimensions": ["axis"], "cases": [], "planner_strategies": []}}
+        }
+        plan.rag_context["execution_plan_validation"] = {"valid": True}
+        _ensure_parameter_combinations(plan, None, {"cnc_accdecdly"})
+
     def test_start_program_uses_current_run_ui_environment_without_overwrite(self) -> None:
         source = "\n".join(
             cpp_step_block(
@@ -235,6 +330,14 @@ int main() { return cnc_statinfo_fn(handle, nullptr); }
 
         self.assertEqual(nc_program, "")
 
+    def test_normalize_llm_nc_program_removes_standalone_generator_comment(self) -> None:
+        nc_program = normalize_llm_nc_program(
+            "O1234\n(NON-MOTION BATCH: PROGRAM PAYLOAD ONLY)\nG01 X1 F100\nM30\n",
+            "O2468",
+        )
+        self.assertNotIn("NON-MOTION BATCH", nc_program)
+        self.assertIn("G01 X1 F100", nc_program)
+
     def test_milling_program_omits_unneeded_g97_spindle_mode(self) -> None:
         from smart_traffic_agent.agents.code_generator import validate_nc_controller_modes
 
@@ -389,6 +492,8 @@ int main() { return cnc_statinfo_fn(handle, nullptr); }
         self.assertIn("#include <chrono>", source)
         self.assertIn("#include <thread>", source)
         self.assertIn("SCENARIO_CORE_BEGIN", fragment)
+        # Code-only rendering uses the same one-request API-fragment contract
+        # as production capture when an LLM is configured.
         self.assertIn("api.cnc_actf(handle, &actual_feed)", fragment)
 
     def test_scenario_fragment_rejects_main_and_loader_ownership_leaks(self) -> None:
@@ -702,19 +807,19 @@ int main() { return cnc_statinfo_fn(handle, nullptr); }
                 patch(
                     "smart_traffic_agent.agents.code_generator.repair_scenario_fragment_after_compile_error",
                     return_value=repaired_fragment,
-                ),
+                ) as repair_mock,
                 patch(
                     "smart_traffic_agent.agents.code_generator.preflight_compile_generated_cpp",
                     side_effect=["api_script.cpp(10): error C2362", ""],
                 ) as compile_mock,
             ):
-                result = CodeGenerationAgent(llm_client=llm).run(state, Path(temp_dir))
-            repaired_fragment_on_disk = result.artifacts.fragment_path.read_text(encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, r"Generated C\+\+ failed MSVC preflight compilation"):
+                    CodeGenerationAgent(llm_client=llm).run(state, Path(temp_dir))
+                repair_mock.assert_not_called()
 
-        self.assertEqual(result.stage, "execution")
-        self.assertIn("scenario_fragment.inc", result.artifacts.api_script)
-        self.assertEqual(repaired_fragment_on_disk, repaired_fragment)
-        self.assertEqual(compile_mock.call_count, 2)
+        # Deterministic C++ failures are reported with compiler evidence; the
+        # removed model-authored full-source repair path must not run.
+        self.assertEqual(compile_mock.call_count, 1)
 
     def test_only_delete_permission_diagnostics_hard_block_codegen(self) -> None:
         diagnostics = [
@@ -1450,6 +1555,22 @@ int main() { return cnc_statinfo_fn(handle, nullptr); }
             render_records = [item for item in runtime.history if item.tool_name == "render_focas_cpp"]
             self.assertEqual(len(render_records), 1)
             self.assertTrue(render_records[0].success)
+
+
+    def test_validate_focas_argument_semantics_rejects_swapped_axis_length(self) -> None:
+        source = "api.cnc_relative(handle, relLen, static_cast<short>(-1), &relative);"
+        diagnostics = validate_focas_argument_semantics(source)
+        self.assertTrue(any("arguments are reversed" in item for item in diagnostics))
+
+    def test_validate_focas_argument_semantics_accepts_documented_order(self) -> None:
+        source = "api.cnc_relative(handle, axis, relLen, &relative);"
+        self.assertEqual(validate_focas_argument_semantics(source), [])
+
+    def test_validate_focas_argument_semantics_rejects_missing_axis_and_odbpos(self) -> None:
+        source = "ODBPOS snap{}; api.cnc_relative(handle, relLen, &snap);"
+        diagnostics = validate_focas_argument_semantics(source)
+        self.assertTrue(any("requires (handle, axis, length" in item for item in diagnostics))
+        self.assertTrue(any("must use the SDK ODBAXIS" in item for item in diagnostics))
 
 
 if __name__ == "__main__":

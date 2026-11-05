@@ -69,15 +69,24 @@ def _metadata_matches(metadata: dict[str, Any], where: dict[str, Any]) -> bool:
 
 
 class KnowledgeBase:
-    """FOCAS 知识库：支持 Chroma 向量检索 + 词项匹配降级。"""
+    """Protocol knowledge base with Chroma/stable-vector and term fallback.
+
+    ``collection_name`` keeps protocol stores isolated.  Existing callers
+    retain the FOCAS default, while LSV-2 uses its own collection.
+    """
 
     def __init__(
         self,
         chunks: list[KnowledgeChunk] | None = None,
         *,
         vector_db_dir: str | Path | None = None,
+        collection_name: str = "focas_knowledge",
     ) -> None:
         self.chunks = chunks or []
+        self.vector_db_path: str | None = str(vector_db_dir) if vector_db_dir else None
+        self.collection_name = collection_name
+        self.vector_db_status = "not_configured"
+        self.vector_db_error = ""
         self._collection = None
         self._chroma_client = None
         self._embed_fn = None
@@ -88,13 +97,45 @@ class KnowledgeBase:
         if vector_db_dir:
             self._load_vector_db(vector_db_dir)
 
+    @property
+    def fallback_available(self) -> bool:
+        """Whether deterministic local chunks can still answer lookups."""
+        return bool(self.chunks)
+
+    @property
+    def status(self) -> dict[str, Any]:
+        """Return an explicit, UI-safe knowledge source diagnosis."""
+        vector_loaded = self.vector_search_available
+        if vector_loaded:
+            overall = "vector"
+        elif self.fallback_available:
+            overall = "fallback"
+        elif self.vector_db_path and self.vector_db_status in {"missing", "error"}:
+            overall = "unavailable"
+        else:
+            overall = "empty"
+        return {
+            "status": overall,
+            "vector_db": {
+                "status": self.vector_db_status,
+                "path": self.vector_db_path,
+                "collection": self.collection_name,
+                "loaded": vector_loaded,
+                "error": self.vector_db_error,
+            },
+            "fallback_available": self.fallback_available,
+            "chunk_count": len(self.chunks),
+        }
+
     # ── 向量库初始化 ──────────────────────────────────────
 
     def _load_vector_db(self, path: str | Path) -> None:
         """加载 Chroma 持久化向量库。"""
         path = Path(path)
         if not path.exists():
-            print(f"[KnowledgeBase] vector DB not found: {path}")
+            self.vector_db_status = "missing"
+            self.vector_db_error = f"vector DB not found: {path}"
+            print(f"[KnowledgeBase] {self.vector_db_error}")
             return
         stable_embeddings = path / "stable_embeddings.npy"
         stable_records = path / "stable_records.jsonl"
@@ -106,19 +147,27 @@ class KnowledgeBase:
                 self._embed_fn = _BGEEmbedding(EMBEDDING_MODEL)
                 if len(self._stable_records) != len(self._stable_embeddings):
                     raise ValueError("stable vector/metadata count mismatch")
+                self.vector_db_status = "loaded"
+                self.vector_db_error = ""
                 print(f"[KnowledgeBase] loaded stable vector index: {path} ({len(self._stable_records)} docs)")
                 return
             except Exception as e:
+                self.vector_db_status = "error"
+                self.vector_db_error = f"stable vector index load failed: {e}"
                 print(f"[KnowledgeBase] stable vector index load failed: {e}")
                 self._stable_embeddings = None
                 self._stable_records = []
-        self._chroma_client = chromadb.PersistentClient(path=str(path))
         try:
-            self._collection = self._chroma_client.get_collection("focas_knowledge")
+            self._chroma_client = chromadb.PersistentClient(path=str(path))
+            self._collection = self._chroma_client.get_collection(self.collection_name)
             self._embed_fn = _BGEEmbedding(EMBEDDING_MODEL)
             count = self._collection.count()
+            self.vector_db_status = "loaded"
+            self.vector_db_error = ""
             print(f"[KnowledgeBase] loaded: {path} ({count} docs)")
         except Exception as e:
+            self.vector_db_status = "error"
+            self.vector_db_error = str(e)
             print(f"[KnowledgeBase] load failed: {e}")
             self._collection = None
 
@@ -382,6 +431,22 @@ class KnowledgeBase:
                         scores[position] += 2.0
                     elif prefix and prefix in {token.upper() for token in query_tokens}:
                         scores[position] += 0.5
+            # API names are stable identifiers.  Prefer the exact API entry
+            # when a caller asks for one by name, while retaining semantic
+            # ranking for natural-language queries that contain no identifier.
+            query_api_tokens = {
+                token.lower()
+                for token in re.findall(r"[A-Za-z][A-Za-z0-9_]+", query)
+            }
+            for position, candidate_index in enumerate(candidate_indices):
+                metadata = self._stable_records[int(candidate_index)].get("metadata", {})
+                names = {
+                    str(metadata.get("function", "")).strip().lower(),
+                    str(metadata.get("library_method", "")).strip().lower(),
+                }
+                names.discard("")
+                if names.intersection(query_api_tokens):
+                    scores[position] += 2.0
             # Per-function prerequisite rules are indexed by exact FOCAS
             # function name; semantic similarity alone cannot discriminate
             # "cnc_rdgrpid" from its subword-neighbors, so boost rules whose

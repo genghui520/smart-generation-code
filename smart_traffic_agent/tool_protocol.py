@@ -25,6 +25,11 @@ class ToolResult:
     error: str = ""
 
 
+def _non_call_marker(value: str) -> bool:
+    """Recognize Planner prose that explicitly says no API call exists."""
+    return bool(re.match(r"^(?:none|null|unknown|no\s+focas\s+call)\b", str(value or "").strip(), re.IGNORECASE))
+
+
 def tool_calls_from_step(step: Any) -> list[ToolCall]:
     """Convert a PlanStep into atomic tool calls without registry lookup."""
     # Packet capture is owned by the deterministic runner, not exposed as a
@@ -32,7 +37,7 @@ def tool_calls_from_step(step: Any) -> list[ToolCall]:
     # split that marker into bogus tools named "N" and "A (...)".
     interface_name = str(getattr(step, "interface_name", "")).lower()
     protocol_function = str(getattr(step, "protocol_function", "")).strip().upper()
-    if "npcap" in interface_name or protocol_function == "N/A" or protocol_function.startswith("N/A "):
+    if "npcap" in interface_name or protocol_function == "N/A" or protocol_function.startswith("N/A ") or _non_call_marker(protocol_function):
         return []
     rows = getattr(step, "api_calls", []) or []
     calls: list[ToolCall] = []
@@ -40,7 +45,7 @@ def tool_calls_from_step(step: Any) -> list[ToolCall]:
         if not isinstance(row, dict):
             continue
         tool_name = str(row.get("protocol_function", row.get("tool_name", ""))).strip()
-        if not tool_name or tool_name.upper() == "N/A" or tool_name.upper().startswith("N/A "):
+        if not tool_name or tool_name.upper() == "N/A" or tool_name.upper().startswith("N/A ") or _non_call_marker(tool_name):
             continue
         call_id = str(row.get("call_id", f"{step.step_id}-call-{index:02d}"))
         arguments = dict(row.get("parameters", row.get("arguments", {})) or {})
@@ -84,6 +89,8 @@ def tool_calls_from_step(step: Any) -> list[ToolCall]:
         )
     if not calls and getattr(step, "protocol_function", ""):
         tool_name = str(step.protocol_function).strip()
+        if _non_call_marker(tool_name):
+            return []
         arguments = dict(getattr(step, "parameters", {}) or {})
         if tool_name.lower().startswith("sequence:"):
             members = [member.strip() for member in tool_name.split(":", 1)[1].split("->") if member.strip()]

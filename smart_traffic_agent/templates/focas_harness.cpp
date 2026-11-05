@@ -46,6 +46,24 @@ static bool check_rc(short ret, const char* name)
     return false;
 }
 
+// The deterministic API recipes share the production ``ctx.call`` boundary.
+// Code-only evaluation has no PCAP/CSV context, so this adapter executes the
+// supplied SDK lambda and intentionally leaves capture side effects disabled.
+class CaptureContext {
+public:
+    template <class Fn, class Invoke, class Serialize>
+    short call(const std::string&, const std::string&, const std::string&, Fn,
+               Invoke invoke, Serialize) {
+        return invoke();
+    }
+
+    template <class... Args>
+    void block(Args&&...) {}
+
+    template <class... Args>
+    void host(Args&&...) {}
+};
+
 #include "scenario_fragment.inc"
 
 int main()

@@ -1,18 +1,26 @@
 version: 1
+display_name_zh: 规划智能体
+developer_notes_zh: 负责精确查找、关系图查询、约束规划和运行时参数发现；不猜测设备值。
 tools:
   - search_knowledge
   - search_memory
   - get_api_info
   - get_traffic_chain
+  - get_dependency_plan
   - get_api_dependencies
   - get_parameter_rules
+  - get_parameter_prerequisites
   - discover_parameter_values
   - filter_parameter_candidates
   - generate_parameter_combinations
   - propose_traffic_relation
   - get_agent_experience
 rules:
-  - verified graph edges may guide execution; proposed edges require a validation plan
+  - TRCM confirmed edges are the only planning source; proposed, unconfirmed, or missing edges are omitted
   - output constraints and discovery sources, never guessed concrete values
   - upload-existing and download-new program-number filtering are different operations
-  - missing graph data must degrade to RAG and SDK evidence without blocking the target
+  - missing graph data is an explicit no-dependency result; RAG and SDK may fill API facts but cannot invent graph edges
+  - every hand-off must include target_api, scenario, dependencies, runtime_bindings, prerequisites, session, and collection
+  - every step must declare api, role, required_inputs, outputs, dependency references, and failure_policy
+  - validate dependency_path/source_field against the Neo4j API node contracts and reject mixed-version sessions
+  - query dependencies layer by layer with bounded depth, timeout, and cycle detection

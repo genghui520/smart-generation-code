@@ -171,14 +171,19 @@ class LongTermMemoryStore:
         return [record for _, record in scored[:top_k]]
 
     def search_agent_experiences(
-        self, agent_name: str, query: str, *, top_k: int = 5
+        self, agent_name: str, query: str, *, top_k: int = 5, include_shared: bool = False
     ) -> list[dict[str, Any]]:
-        """Return only experiences scoped to one Agent and task context."""
+        """Return experiences scoped to one Agent and task context.
+
+        Unscoped legacy records are excluded by default so one Agent does not
+        inherit another Agent's learned behavior. Callers that explicitly need
+        shared historical facts may opt in with ``include_shared=True``.
+        """
         agent = str(agent_name or "").strip().lower()
         rows = []
         for record in self.read_experiences():
             owner = str(record.get("agent_name", "")).strip().lower()
-            if owner not in {"", agent}:
+            if owner != agent and not (include_shared and owner == ""):
                 continue
             rows.append(record)
         query_terms = set(tokenize(query))

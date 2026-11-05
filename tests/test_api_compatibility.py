@@ -1,7 +1,7 @@
 from unittest.mock import patch
 from types import SimpleNamespace
 
-from smart_traffic_agent.api_compatibility import unavailable_reason, compatibility_data, detect_sdk_model, SDK_UNKNOWN
+from smart_traffic_agent.api_compatibility import unavailable_reason, compatibility_data, detect_sdk_model, SDK_UNKNOWN, f0id_api_names, f0id_scope_metadata
 from smart_traffic_agent import desktop_backend as backend
 from scripts.build_api_compatibility import parse_matrix
 
@@ -21,12 +21,21 @@ def test_parser_does_not_treat_missing_as_supported():
     assert result == {"cnc_test": {"e0id": "X", "h0id": "O"}}
 
 
+def test_f0id_scope_is_manifest_compatibility_intersection():
+    names = f0id_api_names()
+    assert len(names) == 308
+    assert "cnc_rdnodenum" not in names
+    assert "cnc_absolute" in names
+    assert f0id_scope_metadata()["api_count"] == 308
+
+
 def test_all_api_counts_prompts_and_validation(tmp_path):
     config = backend.defaults() | {"controller_model": "0i-D", "capture_mode": "all_apis", "api_key": "test"}
     (tmp_path / "Fwlib32.h").write_text("#define FS0IDD\n", encoding="ascii")
     config["header"] = str(tmp_path)
     names = backend.selected_api_names(config)
-    assert 0 < len(names) < len(backend.function_manifest())
+    assert len(names) == 308
+    assert len(names) < len(backend.function_manifest())
     assert "cnc_rdnodenum" not in names
     assert "cnc_absolute" in names
     prompt = backend.render_full_api_prompt(config)

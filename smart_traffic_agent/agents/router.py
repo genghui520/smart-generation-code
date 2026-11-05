@@ -97,6 +97,15 @@ class RouterAgent(AgentTemplate):
             self.last_route_reason = "PlanningAgent provider/network failure; terminate without repair_plan"
             self.last_repair_instruction = ""
             return "complete"
+        binding_regeneration = target_generation_after_runtime_binding(state)
+        if binding_regeneration and "code_generation" in valid_next_stages(state):
+            self.last_route_source = "deterministic_runtime_parameter_binding"
+            self.last_route_reason = binding_regeneration
+            self.last_repair_instruction = (
+                "Use the existing ExecutionPlan and bound parameter sets to generate the dependent target calls; "
+                "do not invoke PlanningAgent or replace the plan."
+            )
+            return "code_generation"
         # Flow-style terminal guard.  Once execution has succeeded and the
         # objective evidence is complete, do not let an LLM choose a repair
         # branch again.  This prevents the historical "success -> repair_code"
@@ -140,10 +149,18 @@ class RouterAgent(AgentTemplate):
             if not target_names:
                 target_names = list(state.request.permissions.get("required_api_functions", []) or [])
         if self.tool_runtime is not None:
+            device_scope = str(state.request.permissions.get("device_scope", ""))
+            allowed_api_names = tuple(
+                str(item).strip()
+                for item in state.request.permissions.get("device_api_names", ())
+                if str(item).strip()
+            )
             for api_name in dict.fromkeys(str(item).strip() for item in target_names if str(item).strip()):
                 try:
                     dependencies, _ = self.tool_runtime.call(
-                        self.role_name, "get_api_dependencies", ApiNameInput(api_name)
+                        self.role_name, "get_api_dependencies", ApiNameInput(
+                            api_name, device_scope=device_scope, allowed_api_names=allowed_api_names,
+                        )
                     )
                     router_graph_context[api_name] = dependencies
                 except Exception as exc:
@@ -385,6 +402,33 @@ def valid_next_stages(state: WorkflowState) -> set[WorkflowStage]:
 def planning_transient_error(state: WorkflowState) -> bool:
     """Planning provider failures are terminal for this run, never re-planned."""
     return any(str(error).startswith("transient_llm_error:") for error in state.errors)
+
+
+def target_generation_after_runtime_binding(state: WorkflowState) -> str:
+    """Request one deterministic second generation pass after prerequisites."""
+    plan = state.plan
+    if plan is None or state.result is None or not state.result.success:
+        return ""
+    context = plan.rag_context if isinstance(plan.rag_context, dict) else {}
+    if context.get("parameter_binding_generation_requested"):
+        return ""
+    bindings = context.get("runtime_parameter_bindings", {})
+    if not isinstance(bindings, dict) or not bindings:
+        return ""
+    target_api = str(getattr(plan, "target_api", "") or "").strip()
+    if not target_api:
+        return ""
+    target_logs = [
+        log for log in state.result.api_logs
+        if str(log.protocol_function or log.interface_name or "").strip() == target_api
+    ]
+    if target_logs:
+        return ""
+    complete = [value for value in bindings.values() if isinstance(value, dict) and value.get("complete")]
+    if not complete:
+        return ""
+    context["parameter_binding_generation_requested"] = True
+    return f"runtime filters bound for {target_api}; regenerate dependent target calls without replanning"
 
 
 def terminal_capture_prerequisite(state: WorkflowState) -> str:
@@ -654,6 +698,14 @@ def summarize_plan_for_router(state: WorkflowState) -> dict[str, object]:
                 "repeat": step.repeat,
                 "interval_seconds": step.interval_seconds,
                 "action": step.action[:240],
+                "api": step.api or step.protocol_function or step.interface_name,
+                "role": step.role,
+                "parameter_sources": step.parameter_sources,
+                "dependencies": step.dependencies,
+                "required_inputs": step.required_inputs,
+                "outputs": step.outputs,
+                "failure_policy": step.failure_policy,
+                "blocks_dependents": step.blocks_dependents,
             }
         )
 
@@ -703,6 +755,15 @@ def summarize_plan_for_router(state: WorkflowState) -> dict[str, object]:
             + ", ".join(empty_parameter_strategies)
         )
     return {
+        "schema_version": plan.schema_version,
+        "target_api": plan.target_api,
+        "scenario": plan.scenario or plan.scenario_type,
+        "dependencies": plan.dependencies,
+        "runtime_bindings": plan.runtime_bindings,
+        "prerequisites": plan.prerequisites,
+        "session": plan.session,
+        "collection": plan.collection,
+        "execution_plan_validation": plan.rag_context.get("execution_plan_validation", {}),
         "scenario_type": plan.scenario_type,
         "scenario_goal": plan.scenario_goal,
         "nc_program_spec": {

@@ -98,15 +98,44 @@ def export_legacy_dataset(
         _write_csv(output_root / f"{stem}_output.csv", outputs_by_stem[stem], OUTPUT_CSV_FIELDS)
         _write_dataset_txt(dataset_dir / f"{stem}.txt", matched_by_stem.get(stem, []))
 
-    pcap_stems = _write_per_api_pcaps(output_root, matched_by_stem, pcap_path, focas_port=focas_port)
+    runtime_marker = output_root / ".runtime_per_api_capture"
+    runtime_pcap_paths = _discover_runtime_per_api_pcaps(output_root)
+    if runtime_marker.is_file():
+        # A runtime marker is an explicit statement that the harness attempted
+        # per-API capture.  Do not silently replace missing API dumpers with a
+        # time-window split of the batch PCAP; that would hide capture failure.
+        pcap_stems = [path.stem for path in runtime_pcap_paths]
+        pcap_files = [path.name for path in runtime_pcap_paths]
+        pcap_mode = "runtime_per_api_dumper"
+    else:
+        pcap_stems = _write_per_api_pcaps(output_root, matched_by_stem, pcap_path, focas_port=focas_port)
+        pcap_files = [f"{stem}.pcap" for stem in pcap_stems]
+        pcap_mode = "batch_time_window_fallback"
     _write_labels_and_training(output_root, matched_by_stem)
     _write_manifest(
         output_root, inputs_by_stem, matched_by_stem, pcap_stems,
+        pcap_files=pcap_files, pcap_mode=pcap_mode,
         source_of_truth=("../../api_logs.jsonl and ../../protocol_transactions.jsonl"
                          if output_root == execution_dir / "data" / "by_api"
                          else "../api_logs.jsonl and ../protocol_transactions.jsonl"),
     )
     return output_root
+
+
+def _discover_runtime_per_api_pcaps(output_root: Path) -> list[Path]:
+    """Return API PCAPs written during execution, when the marker is present.
+
+    A marker prevents an old compatibility export from being mistaken for a
+    runtime capture. Runtime files contain all calls for an API, including
+    calls whose transaction audit later remains unmatched.
+    """
+    marker = output_root / ".runtime_per_api_capture"
+    if not marker.is_file():
+        return []
+    return sorted(
+        path for path in output_root.glob("*.pcap")
+        if path.is_file() and path.stat().st_size >= 24
+    )
 
 
 def _operation_name(api: str) -> str:
@@ -341,11 +370,14 @@ def remove_previous_export_files(output_root: Path, dataset_dir: Path) -> None:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return
+    preserve_runtime_pcaps = (output_root / ".runtime_per_api_capture").is_file()
     for name in manifest.get("generated_files", []):
         if not isinstance(name, str) or Path(name).name != name:
             continue
         path = output_root / name
         if path.suffix not in {".csv", ".pcap"}:
+            continue
+        if preserve_runtime_pcaps and path.suffix == ".pcap":
             continue
         try:
             path.unlink(missing_ok=True)
@@ -371,9 +403,12 @@ def _write_manifest(
     matched_by_stem: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]],
     pcap_stems: list[str],
     *,
+    pcap_files: list[str] | None = None,
+    pcap_mode: str = "batch_time_window_fallback",
     source_of_truth: str,
 ) -> None:
     stems = sorted(rows_by_stem)
+    pcap_files = list(pcap_files or [f"{stem}.pcap" for stem in pcap_stems])
     manifest = {
         "format": "per-api-pcap-and-paired-logs-v2",
         "source_of_truth": source_of_truth,
@@ -381,11 +416,13 @@ def _write_manifest(
         "valid_transaction_count": sum(len(rows) for rows in matched_by_stem.values()),
         "api_file_count": len(rows_by_stem),
         "cleaning_rule": "unique ordered TCP-reassembled request-response association",
+        "pcap_mode": pcap_mode,
+        "pcap_files": pcap_files,
         "api_stems": stems,
         "generated_files": [
             *(f"{stem}_input.csv" for stem in stems),
             *(f"{stem}_output.csv" for stem in stems),
-            *(f"{stem}.pcap" for stem in pcap_stems),
+            *pcap_files,
         ],
     }
     (output_root / "manifest.json").write_text(

@@ -68,12 +68,17 @@ class ValidateFocasCppTool(AgentTool[ValidateFocasCppInput, ValidateFocasCppOutp
             validate_code_spec_coverage,
             validate_download_payload,
             validate_generated,
+            validate_focas_argument_semantics,
             validate_official_output_usage,
             validate_programmatic_abi_binding,
             validate_scenario_fragment,
         )
         from ..integrations.ncguide import default_focas_header_dir
-        from ..sdk_type_index import load_or_build_sdk_type_index, validate_struct_member_access
+        from ..sdk_type_index import (
+            load_or_build_sdk_type_index,
+            validate_sdk_type_declarations,
+            validate_struct_member_access,
+        )
         sdk_header = default_focas_header_dir() / "Fwlib32.h"
         if sdk_header.is_file():
             sdk_index = load_or_build_sdk_type_index(
@@ -83,6 +88,10 @@ class ValidateFocasCppTool(AgentTool[ValidateFocasCppInput, ValidateFocasCppOutp
                 fragment or source, sdk_index,
                 source_name=tool_input.fragment_path.name if tool_input.fragment_path else tool_input.cpp_path.name,
             )
+            type_diagnostics.extend(validate_sdk_type_declarations(
+                fragment or source, sdk_index,
+                source_name=tool_input.fragment_path.name if tool_input.fragment_path else tool_input.cpp_path.name,
+            ))
         else:
             type_diagnostics = [f"BLOCKING: SDK_TYPE_MISMATCH: configured SDK header not found: {sdk_header}"]
 
@@ -99,6 +108,11 @@ class ValidateFocasCppTool(AgentTool[ValidateFocasCppInput, ValidateFocasCppOutp
             from ..agents.code_generator import validate_poselem_scalar_access, validate_odbact_scalar_access
             diagnostics.extend(validate_poselem_scalar_access(fragment))
             diagnostics.extend(validate_odbact_scalar_access(fragment))
+            # Production contracts use the fixed harness path, so the normal
+            # generated-source validator is not run.  Keep the SDK semantic
+            # argument-order check active here as well; C++ cannot detect a
+            # swapped pair of same-typed arguments such as axis/length.
+            diagnostics.extend(validate_focas_argument_semantics(fragment or shell))
         else:
             diagnostics = validate_generated(
                 source,
@@ -132,6 +146,7 @@ class ValidateFocasCppTool(AgentTool[ValidateFocasCppInput, ValidateFocasCppOutp
                 "ODBAXIS array data access",
                 "ODBACT scalar data access",
                 "SDK-derived struct/union member access",
+                "SDK type declaration existence against active Fwlib32.h",
                 "planned API coverage and semantic bindings",
                 "scenario fragment boundary",
                 "NC payload framing",

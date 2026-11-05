@@ -18,7 +18,11 @@ from smart_traffic_agent.integrations.ncguide import (
     pe_machine_bits,
     probe_ncguide,
 )
-from smart_traffic_agent.integrations.focas_bridge import BridgeConfig, run_once
+from smart_traffic_agent.integrations.focas_bridge import (
+    DEFAULT_INSTALL_DIR,
+    BridgeConfig,
+    run_once,
+)
 from smart_traffic_agent.agents.executor import executable_steps, make_execution_client
 from smart_traffic_agent.models import PlanStep
 
@@ -75,6 +79,9 @@ class NcGuideProbeTests(unittest.TestCase):
 
         if result["status_code"] != 0:
             self.assertIn("32-bit Python", result["error"])
+
+    def test_bridge_default_install_dir_is_0id(self) -> None:
+        self.assertEqual(DEFAULT_INSTALL_DIR.name, "NCGuide FS0i-D")
 
     def test_readonly_bridge_keeps_only_supported_steps(self) -> None:
         skipped: list[str] = []
