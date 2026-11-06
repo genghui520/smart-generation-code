@@ -1,13 +1,15 @@
 """SDK-backed C++ generation helpers.
 
 Production CodeGenerationAgent responses contain only a bare SDK call and
-parameter expressions.  This module validates that small expression and owns
-the surrounding declarations, input/output logging, and ``ctx.call`` wrapper.
+parameter expressions.  ``parameter_values`` contains only formal SDK
+arguments; ``struct_values`` contains verified fields for SDK struct/union
+pointers.  This module validates those values and owns the surrounding
+declarations, input/output logging, and ``ctx.call`` wrapper.
 The older recipe facade remains available for offline compatibility callers.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 from types import SimpleNamespace
 from pathlib import Path
@@ -27,6 +29,7 @@ class BareApiCall:
     api_name: str
     call_expr: str
     parameter_values: dict[str, Any]
+    struct_values: dict[str, Any] = field(default_factory=dict)
 
 
 def _split_cpp_arguments(source: str, opening: int) -> tuple[list[str], int] | None:
@@ -161,7 +164,11 @@ def _cpp_value_text(expression: str, type_name: str) -> str:
     return f"std::string(\"<\") + std::string(\"{expression}\") + std::string(\">\")"
 
 
-def _render_parameter_text(metadata: ApiMetadata, args: list[str]) -> str:
+def _render_parameter_text(
+    metadata: ApiMetadata,
+    args: list[str],
+    struct_logs: list[tuple[str, str, str]] | None = None,
+) -> str:
     pieces: list[str] = []
     for parameter, expression in zip(metadata.parameters, args):
         if parameter.direction not in {"in", "inout"}:
@@ -169,12 +176,240 @@ def _render_parameter_text(metadata: ApiMetadata, args: list[str]) -> str:
         pieces.append(
             f"std::string(\"{parameter.name}=\") + {_cpp_value_text(expression, parameter.type)}"
         )
+    for field_name, expression, field_type in struct_logs or []:
+        pieces.append(
+            f"std::string(\"{field_name}=\") + {_cpp_value_text(expression, field_type)}"
+        )
     if not pieces:
         return 'std::string("")'
     result = pieces[0]
     for piece in pieces[1:]:
         result += f" + std::string(\";\") + {piece}"
     return result
+
+
+def _struct_pointer_parameters(metadata: ApiMetadata) -> dict[str, ParameterDefinition]:
+    """Return SDK struct/union pointer parameters that can carry field data."""
+    return {
+        parameter.name: parameter
+        for parameter in metadata.parameters
+        if "*" in parameter.type and parameter.pointed_type and parameter.fields
+    }
+
+
+def _field_value_schema(parameter: ParameterDefinition, field_path: str) -> dict[str, Any] | None:
+    current: dict[str, Any] = parameter.fields
+    parts = [part for part in str(field_path).split(".") if part]
+    for index, part in enumerate(parts):
+        match = re.fullmatch(r"([A-Za-z_]\w*)(?:\[(\d+)\])?", part)
+        if not match:
+            return None
+        name = match.group(1)
+        details = current.get(name)
+        if not isinstance(details, dict):
+            return None
+        if match.group(2) is not None and not details.get("array_dimensions"):
+            return None
+        if index == len(parts) - 1:
+            return details
+        nested = details.get("fields")
+        if not nested:
+            return None
+        current = nested
+    return None
+
+
+def _merge_nested_value(root: dict[str, Any], path: str, value: Any) -> None:
+    """Merge a dotted legacy field path into a nested struct_values object."""
+    parts = re.findall(r"[A-Za-z_]\w*|\[\d+\]", str(path))
+    current: Any = root
+    for index, part in enumerate(parts):
+        last = index == len(parts) - 1
+        if part.startswith("["):
+            if not isinstance(current, list):
+                raise SdkCallAssemblyError(
+                    f"SDK_STRUCT_VALUE_INVALID: cannot index non-array field at {path}"
+                )
+            position = int(part[1:-1])
+            while len(current) <= position:
+                current.append({})
+            if last:
+                current[position] = value
+            else:
+                current = current[position]
+            continue
+        if last:
+            if isinstance(current, dict) and part in current and isinstance(current[part], dict) and isinstance(value, dict):
+                current[part].update(value)
+            else:
+                current[part] = value
+            continue
+        next_part = parts[index + 1]
+        if part not in current:
+            current[part] = [] if next_part.startswith("[") else {}
+        current = current[part]
+
+
+def _normalize_struct_values(
+    metadata: ApiMetadata,
+    parameter_values: dict[str, Any],
+    struct_values: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Separate formal parameters from nested SDK struct field values.
+
+    Older model responses flattened fields into ``parameter_values``.  They
+    are migrated only when the root formal parameter and SDK field path are
+    both verified by the active metadata.
+    """
+    normalized_parameters = dict(parameter_values or {})
+    normalized_structs: dict[str, Any] = {}
+    if struct_values is not None:
+        if not isinstance(struct_values, dict):
+            raise SdkCallAssemblyError("SDK_STRUCT_VALUE_INVALID: struct_values must be an object")
+        normalized_structs.update(struct_values)
+    struct_parameters = _struct_pointer_parameters(metadata)
+    for key in list(normalized_parameters):
+        key_text = str(key)
+        root, separator, path = key_text.partition(".")
+        if key_text in struct_parameters and isinstance(normalized_parameters[key], dict):
+            normalized_structs.setdefault(key_text, {}).update(normalized_parameters.pop(key_text))
+            continue
+        if not separator or root not in struct_parameters:
+            continue
+        if _field_value_schema(struct_parameters[root], path) is None:
+            raise SdkCallAssemblyError(f"SDK_STRUCT_FIELD_UNKNOWN: {root}.{path}")
+        target = normalized_structs.setdefault(root, {})
+        if not isinstance(target, dict):
+            raise SdkCallAssemblyError(f"SDK_STRUCT_VALUE_INVALID: {root} must be an object")
+        _merge_nested_value(target, path, normalized_parameters.pop(key_text))
+    unknown_roots = sorted(set(normalized_structs) - set(struct_parameters))
+    if unknown_roots:
+        raise SdkCallAssemblyError(
+            f"SDK_STRUCT_ROOT_UNKNOWN: {metadata.api_name}; roots={unknown_roots}"
+        )
+    return normalized_parameters, normalized_structs
+
+
+def _cpp_assignment_value(value: Any, field_type: str) -> str:
+    if isinstance(value, bool):
+        raw = "true" if value else "false"
+    elif isinstance(value, (int, float)):
+        raw = repr(value)
+    elif isinstance(value, str) and value.strip():
+        raw = value.strip()
+    else:
+        raise SdkCallAssemblyError(
+            f"SDK_STRUCT_VALUE_INVALID: scalar value for type {field_type!r} is missing"
+        )
+    clean_type = re.sub(r"\s+", " ", str(field_type or "").strip())
+    if not clean_type:
+        raise SdkCallAssemblyError("SDK_STRUCT_VALUE_UNRESOLVED: field type is unavailable")
+    if isinstance(value, (int, float)):
+        lowered = clean_type.lower()
+        bounds: tuple[float, float] | None = None
+        if "unsigned char" in lowered:
+            bounds = (0, 255)
+        elif lowered == "char":
+            bounds = (-128, 127)
+        elif "unsigned short" in lowered:
+            bounds = (0, 65535)
+        elif lowered == "short":
+            bounds = (-32768, 32767)
+        elif "unsigned long" in lowered or lowered in {"unsigned int", "uint32_t"}:
+            bounds = (0, 4294967295)
+        elif lowered in {"long", "int", "long int", "int32_t"}:
+            bounds = (-2147483648, 2147483647)
+        if bounds is not None and not (bounds[0] <= value <= bounds[1]):
+            raise SdkCallAssemblyError(
+                f"SDK_STRUCT_VALUE_TYPE_MISMATCH: value={value} is outside {clean_type} range"
+            )
+    if isinstance(value, str) and not re.fullmatch(r"[-+]?\d+(?:\.\d+)?", value.strip()):
+        return raw
+    return f"static_cast<{clean_type}>({raw})"
+
+
+def _render_struct_assignments(
+    parameter: ParameterDefinition,
+    struct_value: Any,
+    symbol: str,
+) -> tuple[list[str], list[tuple[str, str, str]]]:
+    """Validate a nested field tree and render assignments/log fields."""
+    if not isinstance(struct_value, dict):
+        raise SdkCallAssemblyError(
+            f"SDK_STRUCT_VALUE_INVALID: {parameter.name} must contain an object"
+        )
+    assignments: list[str] = []
+    logs: list[tuple[str, str, str]] = []
+
+    def visit(schema: dict[str, Any], values: dict[str, Any], prefix: str) -> None:
+        for field_name, value in values.items():
+            if field_name in {"active_member", "active_branch"}:
+                continue
+            details = schema.get(field_name)
+            if not isinstance(details, dict):
+                raise SdkCallAssemblyError(
+                    f"SDK_STRUCT_FIELD_UNKNOWN: {parameter.name}.{prefix + field_name}"
+                )
+            path = f"{prefix}{field_name}"
+            nested = details.get("fields")
+            dimensions = details.get("array_dimensions") or []
+            if nested and dimensions:
+                if not isinstance(value, (list, tuple)):
+                    raise SdkCallAssemblyError(f"SDK_STRUCT_VALUE_INVALID: {parameter.name}.{path} must be an array")
+                for index, item in enumerate(value):
+                    if str(dimensions[0]).isdigit() and index >= int(dimensions[0]):
+                        raise SdkCallAssemblyError(f"SDK_STRUCT_ARRAY_BOUNDS: {parameter.name}.{path}[{index}]")
+                    if not isinstance(item, dict):
+                        raise SdkCallAssemblyError(f"SDK_STRUCT_VALUE_INVALID: {parameter.name}.{path}[{index}] must be an object")
+                    visit(nested, item, f"{path}[{index}].")
+                continue
+            if nested:
+                if not isinstance(value, dict):
+                    raise SdkCallAssemblyError(f"SDK_STRUCT_VALUE_INVALID: {parameter.name}.{path} must be an object")
+                nested_values = value
+                if str(details.get("type", "")).lstrip().lower().startswith("union"):
+                    active = value.get("active_member", value.get("active_branch"))
+                    branch_values = {
+                        key: item for key, item in value.items()
+                        if key not in {"active_member", "active_branch"}
+                    }
+                    if active is not None:
+                        active = str(active)
+                        if active not in nested:
+                            raise SdkCallAssemblyError(
+                                f"SDK_UNION_BRANCH_UNKNOWN: {parameter.name}.{path}.{active}"
+                            )
+                        if "value" in branch_values and active not in branch_values:
+                            branch_values = {active: branch_values["value"]}
+                    if len(branch_values) != 1:
+                        raise SdkCallAssemblyError(
+                            f"SDK_UNION_BRANCH_REQUIRED: {parameter.name}.{path}; provide exactly one active member"
+                        )
+                    if active is not None and next(iter(branch_values)) != active:
+                        raise SdkCallAssemblyError(
+                            f"SDK_UNION_BRANCH_MISMATCH: {parameter.name}.{path}; active_member={active}"
+                        )
+                    nested_values = branch_values
+                visit(nested, nested_values, path + ".")
+                continue
+            if dimensions:
+                if not isinstance(value, (list, tuple)):
+                    raise SdkCallAssemblyError(f"SDK_STRUCT_VALUE_INVALID: {parameter.name}.{path} must be an array")
+                for index, item in enumerate(value):
+                    if index >= int(dimensions[0]) if str(dimensions[0]).isdigit() else False:
+                        raise SdkCallAssemblyError(f"SDK_STRUCT_ARRAY_BOUNDS: {parameter.name}.{path}[{index}]")
+                    expression = f"{symbol}.{path}[{index}]"
+                    field_type = str(details.get("type") or "")
+                    assignments.append(f"{expression} = {_cpp_assignment_value(item, field_type)};")
+                    logs.append((f"{path}[{index}]", expression, field_type))
+                continue
+            expression = f"{symbol}.{path}"
+            field_type = str(details.get("type") or "")
+            assignments.append(f"{expression} = {_cpp_assignment_value(value, field_type)};")
+            logs.append((path, expression, field_type))
+
+    visit(parameter.fields, struct_value, "")
+    return assignments, logs
 
 
 def _normalize_expression_for_match(value: Any) -> str:
@@ -248,6 +483,7 @@ def assemble_capture_call(
     api_name: str,
     call_expr: str,
     parameter_values: dict[str, Any] | None = None,
+    struct_values: dict[str, Any] | None = None,
     available_symbols: dict[str, str] | None = None,
     symbol_step_id: str | None = None,
 ) -> tuple[str, dict[str, str]]:
@@ -262,7 +498,9 @@ def assemble_capture_call(
         raise SdkCallAssemblyError(
             f"SDK_CALL_ARGUMENT_COUNT_MISMATCH: {api_name}; expected={len(metadata.parameters)}; actual={len(args)}"
         )
-    supplied_values = parameter_values or {}
+    supplied_values, supplied_structs = _normalize_struct_values(
+        metadata, parameter_values or {}, struct_values
+    )
     formal_names = {parameter.name for parameter in metadata.parameters}
     unknown_values = sorted(set(str(key) for key in supplied_values) - formal_names)
     if unknown_values:
@@ -279,13 +517,42 @@ def assemble_capture_call(
         # execution context.  Keep the base names available for lexical
         # validation while member names are handled below.
         available.add(str(symbol).split(".", 1)[0].split("->", 1)[0])
+    struct_parameters = _struct_pointer_parameters(metadata)
     output_symbols: dict[str, str] = {}
+    struct_logs: list[tuple[str, str, str]] = []
     output_name_step = symbol_step_id or step_id
     rendered_args = list(args)
     declarations: list[str] = []
     for index, parameter in enumerate(metadata.parameters):
         expression = rendered_args[index]
-        if parameter.direction in {"out", "inout"} and "*" in parameter.type:
+        is_struct_pointer = parameter.name in struct_parameters
+        if is_struct_pointer:
+            marker = _placeholder(parameter.name)
+            if marker not in expression:
+                raise SdkCallAssemblyError(
+                    f"SDK_CALL_OUTPUT_BINDING_MISSING: {api_name}.{parameter.name}; use &{marker} in call_expr"
+                )
+            symbol = _symbol(output_name_step, parameter.name)
+            if parameter.direction in {"out", "inout"} or parameter.name in supplied_structs:
+                output_symbols[parameter.name] = symbol
+            rendered_args[index] = expression.replace(marker, symbol)
+            available.add(symbol)
+            pointed = (parameter.pointed_type or "").strip()
+            if not pointed:
+                raise SdkCallAssemblyError(
+                    f"SDK_CALL_ASSEMBLY_UNRESOLVED: {api_name}.{parameter.name}; output buffer rule is missing"
+                )
+            declarations.append(f"{pointed} {symbol}{{}};")
+            if parameter.name in supplied_structs:
+                assignments, logs = _render_struct_assignments(
+                    parameter, supplied_structs[parameter.name], symbol
+                )
+                declarations.extend(assignments)
+                struct_logs.extend(
+                    (f"{parameter.name}.{name}", expression_text, field_type)
+                    for name, expression_text, field_type in logs
+                )
+        elif parameter.direction in {"out", "inout"} and "*" in parameter.type:
             marker = _placeholder(parameter.name)
             if marker not in expression:
                 raise SdkCallAssemblyError(
@@ -318,7 +585,7 @@ def assemble_capture_call(
             raise SdkCallAssemblyError(
                 f"SDK_RUNTIME_SYMBOL_UNRESOLVED: {api_name}; symbols={sorted(set(unknown))}"
             )
-    parameter_text = _render_parameter_text(metadata, rendered_args)
+    parameter_text = _render_parameter_text(metadata, rendered_args, struct_logs)
     output_lambda = _render_output_lambda(metadata, output_symbols)
     call = (
         "\n".join(declarations)

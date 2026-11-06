@@ -243,6 +243,25 @@ class ParameterCoverageTests(unittest.TestCase):
         self.assertIn("api.cnc_rdopmsg", fragment)
         self.assertEqual(client.invoke_json.call_count, 1)
 
+    def test_batch_generation_passes_struct_values_to_generic_sdk_assembler(self):
+        from smart_traffic_agent.agents.code_generator import generate_capture_fragment
+        p = plan_for("cnc_wrrelpos")
+        state = WorkflowState(request=TaskRequest("capture", "t"), plan=p)
+        client = Mock(); client.enabled = True
+        client.invoke_json.return_value = {"api_fragments": [{
+            "step_id": "sample",
+            "apis": ["cnc_wrrelpos"],
+            "calls": [{
+                "api_name": "cnc_wrrelpos",
+                "call_expr": "api.cnc_wrrelpos(handle, 8, &__out_wrrelpos)",
+                "parameter_values": {"length": 8},
+                "struct_values": {"wrrelpos": {"datano": 0, "type": 1, "data": [12]}},
+            }],
+        }]}
+        fragment = generate_capture_fragment(state, p.steps, "", client)
+        self.assertIn("sample_wrrelpos.type = static_cast<short>(1);", fragment)
+        self.assertIn("sample_wrrelpos.data[0] = static_cast<long>(12);", fragment)
+
     def test_one_step_can_emit_multiple_parameter_combinations(self):
         from smart_traffic_agent.agents.code_generator import generate_capture_fragment
         p = plan_for("cnc_statinfo")

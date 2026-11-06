@@ -175,6 +175,23 @@ def _field_definition(
 ) -> dict[str, Any]:
     if index is None:
         return {}
+    inline_match = re.search(r"\b(?:union|struct)\s*\{(?P<body>.*)\}", type_name, re.IGNORECASE | re.DOTALL)
+    if inline_match:
+        inline_fields: dict[str, Any] = {}
+        for declaration in inline_match.group("body").split(";"):
+            parsed = _type_and_name(declaration)
+            if parsed is None:
+                continue
+            nested_type, name, arrays = parsed
+            details: dict[str, Any] = {
+                "type": nested_type,
+                "array_dimensions": list(arrays),
+            }
+            nested = _field_definition(nested_type, index, _seen)
+            if nested:
+                details["fields"] = nested
+            inline_fields[name] = details
+        return inline_fields
     clean = type_name.replace("const", "").replace("*", "").strip().upper()
     item = index.structs.get(clean) or index.unions.get(clean)
     if not item:

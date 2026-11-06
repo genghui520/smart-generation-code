@@ -219,3 +219,104 @@ def test_sdk_call_assembler_uses_unique_output_names_for_combinations():
     )
     assert "ODBST S001_statinfo{};" in first
     assert "ODBST S001_C002_statinfo{};" in second
+
+
+def test_sdk_call_assembler_initializes_generic_struct_values_and_logs_fields():
+    from smart_traffic_agent.sdk_cpp_generator import assemble_capture_call
+
+    fragment, _ = assemble_capture_call(
+        step_id="S004",
+        api_name="cnc_wrrelpos",
+        call_expr="api.cnc_wrrelpos(handle, 8, &__out_wrrelpos)",
+        parameter_values={"length": 8},
+        struct_values={"wrrelpos": {"datano": 0, "type": 1, "data": [12]}},
+    )
+    assert "S004_wrrelpos.type = static_cast<short>(1);" in fragment
+    assert "S004_wrrelpos.data[0] = static_cast<long>(12);" in fragment
+    assert "wrrelpos.data[0]" in fragment
+
+
+def test_sdk_call_assembler_reuses_same_struct_contract_for_another_api():
+    from smart_traffic_agent.sdk_cpp_generator import assemble_capture_call
+
+    fragment, _ = assemble_capture_call(
+        step_id="S006",
+        api_name="cnc_prstwkcd",
+        call_expr="api.cnc_prstwkcd(handle, 8, &__out_prstwkcd)",
+        parameter_values={"length": 8},
+        struct_values={"prstwkcd": {"datano": 0, "type": 1, "data": [7]}},
+    )
+    assert "IDBWRA S006_prstwkcd{};" in fragment
+    assert "S006_prstwkcd.data[0] = static_cast<long>(7);" in fragment
+
+
+def test_sdk_call_assembler_migrates_flattened_struct_fields():
+    from smart_traffic_agent.sdk_cpp_generator import assemble_capture_call
+
+    fragment, _ = assemble_capture_call(
+        step_id="S004",
+        api_name="cnc_wrrelpos",
+        call_expr="api.cnc_wrrelpos(handle, 8, &__out_wrrelpos)",
+        parameter_values={"length": 8, "wrrelpos.type": 1, "wrrelpos.data[0]": 12},
+    )
+    assert "S004_wrrelpos.type = static_cast<short>(1);" in fragment
+    assert "S004_wrrelpos.data[0] = static_cast<long>(12);" in fragment
+
+
+def test_sdk_call_assembler_rejects_unknown_struct_field():
+    from smart_traffic_agent.sdk_cpp_generator import SdkCallAssemblyError, assemble_capture_call
+
+    try:
+        assemble_capture_call(
+            step_id="S004",
+            api_name="cnc_wrrelpos",
+            call_expr="api.cnc_wrrelpos(handle, 8, &__out_wrrelpos)",
+            parameter_values={"length": 8},
+            struct_values={"wrrelpos": {"not_a_field": 1}},
+        )
+    except SdkCallAssemblyError as exc:
+        assert "SDK_STRUCT_FIELD_UNKNOWN" in str(exc)
+    else:
+        raise AssertionError("unknown SDK struct fields must be rejected")
+
+
+def test_sdk_call_assembler_rejects_struct_scalar_type_range_error():
+    from smart_traffic_agent.sdk_cpp_generator import SdkCallAssemblyError, assemble_capture_call
+
+    try:
+        assemble_capture_call(
+            step_id="S004",
+            api_name="cnc_wrrelpos",
+            call_expr="api.cnc_wrrelpos(handle, 8, &__out_wrrelpos)",
+            parameter_values={"length": 8},
+            struct_values={"wrrelpos": {"type": 40000}},
+        )
+    except SdkCallAssemblyError as exc:
+        assert "SDK_STRUCT_VALUE_TYPE_MISMATCH" in str(exc)
+    else:
+        raise AssertionError("out-of-range SDK field values must be rejected")
+
+
+def test_sdk_call_assembler_validates_anonymous_union_branch_generically():
+    from smart_traffic_agent.sdk_cpp_generator import SdkCallAssemblyError, assemble_capture_call
+
+    fragment, _ = assemble_capture_call(
+        step_id="S005",
+        api_name="cnc_rdparam",
+        call_expr="api.cnc_rdparam(handle, 1, 0, 8, &__out_param)",
+        parameter_values={"number": 1, "axis": 0, "length": 8},
+        struct_values={"param": {"u": {"active_member": "idata", "value": 2}}},
+    )
+    assert "S005_param.u.idata = static_cast<short>(2);" in fragment
+    try:
+        assemble_capture_call(
+            step_id="S005",
+            api_name="cnc_rdparam",
+            call_expr="api.cnc_rdparam(handle, 1, 0, 8, &__out_param)",
+            parameter_values={"number": 1, "axis": 0, "length": 8},
+            struct_values={"param": {"u": {"idata": 2, "ldata": 3}}},
+        )
+    except SdkCallAssemblyError as exc:
+        assert "SDK_UNION_BRANCH_REQUIRED" in str(exc)
+    else:
+        raise AssertionError("multiple anonymous union branches must be rejected")

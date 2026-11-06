@@ -2101,19 +2101,23 @@ def generate_api_fragment_bundle_with_llm(
     system_prompt = (
         "You are CodeGenerationAgent generating bare FANUC FOCAS API expressions for a fixed C++17 harness. "
         "Return JSON only with key api_fragments. Each item must contain step_id and calls; each call must contain "
-        "api_name, call_expr, and parameter_values (use an empty object only when the API has no named inputs). "
+        "api_name, call_expr, parameter_values, and optional struct_values. parameter_values may contain only "
+        "formal SDK parameter names; structure or union fields must be nested under struct_values using the pointer "
+        "parameter name as the root. Use an empty parameter_values object only when the API has no named inputs. "
         "The call_expr must be exactly one bare expression such as "
         "api.cnc_statinfo(handle, &__out_statinfo). The local assembler will create SDK declarations, parameter logs, "
         "output serializers, lambdas, and the six-argument ctx.call wrapper. "
         "Never emit ctx.call, lambda syntax, semicolons, declarations, main(), includes, structs, typedefs, connection, "
         "cleanup, logging code, Markdown, api.function(...), target_api, TODO, or ellipsis. "
-        "Use only the supplied Fwlib32.h prototype and SDK type context. Current output pointers must use the placeholder "
+        "Use only the supplied Fwlib32.h prototype and SDK type context. Current structure pointers must use the placeholder "
         "&__out_<formal_parameter_name>; earlier output values must use only the available_runtime_symbols supplied for "
         "that step. Do not invent an upstream output or replace a missing runtime value with a guessed literal. "
         "Preserve the complete ExecutionPlan order and return at least one call entry for each planned API. "
         "When parameter combinations contain multiple cases, return one call entry per case in deterministic order; "
         "repeated api_name values within one step are valid and must not be collapsed. "
         "Parameter expressions may contain documented constants, literals, handle, and previously bound runtime symbols. "
+        "For a structure pointer, put field values in struct_values, for example "
+        "struct_values:{\"buffer\":{\"type\":1,\"data\":[12]}}; do not emit buffer.type or buffer.data[0] as parameter keys. "
         "The local assembler, not the model, owns return-code handling, input/output CSV format and PCAP boundaries. "
         "Repair only requested step_ids and leave unrelated cached calls unchanged."
     )
@@ -2135,7 +2139,7 @@ def generate_api_fragment_bundle_with_llm(
         f"NC program already embedded by the harness:\n{nc_program}\n"
         f"Repair diagnostics:\n{diagnostics}\n"
         f"Existing fragments for the requested steps:\n{json.dumps(existing, ensure_ascii=False, indent=2)}\n"
-        "Return JSON with this shape: {\"api_fragments\":[{\"step_id\":\"S001\",\"calls\":[{\"api_name\":\"cnc_statinfo\",\"call_expr\":\"api.cnc_statinfo(handle, &__out_statinfo)\",\"parameter_values\":{}}]}]}"
+        "Return JSON with this shape: {\"api_fragments\":[{\"step_id\":\"S001\",\"calls\":[{\"api_name\":\"cnc_statinfo\",\"call_expr\":\"api.cnc_statinfo(handle, &__out_statinfo)\",\"parameter_values\":{},\"struct_values\":{}}]}]}"
     )
     payload = llm_client.invoke_json(system_prompt, user_prompt)
     _record_generation_response(state, llm_client, stage="api_fragment_bundle_generation")
@@ -2178,6 +2182,7 @@ def generate_api_fragment_bundle_with_llm(
                 "api_name": row.get("api_name") or (expected[step_id][0] if len(expected[step_id]) == 1 else ""),
                 "call_expr": row.get("call_expr"),
                 "parameter_values": row.get("parameter_values", {}),
+                "struct_values": row.get("struct_values", {}),
             }]
         if not isinstance(calls, list) or not calls:
             raise ValueError(f"CODEGEN_CALLS_EMPTY[step={step_id}]: return calls with bare call_expr entries")
@@ -2195,6 +2200,9 @@ def generate_api_fragment_bundle_with_llm(
             parameter_values = call.get("parameter_values", {})
             if not isinstance(parameter_values, dict):
                 raise ValueError(f"CODEGEN_CALL_PARAMETERS_INVALID: step_id={step_id}; api={api_name}")
+            struct_values = call.get("struct_values", {})
+            if not isinstance(struct_values, dict):
+                raise ValueError(f"CODEGEN_STRUCT_VALUES_INVALID: step_id={step_id}; api={api_name}")
             try:
                 # Each combination needs a unique local output object name,
                 # while the externally visible step_id remains the plan's
@@ -2205,6 +2213,7 @@ def generate_api_fragment_bundle_with_llm(
                     api_name=api_name,
                     call_expr=call_expr,
                     parameter_values=parameter_values,
+                    struct_values=struct_values,
                     available_symbols=_runtime_symbols_before_step(all_steps, step_id),
                     symbol_step_id=(step_id if combination_index == 1 else f"{step_id}_C{combination_index:03d}"),
                 )
