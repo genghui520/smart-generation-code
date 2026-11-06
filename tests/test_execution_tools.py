@@ -410,7 +410,7 @@ class CppToolchainPathTests(unittest.TestCase):
             self.assertIn("output_data", text)
             self.assertIn("host=127.0.0.1;port=8193", text)
             self.assertIn("handle=32769", text)
-            self.assertIn(",4,", text)
+            self.assertNotIn("api_parameter_count", text.splitlines()[0])
 
     def test_collect_writes_per_api_csvs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -447,7 +447,7 @@ class CppToolchainPathTests(unittest.TestCase):
             self.assertTrue(descriptive_output_csv.exists())
             self.assertIn("handle=1", actf_input_csv.read_text(encoding="utf-8-sig"))
             self.assertIn("actual_feed=120", actf_output_csv.read_text(encoding="utf-8-sig"))
-            self.assertIn(",2,", actf_input_csv.read_text(encoding="utf-8-sig"))
+            self.assertNotIn("api_parameter_count", actf_input_csv.read_text(encoding="utf-8-sig").splitlines()[0])
 
     def test_collect_removes_stale_per_api_csvs_from_previous_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

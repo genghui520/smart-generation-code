@@ -69,9 +69,55 @@ def build_fast_path_steps(target: str) -> list[PlanStep]:
     ]
 
 
-def eligible_read_fast_path(targets: Iterable[str], *, header_path: Path, manifest_functions: Iterable[str] = ()) -> tuple[bool, list[dict[str, Any]]]:
+def eligible_read_fast_path(
+    targets: Iterable[str],
+    *,
+    header_path: Path,
+    manifest_functions: Iterable[str] = (),
+    prerequisites: dict[str, Any] | None = None,
+    trcm_context: dict[str, Any] | None = None,
+) -> tuple[bool, list[dict[str, Any]]]:
+    """Check the ordinary read recipe.
+
+    A graph-declared stateful variation contract always overrides the generic
+    read classification.  The optional arguments keep this helper useful for
+    direct callers while Planner can still perform its normal graph lookup.
+    """
     facts = [classify_known_api(name, header_path=header_path, manifest_functions=manifest_functions) for name in targets]
+    selected = [str(item).strip() for item in targets if str(item).strip()]
+    contract = prerequisites or {}
+    if not contract and isinstance(trcm_context, dict):
+        api_facts = (trcm_context.get("apis", {}) or {}).get(selected[0], {}) if len(selected) == 1 else {}
+        if isinstance(api_facts, dict):
+            api_info = api_facts.get("api_info", {})
+            node = api_info.get("api", {}) if isinstance(api_info, dict) else {}
+            contract = api_facts.get("prerequisites", {}) or (node.get("prerequisites", {}) if isinstance(node, dict) else {})
+    if len(selected) == 1 and selected[0] == "cnc_rdngrp" and _has_stateful_variation_contract(contract):
+        facts[0] = {**facts[0], "status": "partially_known", "reasons": [*facts[0].get("reasons", []), "graph-declared tool-life variation requires stateful path"]}
+        return False, facts
     return len(facts) == 1 and facts[0]["status"] == "known", facts
+
+
+def _has_stateful_variation_contract(prerequisites: Any) -> bool:
+    if isinstance(prerequisites, str):
+        try:
+            import json
+            prerequisites = json.loads(prerequisites)
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(prerequisites, dict):
+        return False
+    candidates: list[Any] = []
+    for key in ("variation", "tool_life_variation"):
+        raw = prerequisites.get(key)
+        candidates.extend(raw if isinstance(raw, list) else [raw] if isinstance(raw, dict) else [])
+    raw_nc = prerequisites.get("nc_program", [])
+    candidates.extend(raw_nc if isinstance(raw_nc, list) else [raw_nc] if isinstance(raw_nc, dict) else [])
+    return any(
+        isinstance(item, dict)
+        and "tool_life_variation" in " ".join(str(item.get(key, "")) for key in ("requirement", "variation", "scenario", "kind")).casefold()
+        for item in candidates
+    )
 
 
 def _relation_matches(row: dict[str, Any], source: str, target: str, relation_type: str) -> bool:

@@ -101,6 +101,7 @@ def test_export_writes_legacy_layout_and_auditable_mapping() -> None:
             output_row = next(csv.DictReader(source))
         assert input_row["api_name"] == "cnc_absolute"
         assert input_row["parameters"] == "axis=1;length=8"
+        assert "api_parameter_count" not in input_row
         assert output_row["data"] == "position=13440;decimal=3"
         assert input_row["index"] == output_row["index"] == "1"
         assert input_row["invocation_id"] == output_row["invocation_id"] == "inv-1"

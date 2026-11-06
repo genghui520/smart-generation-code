@@ -38,13 +38,80 @@ def test_sdk_metadata_counts_real_input_and_inout_parameters() -> None:
     assert download.parameters[2].valid_length_rule == "runtime_bound_by=length"
 
 
+def test_cnc_alarm2_uses_the_active_header_contract() -> None:
+    alarm = api_metadata("cnc_alarm2")
+
+    assert alarm.complete
+    assert [item.name for item in alarm.parameters] == ["FlibHndl", "alarm"]
+    assert [item.type for item in alarm.parameters] == ["unsigned short", "long *"]
+    assert [item.direction for item in alarm.parameters] == ["in", "out"]
+
+
+def test_api_metadata_reports_sdk_header_arity_mismatch(monkeypatch) -> None:
+    import smart_traffic_agent.api_log_templates as templates
+    from types import SimpleNamespace
+
+    templates.api_metadata.cache_clear()
+    monkeypatch.setattr(
+        templates,
+        "named_prototype",
+        lambda _name: "FWLIBAPI short WINAPI cnc_alarm2(unsigned short FlibHndl, long *alarm);",
+    )
+    monkeypatch.setattr(
+        templates,
+        "_sdk_index",
+        lambda: SimpleNamespace(
+            functions={"cnc_alarm2": "FWLIBAPI short WINAPI cnc_alarm2(unsigned short, long *, short);"},
+            structs={},
+            unions={},
+        ),
+    )
+    metadata = templates.api_metadata("cnc_alarm2")
+    try:
+        assert not metadata.complete
+        assert any("SDK_PROTOTYPE_MISMATCH" in item for item in metadata.diagnostics)
+        assert any("documented_parameters=2" in item for item in metadata.diagnostics)
+        assert any("sdk_header_parameters=3" in item for item in metadata.diagnostics)
+    finally:
+        monkeypatch.undo()
+        templates.api_metadata.cache_clear()
+
+
+def test_api_metadata_reports_sdk_header_type_mismatch(monkeypatch) -> None:
+    import smart_traffic_agent.api_log_templates as templates
+    from types import SimpleNamespace
+
+    templates.api_metadata.cache_clear()
+    monkeypatch.setattr(
+        templates,
+        "named_prototype",
+        lambda _name: "FWLIBAPI short WINAPI cnc_alarm2(unsigned short FlibHndl, long *alarm);",
+    )
+    monkeypatch.setattr(
+        templates,
+        "_sdk_index",
+        lambda: SimpleNamespace(
+            functions={"cnc_alarm2": "FWLIBAPI short WINAPI cnc_alarm2(unsigned short, short *);"},
+            structs={},
+            unions={},
+        ),
+    )
+    metadata = templates.api_metadata("cnc_alarm2")
+    try:
+        assert not metadata.complete
+        assert any("documented_types" in item and "sdk_header_types" in item for item in metadata.diagnostics)
+    finally:
+        monkeypatch.undo()
+        templates.api_metadata.cache_clear()
+
+
 def test_fixed_rows_keep_handle_and_only_emit_success_output() -> None:
     input_row = fixed_input_row({
         "timestamp": "2026-10-28T12:00:00Z",
         "protocol_function": "cnc_rdmacro",
         "parameters": "FlibHndl=32769;number=100;length=10",
     })
-    assert input_row["api_parameter_count"] == 3
+    assert "api_parameter_count" not in input_row
     assert input_row["params"].startswith("FlibHndl=32769")
 
     success = fixed_output_row({

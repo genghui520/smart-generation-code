@@ -1,0 +1,9 @@
+{
+  "protocol": "ezsocket",
+  "manual": "E:\\BaiduNetdiskDownload\\三合一数控机床虚拟机\\三菱A2\\FCSB1224W000 参考手册 ib1501632f.pdf",
+  "simcnc_source": "E:\\BaiduNetdiskDownload\\三合一数控机床虚拟机\\三菱A2\\SimCNC-master",
+  "manual_pages": 291,
+  "api_count": 31,
+  "rule_count": 3,
+  "test_api": "Status_GetRunStatus"
+}

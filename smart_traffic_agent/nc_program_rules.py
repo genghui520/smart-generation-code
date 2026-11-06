@@ -5,6 +5,136 @@ from typing import Any
 from .models import ExecutionPlan, NcProgramSpec, PlanStep
 
 
+TOOL_LIFE_VARIATION_APIS = frozenset({"cnc_rdngrp"})
+
+
+def _as_prerequisite_map(prerequisites: Any) -> dict[str, Any]:
+    if isinstance(prerequisites, str):
+        try:
+            import json
+            prerequisites = json.loads(prerequisites)
+        except (TypeError, ValueError):
+            return {}
+    return prerequisites if isinstance(prerequisites, dict) else {}
+
+
+def extract_tool_life_variation_requirement(prerequisites: Any) -> dict[str, Any] | None:
+    """Return the graph-declared tool-life/NC variation contract.
+
+    Neo4j stores this as JSON and older graph snapshots may use either a
+    single mapping or a list of mappings.  Keep the reader permissive while
+    requiring the explicit ``tool_life_variation`` marker before a target is
+    promoted to the stateful path.
+    """
+    value = _as_prerequisite_map(prerequisites)
+    candidates: list[Any] = []
+    for key in ("variation", "tool_life_variation"):
+        raw = value.get(key)
+        if isinstance(raw, dict):
+            candidates.append(raw)
+        elif isinstance(raw, list):
+            candidates.extend(raw)
+    candidates.extend(item for item in value.get("nc_program", []) if isinstance(item, dict))
+    for item in candidates:
+        marker = " ".join(str(item.get(key, "")) for key in ("requirement", "scenario", "variation", "kind")).casefold()
+        if "tool_life_variation" in marker or ("tool" in marker and "variation" in marker):
+            return dict(item)
+    return None
+
+
+def has_tool_life_variation_requirement(prerequisites: Any) -> bool:
+    return extract_tool_life_variation_requirement(prerequisites) is not None
+
+
+def build_tool_life_variation_steps() -> list[PlanStep]:
+    """Build the deterministic registration, NC lifecycle and sampling path."""
+    return [
+        PlanStep("TL-001", "before", "read baseline CNC status", "ReadRunStatus", {}, protocol_function="cnc_statinfo"),
+        PlanStep("TL-002", "before", "read baseline CNC alarm state", "ReadAlarm", {}, protocol_function="cnc_alarm2"),
+        PlanStep("TL-003", "before", "read current registered tool-group count", "ReadToolGroupCount", {}, protocol_function="cnc_rdngrp", role="auxiliary"),
+        PlanStep(
+            "TL-004", "before", "register a verified tool-life group when absent", "RegisterToolLifeGroup",
+            {"registration_api": "cnc_instlifedt", "dangerous_operation": True, "auto_execute": False,
+             "requires_isolated_simulator_write_permission": True, "values_source": "runtime_or_graph_evidence"},
+            protocol_function="cnc_instlifedt", role="auxiliary", expected_state="registration succeeds or an existing group is verified",
+        ),
+        PlanStep("TL-005", "before", "verify registered tool group", "VerifyToolGroup", {"group_source": "runtime_registration_output"}, protocol_function="cnc_rdngrp", role="auxiliary"),
+        PlanStep("TL-006", "before", "verify registered tool membership", "VerifyToolGroupTools", {"group_source": "runtime_registration_output"}, protocol_function="cnc_rdntool", role="auxiliary"),
+        PlanStep("TL-007", "before", "verify tool maps to group", "VerifyToolGroupId", {"tool_source": "runtime_registration_output"}, protocol_function="cnc_rdgrpid", role="auxiliary"),
+        PlanStep("TL-008", "before", "upload NC program with verified T code", "UploadProgram", {"t_code_source": "verified_registered_tool"}, protocol_function="cnc_dwnstart3/cnc_download3/cnc_dwnend3"),
+        PlanStep("TL-009", "before", "select and verify NC program", "SelectProgram", {"program_number_source": "runtime_upload_result"}, protocol_function="cnc_search"),
+        PlanStep("TL-010", "before", "verify selected NC program", "ReadProgramNumber", {}, protocol_function="cnc_rdprgnum"),
+        PlanStep("TL-011", "during", "start NCGuide Cycle Start", "StartProgram", {"execution_gate": "isolated_simulator_and_explicit_permission", "cycle_start": True}, protocol_function="ncguide_ui_cycle_start", operation_kind="ncguide_ui"),
+        PlanStep("TL-012", "during", "confirm NC program is running", "ReadRunStatus", {"run_field": "statinfo.run", "required_value": "running"}, protocol_function="cnc_statinfo", expected_state="cnc_statinfo.run confirms execution"),
+        PlanStep("TL-013", "during", "sample tool-group count during execution", "ReadToolGroupCount", {"sample_role": "dynamic_variation"}, protocol_function="cnc_rdngrp", repeat=4, interval_seconds=0.2, role="target"),
+        PlanStep("TL-014", "during", "sample tool-group membership during execution", "ReadToolGroupTools", {"group_source": "runtime_registration_output", "sample_role": "dynamic_variation"}, protocol_function="cnc_rdntool", repeat=2, interval_seconds=0.2, role="auxiliary"),
+        PlanStep("TL-015", "during", "confirm run gate remains valid", "ReadRunStatus", {"run_field": "statinfo.run", "required_value": "running"}, protocol_function="cnc_statinfo", repeat=2, interval_seconds=0.2),
+        PlanStep("TL-016", "after", "confirm NC program completion", "ReadRunStatus", {"run_field": "statinfo.run", "required_value": "idle"}, protocol_function="cnc_statinfo"),
+        PlanStep("TL-017", "after", "read final tool-group count", "ReadToolGroupCount", {"sample_role": "final_variation"}, protocol_function="cnc_rdngrp", role="target"),
+    ]
+
+
+def apply_tool_life_variation_rule(
+    plan: ExecutionPlan,
+    trcm_context: dict[str, Any],
+    requested_targets: list[str] | tuple[str, ...],
+) -> bool:
+    """Apply the graph contract for cnc_rdngrp's tool-life variation path."""
+    targets = {str(item).strip() for item in requested_targets if str(item).strip()}
+    if not targets.intersection(TOOL_LIFE_VARIATION_APIS):
+        return False
+    facts = (trcm_context.get("apis", {}) or {}).get("cnc_rdngrp", {})
+    if not isinstance(facts, dict):
+        return False
+    api_info = facts.get("api_info", {})
+    node = api_info.get("api", {}) if isinstance(api_info, dict) else {}
+    prerequisites = facts.get("prerequisites", {}) or facts.get("prerequisites_json", {})
+    if not prerequisites and isinstance(node, dict):
+        prerequisites = node.get("prerequisites", {}) or node.get("prerequisites_json", {})
+    requirement = extract_tool_life_variation_requirement(prerequisites)
+    if requirement is None:
+        return False
+    graph_requirements = extract_nc_program_requirements(prerequisites)
+    plan.target_api = "cnc_rdngrp"
+    plan.scenario_type = "tool_life_variation"
+    plan.scenario = "tool_life_variation"
+    plan.scenario_goal = "Capture cnc_rdngrp across verified tool-group registration states while an NC program using a registered T code is running."
+    plan.nc_program_type = "required_for_running_state"
+    plan.nc_program_requirements = list(dict.fromkeys([
+        "NC program must contain a valid O number and a T code bound to a verified registered tool",
+        "NC program must be uploaded, selected, and verified before Cycle Start",
+        "cnc_statinfo.run must confirm execution before dynamic cnc_rdngrp samples count",
+        "Only successful registration, NC execution, and target reads count as valid diversity samples",
+        *graph_requirements,
+    ]))
+    plan.nc_program_spec = NcProgramSpec(
+        program_name="",
+        purpose="Run a bounded NC program that invokes a verified registered tool while sampling tool-group state.",
+        block_goals=["select a verified registered tool with a T code", "perform a bounded safe operation", "end with M30"],
+        constraints=[
+            "registration writes are allowed only in an isolated simulator with explicit permission",
+            "never invent tool or group numbers; bind them from runtime reads or graph/RAG evidence",
+            "Cycle Start is blocked when isolation or permission gates are absent",
+            "cnc_statinfo.run is the mandatory dynamic-sample gate",
+            *graph_requirements,
+        ],
+        generation_notes=["Use only a T code that was verified by cnc_rdgrpid/cnc_rdntool or an existing registration readback."],
+    )
+    plan.steps = build_tool_life_variation_steps()
+    plan.rag_context["tool_life_variation"] = {
+        "target_api": "cnc_rdngrp",
+        "registration_api": "cnc_instlifedt",
+        "verification_apis": ["cnc_rdngrp", "cnc_rdntool", "cnc_rdgrpid"],
+        "status_gate": "cnc_statinfo.run",
+        "registration_write": {"dangerous_operation": True, "auto_execute": False, "requires_isolated_simulator_write_permission": True},
+        "tool_values_source": "runtime_readback_or_explicit_graph_rag_evidence",
+        "diversity_policy": "require at least two distinct verified registration/output states",
+        "nc_program_requirements": list(plan.nc_program_requirements),
+    }
+    plan.rag_context["explicit_target_functions"] = ["cnc_rdngrp"]
+    return True
+
+
 def extract_nc_program_requirement(prerequisites: Any) -> str | None:
     """Return the first explicit NC-program requirement from a node contract."""
     if isinstance(prerequisites, str):

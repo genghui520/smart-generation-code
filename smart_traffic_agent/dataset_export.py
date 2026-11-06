@@ -21,7 +21,7 @@ from .traffic_transactions import parse_tcp_payload_frame
 
 INPUT_CSV_FIELDS = [
     "index", "timestamp", "invocation_id", "transaction_id", "traffic_status",
-    "api_name", "api_parameter_count", "parameters",
+    "api_name", "parameters",
 ]
 OUTPUT_CSV_FIELDS = [
     "index", "timestamp", "invocation_id", "transaction_id", "traffic_status",
@@ -77,7 +77,6 @@ def export_legacy_dataset(
         }
         inputs_by_stem[stem].append({
             **common,
-            "api_parameter_count": invocation.get("api_parameter_count", 0),
             "parameters": invocation.get("input_parameters", ""),
         })
         outputs_by_stem[stem].append({
@@ -225,7 +224,6 @@ def _write_dataset_txt(
         item: dict[str, Any] = {
             "time_ip": _display_timestamp(invocation.get("log_timestamp")),
             "operation": operation,
-            "arg_num": str(invocation.get("api_parameter_count", 0)),
         }
         item.update(dict(_key_values(invocation.get("input_parameters"))))
         csv_data.append(item)

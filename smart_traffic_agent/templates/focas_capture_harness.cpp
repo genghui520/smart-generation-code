@@ -245,8 +245,8 @@ public:
                        input_("data\\focas_api_input.csv", std::ios::binary),
                        output_("data\\focas_api_output.csv", std::ios::binary) {
         if (!input_ || !output_) throw std::runtime_error("Cannot create API CSV logs");
-        input_ << "\xEF\xBB\xBFindex,timestamp,step_id,interface_name,protocol_function,parameters,api_parameter_count,invocation_id,transaction_id,start_timestamp_ns,device_context\n";
-        output_ << "\xEF\xBB\xBFindex,timestamp,step_id,api_name,return_code,return_text,data,api_parameter_count,invocation_id,transaction_id,end_timestamp_ns\n";
+        input_ << "\xEF\xBB\xBFindex,timestamp,step_id,interface_name,protocol_function,parameters,invocation_id,transaction_id,start_timestamp_ns,device_context\n";
+        output_ << "\xEF\xBB\xBFindex,timestamp,step_id,api_name,return_code,return_text,data,invocation_id,transaction_id,end_timestamp_ns\n";
         nonce_ = std::to_string(GetCurrentProcessId()) + "-" + std::to_string(timestamp_ns());
     }
     template<class Function, class Callable, class Output>
@@ -424,28 +424,11 @@ private:
         return result;
     }
 
-    static int parameter_count(const std::string& name) {
-        // This legacy CSV field is the SDK/ABI argument count. FlibHndl is
-        // session context, and must not be described as a CNC business input.
-        if (name == "cnc_alarm") return 2;
-        if (name == "cnc_alarm2") return 2;
-        if (name == "cnc_clralm") return 2;
-        if (name == "cnc_getdtailerr") return 2;
-        if (name == "cnc_rdalmhisno") return 2;
-        if (name == "cnc_rdalmhistry5") return 5;
-        if (name == "cnc_rdalmmsg2") return 4;
-        if (name == "cnc_reset") return 1;
-        if (name == "cnc_startophis") return 1;
-        if (name == "cnc_statinfo") return 2;
-        if (name == "cnc_stopophis") return 1;
-__PARAMETER_COUNTS__
-        return 0;
-    }
     void write_input(int index, const std::string& step, const std::string& api, const std::string& params,
                      const std::string& id, const std::string& tx, long long ns) {
         std::string device = "target=NCGuide;endpoint=" + env("FOCAS_HOST", "127.0.0.1") + ":" + env("FOCAS_PORT", "8193");
         input_ << index << ',' << csv(timestamp()) << ',' << csv(step) << ',' << csv(api) << ',' << csv(api)
-               << ',' << csv(params) << ',' << parameter_count(api) << ',' << csv(id) << ',' << csv(tx)
+               << ',' << csv(params) << ',' << csv(id) << ',' << csv(tx)
                << ',' << ns << ',' << csv(device) << '\n';
         input_.flush();
     }
@@ -453,7 +436,7 @@ __PARAMETER_COUNTS__
                       const std::string& label, const std::string& data, const std::string& id,
                       const std::string& tx, long long ns) {
         output_ << index << ',' << csv(timestamp()) << ',' << csv(step) << ',' << csv(api) << ',' << ret
-                << ',' << csv(label) << ',' << csv(data) << ',' << parameter_count(api) << ',' << csv(id)
+                << ',' << csv(label) << ',' << csv(data) << ',' << csv(id)
                 << ',' << csv(tx) << ',' << ns << '\n';
         output_.flush();
     }

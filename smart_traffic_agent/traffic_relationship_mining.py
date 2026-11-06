@@ -179,6 +179,62 @@ def seed_documented_relations(
             prerequisites=dict(row.get("prerequisites", {}) or {}) if isinstance(row.get("prerequisites", {}), dict) else {},
         ))
     relations: list[dict[str, Any]] = []
+    if "cnc_rdngrp" in names:
+        # Tool-life registration is a documented prerequisite of the group
+        # count API.  Keep this edge in the shared migration path so memory
+        # graph tests and Neo4j target-only seeds expose the same contract.
+        rdngrp_contract = {
+            "tool_registration": [{
+                "requirement": "at_least_one_registered_tool_group",
+                "prepare_api": "cnc_instlifedt",
+                "dangerous_operation": True,
+                "auto_execute": False,
+                "requires_isolated_simulator_write_permission": True,
+            }],
+            "variation": [{
+                "requirement": "tool_life_variation",
+                "success_condition": "at least two distinct registered/output states",
+            }],
+            "nc_program": [{
+                "requirement": "tool_life_variation_running",
+                "requirements": [
+                    "NC program must reference a verified registered tool number or tool group with a T code",
+                    "NC program must be uploaded, selected, and run before dynamic cnc_rdngrp samples count",
+                    "cnc_statinfo.run must confirm execution",
+                ],
+                "registration_api": "cnc_instlifedt",
+                "run_gate_api": "cnc_statinfo",
+            }],
+        }
+        # Neo4j's upsert preserves existing non-empty JSON; the memory store
+        # applies the same merge semantics through ApiNode.upsert_api.
+        row = metadata.get("cnc_rdngrp", {})
+        service.call("upsert_api", ApiNode(
+            api_id="focas:cnc_rdngrp", name="cnc_rdngrp", protocol="FOCAS",
+            sdk_signature_ref=str(row.get("chunk_id", "")), description=str(row.get("description", ""))[:500],
+            metadata={"source": row.get("source_url", "")}, prerequisites=rdngrp_contract,
+        ))
+        for helper in ("cnc_instlifedt", "cnc_rdntool", "cnc_rdgrpid", "cnc_statinfo"):
+            helper_row = metadata.get(helper, {})
+            service.call("upsert_api", ApiNode(
+                api_id=f"focas:{helper}", name=helper, protocol="FOCAS",
+                sdk_signature_ref=str(helper_row.get("chunk_id", "")), description=str(helper_row.get("description", ""))[:500],
+                metadata={"source": helper_row.get("source_url", "")},
+            ))
+        relations.append(service.call("upsert_relation", TrafficRelation(
+            relation_id=scoped_relation_id("cnc_instlifedt", "cnc_rdngrp", "prepares", "FANUC-tool-life-registration-for-rdngrp"),
+            source_api="cnc_instlifedt", target_api="cnc_rdngrp", relation_type="prepares",
+            rule_id="FANUC-tool-life-registration-for-rdngrp", confidence_status="documented",
+            evidence_ids=("focas-cnc_instlifedt-overview", "focas-cnc_rdngrp-overview"),
+            applicability=scoped_applicability({"scope": "FANUC 0i-D", "operation": "tool_life_management"}),
+            attributes={
+                "dependency_path": "prerequisites.tool_registration",
+                "verification_apis": ["cnc_rdngrp", "cnc_rdntool", "cnc_rdgrpid"],
+                "dangerous_operation": True, "auto_execute": False,
+                "requires_isolated_simulator_write_permission": True,
+                "verify_after_prepare": True,
+            },
+        )))
     alarm_chain_names = {"cnc_stopophis", "cnc_rdalmhisno", "cnc_rdalmhistry5", "cnc_startophis"}
     for target, dependencies in API_INTERACTION_RULES.items():
         if target not in names and not ("cnc_rdalmhistry5" in names and target in alarm_chain_names):

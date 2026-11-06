@@ -1797,7 +1797,7 @@ class DesktopApp:
                 fixed_input = batch / "execution" / "data" / "input_log.csv"
                 fixed_output = batch / "execution" / "data" / "output_log.csv"
                 for title, path, fields in (
-                    ("Input Log", fixed_input, ("timestamp", "api_name", "api_parameter_count", "params")),
+                    ("Input Log", fixed_input, ("timestamp", "api_name", "params")),
                     ("Output Log", fixed_output, ("timestamp", "api_name", "return_code", "return_desc", "success_data")),
                 ):
                     if not path.is_file():

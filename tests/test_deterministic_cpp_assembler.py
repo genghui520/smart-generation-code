@@ -144,6 +144,91 @@ def test_sdk_call_assembler_wraps_bare_call_and_builds_local_logging():
     assert outputs["statinfo"] == "S001_statinfo"
 
 
+def test_sdk_call_assembler_serializes_scalar_alarm_output():
+    from smart_traffic_agent.sdk_cpp_generator import assemble_capture_call
+
+    fragment, outputs = assemble_capture_call(
+        step_id="FAST_ALARM",
+        api_name="cnc_alarm2",
+        call_expr="api.cnc_alarm2(handle, &__out_alarm)",
+    )
+
+    assert "long FAST_ALARM_alarm{};" in fragment
+    assert 'api.cnc_alarm2(handle, &FAST_ALARM_alarm)' in fragment
+    assert 'data += "alarm=" + std::to_string(FAST_ALARM_alarm);' in fragment
+    assert outputs["alarm"] == "FAST_ALARM_alarm"
+
+
+def test_sdk_call_assembler_serializes_multiple_scalar_outputs():
+    from smart_traffic_agent.sdk_cpp_generator import assemble_capture_call
+
+    fragment, outputs = assemble_capture_call(
+        step_id="S001",
+        api_name="cnc_getpath",
+        call_expr="api.cnc_getpath(handle, &__out_path_no, &__out_maxpath_no)",
+    )
+
+    assert "short S001_path_no{};" in fragment
+    assert "short S001_maxpath_no{};" in fragment
+    assert 'data += "path_no=" + std::to_string(S001_path_no);' in fragment
+    assert 'data += "maxpath_no=" + std::to_string(S001_maxpath_no);' in fragment
+    assert outputs == {"path_no": "S001_path_no", "maxpath_no": "S001_maxpath_no"}
+
+
+def test_sdk_output_classifier_accepts_numeric_scalar_types():
+    from smart_traffic_agent.api_log_templates import ParameterDefinition
+    from smart_traffic_agent.sdk_cpp_generator import _output_serialization_kind
+
+    for type_name in (
+        "short", "long", "int", "unsigned short", "unsigned long",
+        "double", "float", "int32_t", "uint64_t", "size_t",
+    ):
+        parameter = ParameterDefinition(
+            name="value",
+            type=f"{type_name} *",
+            direction="out",
+            pointed_type=type_name,
+        )
+        assert _output_serialization_kind(parameter) == "scalar"
+
+
+def test_sdk_output_classifier_keeps_numeric_count_outputs_scalar_with_length_rule():
+    from smart_traffic_agent.api_log_templates import ParameterDefinition
+    from smart_traffic_agent.sdk_cpp_generator import _output_serialization_kind
+
+    parameter = ParameterDefinition(
+        name="length",
+        type="long *",
+        direction="inout",
+        pointed_type="long",
+        valid_length_rule="runtime_bound_by=length",
+    )
+    assert _output_serialization_kind(parameter) == "scalar"
+
+
+def test_sdk_call_assembler_rejects_unsupported_char_and_void_buffer_outputs():
+    from smart_traffic_agent.sdk_cpp_generator import SdkCallAssemblyError, assemble_capture_call
+
+    cases = (
+        (
+            "cnc_rdcomlogmsg",
+            "api.cnc_rdcomlogmsg(handle, &__out_logmsg)",
+        ),
+        (
+            "cnc_svdtrddata",
+            "api.cnc_svdtrddata(handle, 0, 0, &__out_data)",
+        ),
+    )
+    for api_name, expression in cases:
+        try:
+            assemble_capture_call(step_id="S001", api_name=api_name, call_expr=expression)
+        except SdkCallAssemblyError as exc:
+            assert "SDK_OUTPUT_SERIALIZATION_UNRESOLVED" in str(exc)
+            assert "buffer output" in str(exc)
+        else:
+            raise AssertionError(f"unbounded {api_name} output must be rejected")
+
+
 def test_sdk_call_assembler_rejects_model_owned_capture_wrapper_and_wrong_arity():
     from smart_traffic_agent.sdk_cpp_generator import SdkCallAssemblyError, assemble_capture_call
 

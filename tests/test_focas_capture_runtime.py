@@ -27,6 +27,11 @@ from smart_traffic_agent.focas_contracts import named_contract_context
 
 
 class ProductionCaptureTests(unittest.TestCase):
+    def test_capture_harness_csv_does_not_emit_parameter_count_column(self):
+        template = Path("smart_traffic_agent/templates/focas_capture_harness.cpp").read_text(encoding="utf-8")
+        self.assertNotIn("api_parameter_count", template)
+        self.assertNotIn("parameter_count(", template)
+
     def test_deterministic_read_recipe_uses_capture_context_for_logs(self):
         fragment = wrap_capture_fragment(deterministic_read_core({"cnc_rdcncid"}))
         self.assertIn('ctx.call("TARGET_CNC_RDCNCID", "cnc_rdcncid"', fragment)

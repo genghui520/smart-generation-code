@@ -20,7 +20,7 @@ from .focas_contracts import _api_docs, named_prototype, resolve_api_return_code
 from .integrations.ncguide import default_focas_header_dir
 from .sdk_type_index import SdkIndex, load_or_build_sdk_type_index
 
-INPUT_LOG_FIELDS = ["timestamp", "api_name", "api_parameter_count", "params"]
+INPUT_LOG_FIELDS = ["timestamp", "api_name", "params"]
 OUTPUT_LOG_FIELDS = ["timestamp", "api_name", "return_code", "return_desc", "success_data"]
 _NON_API_PAYLOAD_KEYS = {
     "coverage_role", "pcap_capture_enabled", "pcap_capture_started",
@@ -139,6 +139,66 @@ def _split_arguments(raw: str) -> list[str]:
     return parts
 
 
+def _prototype_parameter_count(prototype: str) -> int | None:
+    """Return the ABI argument count from one C/C++ function declaration."""
+    text = str(prototype or "")
+    if "(" not in text or ")" not in text:
+        return None
+    raw = text.partition("(")[2].rsplit(")", 1)[0].strip()
+    if not raw or raw.lower() == "void":
+        return 0
+    return len(_split_arguments(raw))
+
+
+_C_TYPE_WORDS = frozenset({
+    "bool", "char", "double", "float", "int", "long", "short", "signed",
+    "unsigned", "void", "wchar_t", "size_t", "hwnd", "uint", "dword",
+})
+
+
+def _normalize_abi_type(value: str) -> str:
+    value = re.sub(r"\b(?:const|volatile)\b", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s*\*\s*", " *", value)
+    return re.sub(r"\s+", " ", value).strip().lower()
+
+
+def _header_argument_type(argument: str) -> str:
+    """Remove an optional ABI parameter name from an unnamed header argument."""
+    value = re.sub(r"\s+", " ", str(argument).strip())
+    if "*" in value:
+        value = re.sub(r"\*\s*[A-Za-z_]\w*\s*(?=\[|$)", "*", value)
+    elif "[" in value:
+        value = re.sub(r"\b[A-Za-z_]\w*\s*(?=\[)", "", value)
+    else:
+        tokens = value.split()
+        if len(tokens) > 1 and tokens[-1].lower() not in _C_TYPE_WORDS:
+            value = " ".join(tokens[:-1])
+    return _normalize_abi_type(value)
+
+
+def _prototype_parameter_types(prototype: str, *, named: bool) -> list[str] | None:
+    """Return normalized parameter types from a named or ABI-only prototype."""
+    text = str(prototype or "")
+    if "(" not in text or ")" not in text:
+        return None
+    raw = text.partition("(")[2].rsplit(")", 1)[0].strip()
+    if not raw or raw.lower() == "void":
+        return []
+    result: list[str] = []
+    for argument in _split_arguments(raw):
+        if named:
+            parsed = _type_and_name(argument)
+            if parsed is None:
+                return None
+            type_name, _name, arrays = parsed
+            value = type_name + "".join(f"[{item}]" for item in arrays)
+        else:
+            result.append(_header_argument_type(argument))
+            continue
+        result.append(_normalize_abi_type(value))
+    return result
+
+
 def _argument_directions(api_name: str) -> dict[str, str]:
     text = str(_api_docs().get(api_name, {}).get("arguments", ""))
     result: dict[str, str] = {}
@@ -223,6 +283,25 @@ def api_metadata(api_name: str) -> ApiMetadata:
     index = _sdk_index()
     parameters: list[ParameterDefinition] = []
     diagnostics: list[str] = []
+    header_prototype = str(index.functions.get(api_name, "")) if index is not None else ""
+    documented_count = _prototype_parameter_count(prototype)
+    header_count = _prototype_parameter_count(header_prototype)
+    if index is not None and not header_prototype:
+        diagnostics.append(
+            f"SDK_PROTOTYPE_MISMATCH: {api_name}; API is absent from active Fwlib32.h"
+        )
+    elif documented_count is not None and header_count is not None and documented_count != header_count:
+        diagnostics.append(
+            f"SDK_PROTOTYPE_MISMATCH: {api_name}; documented_parameters={documented_count}; "
+            f"sdk_header_parameters={header_count}"
+        )
+    documented_types = _prototype_parameter_types(prototype, named=True)
+    header_types = _prototype_parameter_types(header_prototype, named=False)
+    if documented_types is not None and header_types is not None and documented_types != header_types:
+        diagnostics.append(
+            f"SDK_PROTOTYPE_MISMATCH: {api_name}; documented_types={documented_types}; "
+            f"sdk_header_types={header_types}"
+        )
     parsed_arguments: list[tuple[str, str, tuple[str, ...], str]] = []
     for argument in _split_arguments(raw):
         parsed = _type_and_name(argument)
@@ -411,13 +490,10 @@ def return_description(api_name: str, code: int, provided: str | None = None) ->
 
 def fixed_input_row(row: dict[str, Any]) -> dict[str, Any]:
     api_name = str(row.get("protocol_function") or row.get("api_name") or "")
-    metadata = api_metadata(api_name)
     raw = api_payload(str(row.get("parameters") or row.get("params") or ""), api_name, "in")
-    count = metadata.parameter_count
     return {
         "timestamp": row.get("timestamp", ""),
         "api_name": api_name,
-        "api_parameter_count": "" if count is None else count,
         "params": raw,
     }
 

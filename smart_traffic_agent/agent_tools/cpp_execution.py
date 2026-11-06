@@ -788,7 +788,6 @@ def write_combined_api_csv(
         "step_id",
         "interface_name",
         "protocol_function",
-        "api_parameter_count",
         "input_parameters",
         "return_code",
         "return_text",
@@ -818,12 +817,6 @@ def write_combined_api_csv(
                     "step_id": out_row.get("step_id") or in_row.get("step_id") or "",
                     "interface_name": in_row.get("interface_name") or interface_from_focas(api_name),
                     "protocol_function": api_name,
-                    "api_parameter_count": (
-                        in_row.get("api_parameter_count")
-                        or out_row.get("api_parameter_count")
-                        or in_row.get("parameter_count")
-                        or str(api_parameter_count_for_name(api_name))
-                    ),
                     "input_parameters": parameter_payload_only(in_row.get("parameters", "")),
                     "return_code": out_row.get("return_code") or out_row.get("status_code") or "",
                     "return_text": out_row.get("return_text") or out_row.get("error", ""),
@@ -1061,7 +1054,6 @@ def validate_cpp_csv_schema(input_path: Path, output_path: Path) -> list[str]:
         "interface_name",
         "protocol_function",
         "parameters",
-        "api_parameter_count",
     ]
     expected_output = [
         "index",
@@ -1071,7 +1063,6 @@ def validate_cpp_csv_schema(input_path: Path, output_path: Path) -> list[str]:
         "return_code",
         "return_text",
         "data",
-        "api_parameter_count",
     ]
     legacy_input = ["index", "step_id", "phase", "interface_name", "protocol_function", "parameters"]
     legacy_timestamped_input = [
@@ -1082,22 +1073,27 @@ def validate_cpp_csv_schema(input_path: Path, output_path: Path) -> list[str]:
         "interface_name",
         "protocol_function",
         "parameters",
-        "api_parameter_count",
     ]
+    legacy_count_input = legacy_timestamped_input + ["api_parameter_count"]
+    legacy_count_input_without_phase = expected_input + ["api_parameter_count"]
     legacy_output = ["index", "step_id", "api_name", "return_code", "return_text", "data"]
+    legacy_count_output = expected_output + ["api_parameter_count"]
     input_header = csv_header(input_path)
     output_header = csv_header(output_path)
-    if (
-        input_header
-        and input_header[: len(expected_input)] != expected_input
-        and input_header[: len(legacy_input)] != legacy_input
-        and input_header[: len(legacy_timestamped_input)] != legacy_timestamped_input
-    ):
+    accepted_input_headers = (
+        expected_input,
+        legacy_input,
+        legacy_timestamped_input,
+        legacy_count_input,
+        legacy_count_input_without_phase,
+    )
+    accepted_output_headers = (expected_output, legacy_output, legacy_count_output)
+    if input_header and not any(input_header[: len(candidate)] == candidate for candidate in accepted_input_headers):
         errors.append(
             "CSV schema mismatch: focas_api_input.csv must start with "
             f"{expected_input} (legacy formats are still readable), got {input_header}."
         )
-    if output_header and output_header[: len(expected_output)] != expected_output and output_header[: len(legacy_output)] != legacy_output:
+    if output_header and not any(output_header[: len(candidate)] == candidate for candidate in accepted_output_headers):
         errors.append(
             "CSV schema mismatch: focas_api_output.csv must start with "
             f"{expected_output} (legacy without timestamp is still readable), got {output_header}."

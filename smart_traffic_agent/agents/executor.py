@@ -1206,7 +1206,7 @@ def classify_collection_status(
         status = "partial"
     else:
         status = "local_success" if api_logs and all(log.status_code == 0 for log in api_logs) else "failed"
-    return status, {
+    evidence: dict[str, Any] = {
         "target_apis": sorted(targets),
         "target_call_counts": called,
         "target_apis_with_wire_evidence": sorted(wire_targets),
@@ -1229,6 +1229,22 @@ def classify_collection_status(
             for log in api_logs if log.protocol_function and log.protocol_function not in targets
         ],
     }
+    # cnc_rdngrp is accepted as a diversity sample only after the complete
+    # tool-life contract has been evidenced.  A successful read by itself is
+    # insufficient because it may come from the ordinary read path.
+    tool_life_contract = state.plan.rag_context.get("tool_life_variation", {}) if state.plan is not None else {}
+    if "cnc_rdngrp" in targets and isinstance(tool_life_contract, dict) and tool_life_contract:
+        from .code_generator import validate_tool_life_runtime_evidence
+        diagnostics = validate_tool_life_runtime_evidence(api_logs)
+        evidence["tool_life_variation"] = {
+            "valid": not diagnostics,
+            "diagnostics": diagnostics,
+            "registration_api": tool_life_contract.get("registration_api", "cnc_instlifedt"),
+            "run_gate": tool_life_contract.get("status_gate", "cnc_statinfo.run"),
+        }
+        if diagnostics:
+            status = "blocked" if any("GATE_MISSING" in item or "EVIDENCE_MISSING" in item for item in diagnostics) else "partial"
+    return status, evidence
 
 
 def collection_status_fields(

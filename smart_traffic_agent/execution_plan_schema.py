@@ -33,7 +33,8 @@ _VALID_TRANSFORMS = {
     "identity", "available_sram_name",
 }
 _PREREQUISITE_CATEGORIES = (
-    "cnc_parameters", "pmc_signals", "cnc_mode", "cnc_state", "session", "options", "nc_program",
+    "cnc_parameters", "pmc_signals", "cnc_mode", "cnc_state", "session", "options",
+    "tool_registration", "variation", "nc_program",
 )
 
 
@@ -391,6 +392,7 @@ def validate_execution_plan(plan: ExecutionPlan) -> dict[str, Any]:
         errors.append("collection contract is required")
     ids: set[str] = set()
     api_to_index: dict[str, int] = {}
+    api_positions: dict[str, list[int]] = {}
     for index, step in enumerate(plan.steps):
         if not step.step_id or step.step_id in ids:
             errors.append(f"steps[{index}] has a duplicate or empty step_id")
@@ -401,6 +403,7 @@ def validate_execution_plan(plan: ExecutionPlan) -> dict[str, Any]:
         if step.role not in _VALID_ROLES:
             errors.append(f"steps[{index}] role must be target or auxiliary")
         api_to_index.setdefault(api, index)
+        api_positions.setdefault(api, []).append(index)
     contracts = _contract_map(plan.rag_context.get("traffic_relationships"))
     for index, edge in enumerate(plan.dependencies):
         relation = str(edge.get("relation", "")).lower()
@@ -409,8 +412,17 @@ def validate_execution_plan(plan: ExecutionPlan) -> dict[str, Any]:
             errors.append(f"dependencies[{index}] has unsupported relation {relation!r}")
         if not source or not target or not path:
             errors.append(f"dependencies[{index}] requires source_api, target_api and dependency_path")
-        if source in api_to_index and target in api_to_index and api_to_index[source] >= api_to_index[target]:
-            errors.append(f"dependency {source}->{target} is out of execution order")
+        if source in api_to_index and target in api_to_index:
+            if relation == "prepares":
+                # A stateful target may be read once before preparation to
+                # discover whether registration is needed, then again after
+                # preparation for verification.  Validate against the last
+                # target occurrence so the graph edge still enforces the
+                # source-before-verification ordering.
+                if max(api_positions.get(source, ())) >= max(api_positions.get(target, ())):
+                    errors.append(f"dependency {source}->{target} is out of execution order")
+            elif api_to_index[source] >= api_to_index[target]:
+                errors.append(f"dependency {source}->{target} is out of execution order")
         if relation == "filters":
             if not edge.get("source_field"):
                 errors.append(f"filters dependency {source}->{target} requires source_field")

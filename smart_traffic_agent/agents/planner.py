@@ -23,7 +23,10 @@ from ..execution_contracts import MOTION_TARGET_APIS, motion_required_for_target
 from ..execution_plan_schema import normalize_execution_plan, execution_plan_view, validate_execution_plan
 from ..nc_program_rules import (
     apply_running_nc_program_rule,
+    apply_tool_life_variation_rule,
     build_accdecdly_running_steps,
+    extract_tool_life_variation_requirement,
+    has_tool_life_variation_requirement,
     extract_nc_program_requirement,
     extract_nc_program_requirements,
 )
@@ -370,6 +373,7 @@ class PlanningAgent(AgentTemplate):
         # relations, are allowed to fall back to RAG.
         trcm_context = self._query_trcm(state, requested_targets)
         running_nc_program_target = False
+        tool_life_variation_target = False
         accdecdly_facts = (trcm_context.get("apis", {}) or {}).get("cnc_accdecdly", {})
         if isinstance(accdecdly_facts, dict):
             api_node = accdecdly_facts.get("api_info", {}).get("api", {}) if isinstance(accdecdly_facts.get("api_info", {}), dict) else {}
@@ -377,6 +381,16 @@ class PlanningAgent(AgentTemplate):
             running_nc_program_target = (
                 "cnc_accdecdly" in requested_targets
                 and extract_nc_program_requirement(prerequisites) == "running"
+            )
+        rdngrp_facts = (trcm_context.get("apis", {}) or {}).get("cnc_rdngrp", {})
+        if isinstance(rdngrp_facts, dict):
+            rdngrp_node = rdngrp_facts.get("api_info", {}).get("api", {}) if isinstance(rdngrp_facts.get("api_info", {}), dict) else {}
+            rdngrp_prerequisites = rdngrp_facts.get("prerequisites", {}) or rdngrp_facts.get("prerequisites_json", {})
+            if not rdngrp_prerequisites and isinstance(rdngrp_node, dict):
+                rdngrp_prerequisites = rdngrp_node.get("prerequisites", {}) or rdngrp_node.get("prerequisites_json", {})
+            tool_life_variation_target = (
+                "cnc_rdngrp" in requested_targets
+                and has_tool_life_variation_requirement(rdngrp_prerequisites)
             )
         graph_missing_targets = list(trcm_context.get("graph_missing_api_names", ()))
         graph_no_relation_targets = list(trcm_context.get("graph_no_relation_api_names", ()))
@@ -425,6 +439,16 @@ class PlanningAgent(AgentTemplate):
             header_path=default_focas_header_dir() / "Fwlib32.h",
             manifest_functions=manifest_names,
         )
+        # cnc_rdngrp is a stateful diversity target when the graph contract
+        # declares tool registration/NC execution. It must never be reduced
+        # to FAST_STATUS -> FAST_ALARM -> FAST_TARGET.
+        if tool_life_variation_target:
+            fast_ok = False
+            fast_facts = {
+                "status": "partially_known",
+                "target": "cnc_rdngrp",
+                "reasons": ["graph declares tool-life registration and running-NC variation prerequisites"],
+            }
         if requires_event_planning and self.llm_client.enabled:
             fast_ok = False
         fast_kind = "read_only_api" if fast_ok else ""
@@ -453,6 +477,18 @@ class PlanningAgent(AgentTemplate):
                 "axis_source": "cnc_sysinfo.axes",
                 "axis_domain": "1..N",
                 "nc_program_requirements": extract_nc_program_requirements(prerequisites),
+            }
+        if tool_life_variation_target:
+            # This is a deterministic stateful path, not the ordinary
+            # read-only fast path.  The graph contract is checked again by
+            # apply_tool_life_variation_rule after the base plan exists.
+            fast_ok = True
+            fast_kind = "tool_life_variation"
+            fast_facts = {
+                "recipe": "tool-life registration/readback plus verified NC program lifecycle",
+                "target": "cnc_rdngrp",
+                "registration_api": "cnc_instlifedt",
+                "status_gate": "cnc_statinfo.run",
             }
         exact_lookup["session_fast_path_eligible"] = session_fast_ok
         exact_lookup["session_fast_path"] = session_fast_facts
@@ -676,18 +712,42 @@ class PlanningAgent(AgentTemplate):
                 plan.rag_context["scene_plan"] = requested_scene_plans[0]
         if fast_ok:
             target = fast_targets[0]
-            if fast_kind == "session":
+            if fast_kind == "tool_life_variation":
+                # Keep all registration, verification, upload, Cycle Start and
+                # run-gated sampling steps in one deterministic contract.
+                applied = apply_tool_life_variation_rule(plan, trcm_context, requested_targets)
+                if not applied:
+                    raise RuntimeError("Neo4j tool-life variation contract for cnc_rdngrp could not be applied")
+                registration_allowed = bool(
+                    request.permissions.get("isolated_simulator_write_allowed")
+                    or request.permissions.get("ncguide_isolated_write_allowed")
+                ) and str(request.target_environment).casefold() in {"simulator", "ncguide", "ncguide-isolated", "ncguide_generated_cpp"}
+                cycle_start_allowed = bool(request.permissions.get("ncguide_cycle_start_allowed")) and bool(
+                    request.permissions.get("ncguide_isolated", True)
+                )
+                for step in plan.steps:
+                    if step.protocol_function == "cnc_instlifedt" and not registration_allowed:
+                        step.parameters["execution_status"] = "blocked"
+                        step.parameters["blocked_reason"] = "isolated simulator write permission is required"
+                    if step.interface_name == "StartProgram" and not cycle_start_allowed:
+                        step.parameters["execution_status"] = "blocked"
+                        step.parameters["blocked_reason"] = "explicit isolated NCGuide Cycle Start permission is required"
+                plan.rag_context["tool_life_variation"]["registration_permission"] = registration_allowed
+                plan.rag_context["tool_life_variation"]["cycle_start_permission"] = cycle_start_allowed
+                target = "cnc_rdngrp"
+            elif fast_kind == "session":
                 plan.steps = build_session_fast_path_steps(target, fast_facts)
                 plan.scenario_goal = f"Deterministic session capture of {target}"
             else:
                 plan.steps = build_fast_path_steps(target)
                 plan.scenario_goal = f"Deterministic read-only capture of {target}"
-            plan.nc_program_type = "not_required"
-            plan.nc_program_requirements = []
-            plan.nc_program_spec = NcProgramSpec(
-                program_name="", purpose="Read-only API capture; no NC program or motion required.",
-                constraints=["No parameter writes", "No Cycle Start", "Preserve AUTO mode"],
-            )
+            if fast_kind != "tool_life_variation":
+                plan.nc_program_type = "not_required"
+                plan.nc_program_requirements = []
+                plan.nc_program_spec = NcProgramSpec(
+                    program_name="", purpose="Read-only API capture; no NC program or motion required.",
+                    constraints=["No parameter writes", "No Cycle Start", "Preserve AUTO mode"],
+                )
             plan.rag_context["known_knowledge"] = fast_facts
             plan.rag_context["fast_path"] = {
                 "enabled": True, "kind": fast_kind, "target": target,
@@ -793,12 +853,23 @@ class PlanningAgent(AgentTemplate):
                 and scene.get("operator_interaction", {}).get("cycle_start_action")
             ]
             if gated_scenes:
-                plan.steps = [
-                    step for step in plan.steps
-                    if step.interface_name not in {
-                        "UploadProgram", "SelectProgram", "ReadProgramNumber", "StartProgram", "StopProgram"
+                if not tool_life_variation_target:
+                    plan.steps = [
+                        step for step in plan.steps
+                        if step.interface_name not in {
+                            "UploadProgram", "SelectProgram", "ReadProgramNumber", "StartProgram", "StopProgram"
+                        }
+                    ]
+                else:
+                    # Keep the complete deterministic contract visible so the
+                    # executor can report the missing permission at the exact
+                    # registration/Cycle Start gate instead of silently
+                    # downgrading cnc_rdngrp to a read-only sample.
+                    plan.rag_context["tool_life_execution_blocked"] = {
+                        "reason": "NCGuide isolation or explicit Cycle Start permission is not verified",
+                        "registration_write": "blocked_without_isolated_simulator_write_permission",
+                        "cycle_start": "blocked_without_explicit_permission",
                     }
-                ]
                 plan.rag_context["deferred_operator_actions"] = [
                     {
                         "action": "manual_cycle_start",

@@ -33,6 +33,31 @@ def test_fast_path_steps_keep_status_target_status_order() -> None:
     ]
 
 
+def test_fast_path_steps_are_assemblable_with_alarm_scalar_output() -> None:
+    from smart_traffic_agent.sdk_cpp_generator import assemble_capture_call
+
+    expressions = {
+        "cnc_statinfo": "api.cnc_statinfo(handle, &__out_statinfo)",
+        "cnc_alarm2": "api.cnc_alarm2(handle, &__out_alarm)",
+        "cnc_rdngrp": "api.cnc_rdngrp(handle, &__out_ngrp)",
+    }
+    steps = build_fast_path_steps("cnc_rdngrp")
+    fragments = []
+    for step in steps:
+        fragment, _ = assemble_capture_call(
+            step_id=step.step_id,
+            api_name=step.protocol_function,
+            call_expr=expressions[step.protocol_function],
+        )
+        fragments.append(fragment)
+
+    combined = "\n".join(fragments)
+    assert combined.count('"cnc_statinfo"') == 2
+    assert '"cnc_alarm2"' in combined
+    assert 'data += "alarm=" + std::to_string(FAST_ALARM_alarm);' in combined
+    assert '"cnc_rdngrp"' in combined
+
+
 def test_output_only_path_apis_are_deterministic_fast_path_candidates() -> None:
     for name in ("cnc_getpath", "cnc_setpath"):
         facts = classify_known_api(name, header_path=SDK_HEADER)

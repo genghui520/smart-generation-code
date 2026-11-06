@@ -23,7 +23,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from smart_traffic_agent.api_prerequisites import load_manifest_rows
 from smart_traffic_agent.api_compatibility import F0ID_MODEL, F0ID_SCOPE_ID, f0id_api_names
-from smart_traffic_agent.traffic_graph import ApiNode, TrafficRelationshipService
+from smart_traffic_agent.traffic_graph import ApiNode, TrafficRelation, TrafficRelationshipService, relation_id
 from smart_traffic_agent.traffic_relationship_mining import seed_documented_relations
 from smart_traffic_agent.parameter_relationship_rules import resolve_rules
 from smart_traffic_agent.cnc_parameter_prerequisites import extract_f0id_parameter_prerequisites
@@ -91,6 +91,66 @@ def _stats(service: TrafficRelationshipService, *, allowed_api_names: set[str] |
     }
 
 
+RDNGRP_PREREQUISITES: dict[str, Any] = {
+    "tool_registration": [{
+        "requirement": "tool_life_management_enabled",
+        "condition": "Tool Life Management option is enabled",
+        "prepare_api": "cnc_instlifedt",
+        "dangerous_operation": True,
+        "auto_execute": False,
+        "requires_isolated_simulator_write_permission": True,
+        "values_source": "runtime_readback_or_explicit_graph_rag_evidence",
+    }, {
+        "requirement": "at_least_one_registered_tool_group",
+        "verify_apis": ["cnc_rdngrp", "cnc_rdntool", "cnc_rdgrpid"],
+        "success_condition": "cnc_rdngrp.data >= 1 and a tool/group readback succeeds",
+    }],
+    "variation": [{
+        "requirement": "tool_life_variation",
+        "states": "distinct registered tool groups or registration states",
+        "success_condition": "at least two successful registration/output states with distinct cnc_rdngrp.data",
+        "evidence_required": ["registration_success_or_verified_existing_group", "target_read_success"],
+    }],
+    "nc_program": [{
+        "requirement": "tool_life_variation_running",
+        "requirements": [
+            "NC program must reference a verified registered tool number or tool group with a T code",
+            "NC program must be uploaded, selected, and verified before Cycle Start",
+            "Cycle Start is allowed only in an isolated NCGuide simulator with explicit permission",
+            "cnc_statinfo.run must prove the program is executing before dynamic cnc_rdngrp samples count",
+            "only successful registration, NC execution, and target reads count as valid diversity traffic",
+        ],
+        "registration_api": "cnc_instlifedt",
+        "verification_apis": ["cnc_rdngrp", "cnc_rdntool", "cnc_rdgrpid"],
+        "run_gate_api": "cnc_statinfo",
+        "run_gate_field": "run",
+        "variation_samples": ["registered_group_state_A", "registered_group_state_B"],
+    }],
+}
+
+
+def _rdngrp_relation() -> TrafficRelation:
+    return TrafficRelation(
+        relation_id=relation_id("cnc_instlifedt", "cnc_rdngrp", "prepares", "FANUC-tool-life-registration-for-rdngrp"),
+        source_api="cnc_instlifedt",
+        target_api="cnc_rdngrp",
+        relation_type="prepares",
+        rule_id="FANUC-tool-life-registration-for-rdngrp",
+        confidence_status="documented",
+        evidence_ids=("focas-cnc_instlifedt-overview", "focas-cnc_rdngrp-overview"),
+        applicability={"scope": "FANUC 0i-D", "operation": "tool_life_management"},
+        attributes={
+            "dependency_path": "prerequisites.tool_registration",
+            "source_field": "cnc_instlifedt.success",
+            "verification_apis": ["cnc_rdngrp", "cnc_rdntool", "cnc_rdgrpid"],
+            "dangerous_operation": True,
+            "auto_execute": False,
+            "requires_isolated_simulator_write_permission": True,
+            "verify_after_prepare": True,
+        },
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -129,6 +189,8 @@ def main() -> int:
                         "variation_samples": ["MESSAGE_A", "MESSAGE_B"],
                     }],
                 }
+            if name == "cnc_rdngrp":
+                prerequisites = json.loads(json.dumps(RDNGRP_PREREQUISITES))
             service.call(
                 "upsert_api",
                 ApiNode(
@@ -141,6 +203,21 @@ def main() -> int:
                     prerequisites=prerequisites,
                 ),
             )
+
+        # Target-only seeds still need the helper nodes and the documented
+        # registration edge so Planner can obtain a complete dependency plan.
+        if "cnc_rdngrp" in names:
+            for helper in ("cnc_instlifedt", "cnc_rdntool", "cnc_rdgrpid", "cnc_statinfo"):
+                row = metadata.get(helper, {})
+                service.call(
+                    "upsert_api",
+                    ApiNode(
+                        api_id=f"focas:{helper}", name=helper, protocol="FOCAS",
+                        sdk_signature_ref=str(row.get("manifest_id", "")),
+                        description=str(row.get("description", ""))[:500], metadata=row,
+                    ),
+                )
+            service.call("upsert_relation", _rdngrp_relation())
 
         # This function is the existing authoritative migration path for
         # documented SDK interaction and transfer-session rules.

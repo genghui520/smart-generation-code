@@ -1064,7 +1064,97 @@ def validate_nc_program_requirements(nc_program: str, rag_context: dict[str, Any
         # smax=0 is a controller state observation.  Record it for graph/RAG
         # diagnostics instead of rejecting the NC payload; the applicable
         # G92/G50 rule depends on the machine series and code system.
+    tool_life_contract = rag_context.get("tool_life_variation", {})
+    tool_life_requirements = " ".join(requirements)
+    tool_life_target = target == "cnc_rdngrp" or isinstance(tool_life_contract, dict) and tool_life_contract.get("target_api") == "cnc_rdngrp"
+    if tool_life_target and (
+        "tool_life" in tool_life_requirements
+        or "tool life" in tool_life_requirements
+        or isinstance(tool_life_contract, dict)
+    ):
+        # O-number and M30 are checked by payload framing too, but keeping the
+        # checks here makes this validator useful to direct callers and gives
+        # a target-specific diagnostic before any upload is attempted.
+        if not re.search(r"(?m)^\s*O[0-9]{1,8}\b", text):
+            errors.append("NC_TOOL_PROGRAM_NUMBER_REQUIRED: cnc_rdngrp variation requires a valid O-number")
+        if not re.search(r"\bM0?30\b", text):
+            errors.append("NC_TOOL_PROGRAM_COMPLETION_REQUIRED: tool-life NC program must end with M30")
+        t_codes = [int(value) for value in re.findall(r"\bT([0-9]+)\b", text)]
+        if not t_codes:
+            errors.append("NC_TOOL_T_CODE_REQUIRED: program must invoke a registered tool with a T code")
+        verified = rag_context.get("verified_tool_numbers")
+        if verified is None and isinstance(tool_life_contract, dict):
+            verified = tool_life_contract.get("verified_tool_numbers")
+        if isinstance(verified, str):
+            verified = [item.strip() for item in verified.split(",") if item.strip()]
+        verified_numbers: set[int] = set()
+        if isinstance(verified, (list, tuple, set)):
+            for value in verified:
+                try:
+                    verified_numbers.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+        if not verified_numbers:
+            errors.append("NC_TOOL_REGISTRATION_UNVERIFIED: T code cannot be accepted until a runtime tool/group readback verifies it")
+        elif not any(value in verified_numbers for value in t_codes):
+            errors.append(
+                "NC_TOOL_T_CODE_UNREGISTERED: program T code does not match a verified registered tool "
+                f"(verified={sorted(verified_numbers)})"
+            )
+        registration_success = rag_context.get("tool_registration_verified")
+        if registration_success is False:
+            errors.append("NC_TOOL_REGISTRATION_FAILED: cnc_instlifedt or existing registration verification did not succeed")
+        if rag_context.get("cycle_start_allowed") is False:
+            errors.append("NC_CYCLE_START_BLOCKED: isolated NCGuide permission is required before Cycle Start")
     return errors
+
+
+def validate_tool_life_runtime_evidence(
+    api_logs: list[Any],
+    *,
+    require_diversity: bool = True,
+) -> list[str]:
+    """Validate evidence gates before a cnc_rdngrp sample is counted.
+
+    This helper accepts ApiCallLog-like objects or dictionaries so offline
+    audits and executor tests can use the same deterministic rule.
+    """
+    def field(item: Any, key: str, default: Any = None) -> Any:
+        if isinstance(item, dict):
+            return item.get(key, default)
+        return getattr(item, key, default)
+
+    def response(item: Any) -> dict[str, Any]:
+        value = field(item, "response", {})
+        return value if isinstance(value, dict) else {}
+
+    def successful(item: Any) -> bool:
+        try:
+            status = int(field(item, "status_code", 1))
+        except (TypeError, ValueError):
+            status = 1
+        return status == 0 and not field(item, "error")
+    registration_ok = any(successful(item) and field(item, "protocol_function", "") == "cnc_instlifedt" for item in api_logs)
+    verified_ok = any(successful(item) and field(item, "protocol_function", "") in {"cnc_rdntool", "cnc_rdgrpid"} for item in api_logs)
+    if not (registration_ok or verified_ok):
+        return ["TOOL_REGISTRATION_EVIDENCE_MISSING: no successful cnc_instlifedt or verified existing tool-group readback"]
+    run_logs = [item for item in api_logs if successful(item) and field(item, "protocol_function", "") == "cnc_statinfo"]
+    running = [item for item in run_logs if any(str(response(item).get(key, "")).lower() in {"1", "2", "3", "start", "running"} for key in ("run", "statinfo.run"))]
+    if not running:
+        return ["NC_RUN_GATE_MISSING: cnc_statinfo.run did not confirm NC execution; dynamic cnc_rdngrp samples are invalid"]
+    target = [item for item in api_logs if successful(item) and field(item, "protocol_function", "") == "cnc_rdngrp"]
+    if not target:
+        return ["RDNGRP_TARGET_READ_MISSING: no successful cnc_rdngrp sample after registration and run gate"]
+    if require_diversity:
+        values: set[str] = set()
+        for item in target:
+            out = response(item)
+            value = out.get("data", out.get("ngrp.data", out.get("ngrp")))
+            if value is not None:
+                values.add(str(value))
+        if len(values) < 2:
+            return ["RDNGRP_DIVERSITY_UNPROVEN: fewer than two distinct verified registration/output states"]
+    return []
 
 
 def repair_nc_program_with_llm(
@@ -2675,50 +2765,6 @@ string EscapeCsv(const string& value) {
     return out;
 }
 
-int ApiParameterCount(const string& api) {
-    // Legacy CSV compatibility field: SDK/ABI argument count. FlibHndl is
-    // session context, while ODBST* is an output buffer for cnc_statinfo.
-    if (api == "cnc_allclibhndl3") return 4;
-    if (api == "cnc_freelibhndl") return 1;
-    if (api == "cnc_statinfo") return 2;
-    if (api == "cnc_sysinfo") return 2;
-    if (api == "cnc_alarm2") return 2;
-    if (api == "cnc_rdalmmsg") return 4;
-    if (api == "cnc_rdprogdir3") return 5;
-    if (api == "cnc_dwnstart3") return 2;
-    if (api == "cnc_download3") return 3;
-    if (api == "cnc_dwnend3") return 1;
-    if (api == "cnc_search") return 2;
-    if (api == "cnc_rdprgnum") return 2;
-    if (api == "cnc_actf") return 2;
-    if (api == "cnc_rdposition") return 4;
-    if (api == "cnc_distance") return 4;
-    if (api == "cnc_absolute") return 4;
-    if (api == "cnc_absolute2") return 4;
-    if (api == "cnc_machine") return 4;
-    if (api == "cnc_relative") return 4;
-    if (api == "cnc_relative2") return 4;
-    if (api == "cnc_skip") return 4;
-    if (api == "cnc_srvdelay") return 4;
-    if (api == "cnc_accdecdly") return 4;
-    if (api == "cnc_rddynamic") return 4;
-    if (api == "cnc_rdaxisdata") return 6;
-    if (api == "cnc_rd3dtooltip") return 2;
-    if (api == "cnc_rdmdiprgstat") return 2;
-    if (api == "cnc_rdmdipntr") return 2;
-    if (api == "cnc_rdtool") return 4;
-    if (api == "cnc_rdtofs") return 5;
-    if (api == "cnc_rdtofsr") return 6;
-    if (api == "cnc_rdtofsinfo") return 2;
-    if (api == "cnc_rdtofsinfo2") return 2;
-    if (api == "cnc_getdtailerr") return 2;
-__DELETE_ALL_PARAMETER_COUNT__
-    if (api == "pcap_open_live") return 5;
-    if (api == "LoadLibraryW") return 1;
-    if (api == "ncguide_ui_cycle_start") return 2;
-    return 0;
-}
-
 void WriteBom(std::ofstream& f) {
     f.put(char(0xEF)); f.put(char(0xBB)); f.put(char(0xBF));
 }
@@ -2761,7 +2807,7 @@ void LogInput(std::ofstream& csv, int index, const string& step, const string& p
               const string& deviceContext) {
     csv << index << "," << EscapeCsv(ts) << "," << EscapeCsv(step)
         << "," << EscapeCsv(phase) << "," << EscapeCsv(iface) << "," << EscapeCsv(fn)
-        << "," << EscapeCsv(params) << "," << ApiParameterCount(fn)
+        << "," << EscapeCsv(params)
         << "," << EscapeCsv(invocationId) << "," << EscapeCsv(transactionId)
         << "," << startNs << "," << EscapeCsv(deviceContext) << "\n";
     csv.flush();
@@ -2772,7 +2818,7 @@ void LogOutput(std::ofstream& csv, int index, const string& step, const string& 
                const string& invocationId, const string& transactionId, long long endNs) {
     csv << index << "," << EscapeCsv(ts) << "," << EscapeCsv(step) << "," << EscapeCsv(api)
         << "," << ret << "," << EscapeCsv(text) << "," << EscapeCsv(data)
-        << "," << ApiParameterCount(api) << "," << EscapeCsv(invocationId)
+        << "," << EscapeCsv(invocationId)
         << "," << EscapeCsv(transactionId) << "," << endNs << "\n";
     csv.flush();
 }
@@ -3085,8 +3131,8 @@ int main() {
     std::ofstream outputCsv("data\\focas_api_output.csv", std::ios::binary);
     WriteBom(inputCsv);
     WriteBom(outputCsv);
-    inputCsv << "index,timestamp,step_id,phase,interface_name,protocol_function,parameters,api_parameter_count,invocation_id,transaction_id,start_timestamp_ns,device_context\n";
-    outputCsv << "index,timestamp,step_id,api_name,return_code,return_text,data,api_parameter_count,invocation_id,transaction_id,end_timestamp_ns\n";
+    inputCsv << "index,timestamp,step_id,phase,interface_name,protocol_function,parameters,invocation_id,transaction_id,start_timestamp_ns,device_context\n";
+    outputCsv << "index,timestamp,step_id,api_name,return_code,return_text,data,invocation_id,transaction_id,end_timestamp_ns\n";
     int idx = 1;
 
     string networkDevice = EnvString("PCAP_NETWORK_DEVICE", "\\Device\\NPF_Loopback");
@@ -4402,8 +4448,8 @@ def generate_cpp_api_script_with_llm(
         "- If an API/control step is infeasible, generate a real best-effort implementation plus explicit diagnostics, or fail generation with a clear reason; do not silently skip required steps.\n"
         "- Do not emit SKIPPED_UNSUPPORTED_BY_CPP_CODEGEN, not_executed_by_cpp_generator, placeholder skip rows, or non-fatal diagnostics in place of required executable steps.\n"
         "- The generated C++ must follow the ExecutionAgent CSV contract exactly.\n"
-        "- focas_api_input.csv header must be: index,timestamp,step_id,interface_name,protocol_function,parameters,api_parameter_count\n"
-        "- focas_api_output.csv header must be: index,timestamp,step_id,api_name,return_code,return_text,data,api_parameter_count\n"
+        "- focas_api_input.csv header must be: index,timestamp,step_id,interface_name,protocol_function,parameters\n"
+        "- focas_api_output.csv header must be: index,timestamp,step_id,api_name,return_code,return_text,data\n"
         "- The same monotonically increasing integer index must be written to matching input/output rows.\n"
         "- For operation_kind=focas_sequence, expand api_calls into atomic logging and execution. Each api_calls element is one real FOCAS call: write one input row with its exact single protocol_function, execute it, and write one output row with the same exact single API name. Never write slash, plus, semicolon, arrow, or other delimiters between multiple API names in any api_name or protocol_function field. For example, cnc_dwnstart3, cnc_download3, and cnc_dwnend3 require three separate input/output row pairs.\n"
         "- When execution_contract.api_prerequisites is present, implement its documented checks and operations in order before target calls. Log every preparation API separately, keep preparation/support traffic distinct from target coverage, and use only the exact sourced parameter value, type, scope, and SDK constraints. Do not infer snapshot, readback, restoration, or a single candidate from a write classification. If restart_required is true, record a pending reinitialization state and stop before the target; do not assume a successful write is active.\n"
@@ -4887,7 +4933,7 @@ static void LogInput(std::ofstream& csv, int index, const string& stepId, const 
                      const string& parameters, const string& timestamp = Timestamp()) {
     csv << index << "," << CsvEscape(timestamp) << "," << CsvEscape(stepId) << ","
         << CsvEscape(interfaceName) << "," << CsvEscape(protocolFunction) << ","
-        << CsvEscape(parameters) << ",0\n";
+        << CsvEscape(parameters) << "\n";
 }
 
 static void LogOutput(std::ofstream& csv, int index, const string& stepId,
@@ -4941,8 +4987,8 @@ int main() {
     std::ofstream outputCsv("data\\focas_api_output.csv", std::ios::binary);
     WriteBom(inputCsv);
     WriteBom(outputCsv);
-    inputCsv << "index,timestamp,step_id,interface_name,protocol_function,parameters,api_parameter_count\n";
-    outputCsv << "index,timestamp,step_id,api_name,return_code,return_text,data,api_parameter_count\n";
+    inputCsv << "index,timestamp,step_id,interface_name,protocol_function,parameters\n";
+    outputCsv << "index,timestamp,step_id,api_name,return_code,return_text,data\n";
     int csvIndex = 1;
 
     FocasApi api;
@@ -5428,8 +5474,8 @@ def render_cpp_api_script_v2(scenario: str, steps, nc_program: str | None = None
         '    ofstream outputCsv("data\\\\focas_api_output.csv", ios::binary);',
             "    inputCsv.put(0xEF); inputCsv.put(0xBB); inputCsv.put(0xBF);",
             "    outputCsv.put(0xEF); outputCsv.put(0xBB); outputCsv.put(0xBF);",
-        '    inputCsv << "index,timestamp,step_id,phase,api_name,parameters,api_parameter_count\\n";',
-        '    outputCsv << "index,timestamp,step_id,api_name,return_code,return_text,data,api_parameter_count\\n";',
+        '    inputCsv << "index,timestamp,step_id,phase,api_name,parameters\\n";',
+        '    outputCsv << "index,timestamp,step_id,api_name,return_code,return_text,data\\n";',
         "    int index = 0;",
         '    if (!pcapEnabled) { outputCsv << "1," << GetTimestamp() << ",PCAP_CAPTURE,PacketSniffer,-1,PCAP_CAPTURE_FAILED," << EscapeCsvField("pcap_capture_enabled=false") << "\\\\n"; cnc_freelibhndl_fn(handle); FreeLibrary(dll); return 1; }',
         '    outputCsv << "1," << GetTimestamp() << ",PCAP_CAPTURE,PacketSniffer,0,EW_OK," << EscapeCsvField("pcap_capture_enabled=true;pcap_file=data\\\\\\\\focas_api_capture.pcap") << "\\\\n";',

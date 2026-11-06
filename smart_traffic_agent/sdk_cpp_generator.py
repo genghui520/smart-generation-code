@@ -197,6 +197,71 @@ def _struct_pointer_parameters(metadata: ApiMetadata) -> dict[str, ParameterDefi
     }
 
 
+# These are the SDK scalar types for which ``std::to_string`` is a
+# deterministic and lossless-enough display representation.  Character and
+# void pointers are deliberately excluded: in FOCAS they normally denote a
+# caller-provided buffer whose size and termination rules must come from the
+# API contract.
+_NUMERIC_SCALAR_TYPES = frozenset({
+    "bool",
+    "char16_t", "char32_t",
+    "signed char", "unsigned char",
+    "short", "signed short", "short int", "signed short int",
+    "unsigned short", "unsigned short int",
+    "int", "signed int", "unsigned int",
+    "long", "signed long", "long int", "signed long int",
+    "unsigned long", "unsigned long int",
+    "long long", "signed long long", "long long int", "signed long long int",
+    "unsigned long long", "unsigned long long int",
+    "float", "double", "long double",
+    "int8_t", "uint8_t", "int16_t", "uint16_t",
+    "int32_t", "uint32_t", "int64_t", "uint64_t",
+    "intptr_t", "uintptr_t", "size_t", "ssize_t", "ptrdiff_t",
+    "__int8", "unsigned __int8", "__int16", "unsigned __int16",
+    "__int32", "unsigned __int32", "__int64", "unsigned __int64",
+    # Common Windows/FOCAS typedef spellings used for integer scalars.
+    "bool32", "byte", "word", "dword", "uint", "uint8", "uint16", "uint32", "uint64",
+    "int8", "int16", "int32", "int64", "uchar", "ushort", "ulong", "ullong",
+})
+
+
+def _normalized_pointed_type(parameter: ParameterDefinition) -> str:
+    pointed = str(parameter.pointed_type or "")
+    pointed = re.sub(r"\b(?:const|volatile)\b", "", pointed, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", pointed).strip().lower()
+
+
+def _output_serialization_kind(parameter: ParameterDefinition) -> str:
+    """Classify one output pointer for deterministic serialization.
+
+    Numeric pointers without an explicit array dimension are scalar outputs.
+    FOCAS uses ``short*``/``long*`` for both scalar values and count/length
+    values whose relationship to another argument is documented at runtime;
+    the pointer type itself is the deterministic ABI evidence available to the
+    assembler.  Fixed arrays remain buffers and require a dedicated serializer.
+    """
+    if parameter.fields:
+        return "struct"
+    if parameter.array_dimensions:
+        return "buffer"
+    pointed = _normalized_pointed_type(parameter)
+    if pointed in _NUMERIC_SCALAR_TYPES:
+        return "scalar"
+    return "buffer"
+
+
+def _buffer_output_diagnostic(api_name: str, parameter: ParameterDefinition) -> str:
+    if parameter.array_dimensions or parameter.valid_length_rule:
+        return (
+            f"SDK_OUTPUT_SERIALIZATION_UNRESOLVED: {api_name}.{parameter.name}; "
+            "buffer output has a documented size rule but no deterministic buffer serializer"
+        )
+    return (
+        f"SDK_OUTPUT_SERIALIZATION_UNRESOLVED: {api_name}.{parameter.name}; "
+        "buffer output requires a documented array or length rule"
+    )
+
+
 def _field_value_schema(parameter: ParameterDefinition, field_path: str) -> dict[str, Any] | None:
     current: dict[str, Any] = parameter.fields
     parts = [part for part in str(field_path).split(".") if part]
@@ -446,18 +511,30 @@ def _validate_parameter_value_alignment(
 
 def _render_output_lambda(metadata: ApiMetadata, output_symbols: dict[str, str]) -> str:
     lines = ["[&](short) -> std::string {", "    std::string data;", "    bool first = true;"]
-    leaves: list[tuple[str, str, dict[str, Any]]] = []
+    outputs: list[tuple[str, str, str, dict[str, Any] | None]] = []
     for parameter in metadata.output_parameters:
         symbol = output_symbols.get(parameter.name)
         if not symbol:
             continue
-        for path, details in _leaf_fields(parameter.fields):
-            leaves.append((symbol, path, details))
-    if not leaves:
+        kind = _output_serialization_kind(parameter)
+        if kind == "struct":
+            for path, details in _leaf_fields(parameter.fields):
+                outputs.append(("field", symbol, path, details))
+        elif kind == "scalar":
+            outputs.append(("scalar", symbol, parameter.name, None))
+        else:
+            raise SdkCallAssemblyError(_buffer_output_diagnostic(metadata.api_name, parameter))
+    if not outputs:
         raise SdkCallAssemblyError(
             f"SDK_CALL_ASSEMBLY_UNRESOLVED: {metadata.api_name}; no deterministic output field rule"
         )
-    for symbol, path, details in leaves:
+    for kind, symbol, path, details in outputs:
+        if kind == "scalar":
+            lines.extend([
+                "    if (!first) data += \";\"; first = false;",
+                f"    data += \"{path}=\" + std::to_string({symbol});",
+            ])
+            continue
         expression = f"{symbol}.{path}"
         dimensions = details.get("array_dimensions") if isinstance(details, dict) else None
         if dimensions:
@@ -558,14 +635,17 @@ def assemble_capture_call(
                 raise SdkCallAssemblyError(
                     f"SDK_CALL_OUTPUT_BINDING_MISSING: {api_name}.{parameter.name}; use &{marker} in call_expr"
                 )
+            if _output_serialization_kind(parameter) == "buffer":
+                raise SdkCallAssemblyError(_buffer_output_diagnostic(api_name, parameter))
             symbol = _symbol(output_name_step, parameter.name)
             output_symbols[parameter.name] = symbol
             rendered_args[index] = expression.replace(marker, symbol)
             available.add(symbol)
             pointed = (parameter.pointed_type or "").strip()
-            if not pointed or pointed.lower() in {"char", "wchar_t"}:
+            if not pointed:
                 raise SdkCallAssemblyError(
-                    f"SDK_CALL_ASSEMBLY_UNRESOLVED: {api_name}.{parameter.name}; output buffer rule is missing"
+                    f"SDK_OUTPUT_SERIALIZATION_UNRESOLVED: {api_name}.{parameter.name}; "
+                    "output type is unavailable"
                 )
             declarations.append(f"{pointed} {symbol}{{}};")
         else:

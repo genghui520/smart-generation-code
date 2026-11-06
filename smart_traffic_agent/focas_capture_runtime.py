@@ -4,7 +4,6 @@ import importlib.util, importlib.machinery, sys
 import re
 from pathlib import Path
 from .execution_contracts import analyze_api_interactions, dependency_closure, validate_api_lifecycle_fragment
-from .api_log_templates import api_metadata
 from .pmc_parameter_profiles import PMC_RANGE_PROFILES
 _legacy_path = Path(__file__).with_name("_focas_capture_runtime_legacy.dat")
 _loader = importlib.machinery.SourcelessFileLoader("smart_traffic_agent._focas_capture_runtime_legacy", str(_legacy_path))
@@ -43,31 +42,6 @@ def render_capture_harness(functions, *args, **kwargs):
     source = source.replace(
         "parameters_without_handle(parameters)",
         "parameters",
-    )
-    # Replace the legacy hand-maintained parameter-count switch with counts
-    # derived from the active SDK prototype and argument documentation.  A
-    # negative value is an explicit "metadata incomplete" marker; it is never
-    # silently turned into zero.
-    count_lines: list[str] = []
-    for name in capture_functions(functions):
-        if not (name.startswith("cnc_") or name.startswith("pmc_")):
-            continue
-        count = api_metadata(name).parameter_count
-        if count is not None:
-            # For cnc_prstwkcd the capture row exposes the four concrete
-            # fields used by the call: length, datano, type and data0.
-            # Keep the log count aligned with the visible parameter fields.
-            if name == "cnc_prstwkcd":
-                count = 4
-            count_lines.append(f'        if (name == "{name}") return {count};')
-    count_lines.append("        return -1;")
-    generated_count = "static int parameter_count(const std::string& name) {\n" + "\n".join(count_lines) + "\n    }"
-    source, replaced = re.subn(
-        r"static int parameter_count\(const std::string& name\)\s*\{.*?\n\s*\}",
-        generated_count,
-        source,
-        count=1,
-        flags=re.S,
     )
     contract = kwargs.get("contract")
     targets = getattr(contract, "targets", ())

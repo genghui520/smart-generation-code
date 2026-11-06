@@ -1,0 +1,271 @@
+{
+  "protocol": "lsv2",
+  "controller": "TNC640",
+  "source_of_truth": "official Heidenhain LSV-2 Library headers",
+  "files": [
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_all.h",
+      "name": "lsv2_all.h",
+      "sha256": "4c4ffbb66b7e96ceb1fbe80d24e78411fcdeb21ed2da3aa3eb786e6923fe7d69",
+      "size": 4090
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_axes.h",
+      "name": "lsv2_axes.h",
+      "sha256": "30409a4bf06dc4c90adb252a670b71d00ec4942d5212907cb34cb64f0ef59e56",
+      "size": 20541
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_axes_def.h",
+      "name": "lsv2_axes_def.h",
+      "sha256": "a930c0d9962ecc8297cb93e8f9c5c5ebb48b6d81d3f4f7dd917d50d13eb26686",
+      "size": 9565
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_backup.h",
+      "name": "lsv2_backup.h",
+      "sha256": "e3a3a4d019cdcb068651ec376839e680dd1a0371e3794c2a857052831d5e94b9",
+      "size": 16903
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_basic.h",
+      "name": "lsv2_basic.h",
+      "sha256": "d095a9b96b1ed5f1fd11b86e833a9ce7c47494ef5976c8d776e3188abdfe914e",
+      "size": 15037
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_chat.h",
+      "name": "lsv2_chat.h",
+      "sha256": "67652ca9a69cfb8b4954924b0c607b026f08f5556b9d29f29c44f7401186d1ab",
+      "size": 3620
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_chat_def.h",
+      "name": "lsv2_chat_def.h",
+      "sha256": "dcd41e5ec7add571172fd3caaf56205dbbeaca5507d62146f63a5a8cf2dde233",
+      "size": 2175
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_com.h",
+      "name": "lsv2_com.h",
+      "sha256": "dd2fc320c762aeedbca3d9777682224cdd84967091192c6faf4448ac2d547515",
+      "size": 25239
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_ctrl.h",
+      "name": "lsv2_ctrl.h",
+      "sha256": "4b907044be7800f2a27710c9ac585ec32eaa0811c4b1e4f212d926594e851d74",
+      "size": 13137
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_data.h",
+      "name": "lsv2_data.h",
+      "sha256": "6d10f93a24e9922c730973e5bdde2aaa0d901353d64b3495a6cd5cc706345234",
+      "size": 17989
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_data_def.h",
+      "name": "lsv2_data_def.h",
+      "sha256": "d74a3377d26b087b95291f32884cc38be5ae6014aac5604e4434c1b06c4bb84e",
+      "size": 8833
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_def.h",
+      "name": "lsv2_def.h",
+      "sha256": "2bb1cbe41dfb2c2f64afaf07eed28a635141bf2bad14ed3a0b88f370f8f89796",
+      "size": 49071
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_dnc.h",
+      "name": "lsv2_dnc.h",
+      "sha256": "b18d4e1205bac15781b705d274dfdc2522a1316603cfd4923060ebfd67b5379b",
+      "size": 12786
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_dnc_def.h",
+      "name": "lsv2_dnc_def.h",
+      "sha256": "4ee836815393235d03fe615009d3862081b3128d9a0b7d1ef3878556dca68415",
+      "size": 21566
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_dsp.h",
+      "name": "lsv2_dsp.h",
+      "sha256": "e3cca2469de8f38fc6423e969c56851ac7cc84cf7bf6a76a68f9be78c0bb3210",
+      "size": 2787
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_dsp_def.h",
+      "name": "lsv2_dsp_def.h",
+      "sha256": "9c5301aca39be3766b071953e589e6251a183fe697d866b662af4470309a58bc",
+      "size": 2030
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_err.h",
+      "name": "lsv2_err.h",
+      "sha256": "890f5344e653825bf577aae31493d3cd7cc73fae19ceaa26b1229c64d6ac9e52",
+      "size": 6754
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_file.h",
+      "name": "lsv2_file.h",
+      "sha256": "2fee5b8ef6ccd5e0c1921e6c06d92293fc354e235033d638bda2904e4372c045",
+      "size": 34566
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_gra.h",
+      "name": "lsv2_gra.h",
+      "sha256": "5dc07c1ac39d4df46d0ffa14fc23b844b0dc9a453be51b1e7a0e0218983db40f",
+      "size": 1661
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_jh.h",
+      "name": "lsv2_jh.h",
+      "sha256": "ab82333c09d40c4d060bc383ee25545153c39afa98d9551eb8f3359ca0d659de",
+      "size": 1697
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_key.h",
+      "name": "lsv2_key.h",
+      "sha256": "5d1d3d3e758a00a13738518b830b74da20af66e8d9e81b014ffd21128295a54c",
+      "size": 3436
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_key_def.h",
+      "name": "lsv2_key_def.h",
+      "sha256": "c956d2c1f6f1f3ac694d3885137513c370fefc664f2d91ff501819581ad9a43d",
+      "size": 1531
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_mc.h",
+      "name": "lsv2_mc.h",
+      "sha256": "0aace6be57f0ec64e74ac29557a0922e2f5548995ad0838aedc81b96d50fd738",
+      "size": 5631
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_mem.h",
+      "name": "lsv2_mem.h",
+      "sha256": "d40b6a352493a254cd06fcf8a3f1b2e39d6bc14280a69d79b7320e4191efccea",
+      "size": 2821
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_messages_def.h",
+      "name": "lsv2_messages_def.h",
+      "sha256": "c562b9005d084f971a157b13003c514d2ca66d2f70d0b1bc39a675850c9dbf89",
+      "size": 2729
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_mouse.h",
+      "name": "lsv2_mouse.h",
+      "sha256": "6c5ad37c9c8ef82ba8638e039bd59091f3437cfc9545a87037a8f213ff13796a",
+      "size": 1463
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_mouse_def.h",
+      "name": "lsv2_mouse_def.h",
+      "sha256": "c0dc83e76b75fa888ee1205a693f761351ade32c128a7424742ff2fa80581aa9",
+      "size": 2913
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_msg.h",
+      "name": "lsv2_msg.h",
+      "sha256": "1a1774b8c32ec2b60dca7d5b546d68b7f78e7ff9ca1ac23338e288ffe39b368b",
+      "size": 4581
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_plc.h",
+      "name": "lsv2_plc.h",
+      "sha256": "4baba4970c82e5ab1976a54344456d4f68a313dc5a17702801e4daaf2c3fe206",
+      "size": 2430
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_plc_def.h",
+      "name": "lsv2_plc_def.h",
+      "sha256": "4702a0b6d1d99a44c937cc86e12ca630fde2c605e093b0d32a90fa73151d22b7",
+      "size": 12372
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_preset.h",
+      "name": "lsv2_preset.h",
+      "sha256": "7ef718e43874c1d10775c79fd479b1e1366af616c4332610424851287b08eead",
+      "size": 9478
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_preset_def.h",
+      "name": "lsv2_preset_def.h",
+      "sha256": "6eebab1de6a8b1214d40e437a011d57204f75d981cae2db20336f6ae02166809",
+      "size": 1993
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_restore.h",
+      "name": "lsv2_restore.h",
+      "sha256": "6e7cf2bac0073535cd0a2bdbd23ccb89f981e27f566dfccfe54b07299c0e16d9",
+      "size": 6903
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_scope.h",
+      "name": "lsv2_scope.h",
+      "sha256": "36a0a506319a087520dc1ce891f7a125ed7a37b238d24cbdc8dbd571a8e943f2",
+      "size": 15294
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_scope_def.h",
+      "name": "lsv2_scope_def.h",
+      "sha256": "b215e54b1201cb6263e2749ccf0471abc83051ad9f07481f3206d80f3210173b",
+      "size": 9677
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_screen.h",
+      "name": "lsv2_screen.h",
+      "sha256": "bd31634ce09088439876499a246e4856c99ed62a8de425613d572fed9c1b3ffa",
+      "size": 2865
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_server.h",
+      "name": "lsv2_server.h",
+      "sha256": "3f931a4ce17b25b0adc941565936764bbc588c7af3b7746d3d593b8d96eccbe9",
+      "size": 346
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_splc.h",
+      "name": "lsv2_splc.h",
+      "sha256": "1a49321b5897ec5529edca54a3781aee367be3bb6bc704314b06745d4f6452ad",
+      "size": 5670
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_time.h",
+      "name": "lsv2_time.h",
+      "sha256": "9ce7805a84f52d034b6336e6c9b576ba5942c18d470158bc67158a2aa87b5202",
+      "size": 2015
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\lsv2lib\\includes\\lsv2\\lsv2_util.h",
+      "name": "lsv2_util.h",
+      "sha256": "a058469d45a2ac524d6b1d2a6ebed41a286fa372ae855814a68e3511c6eff641",
+      "size": 11803
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\Help\\lsv2protocol.chm",
+      "name": "lsv2protocol.chm",
+      "sha256": "ceb1d1113e6739f62afbc9c4ac02e47a93d250620de95c562939b9bdc9be95ee",
+      "size": 531112
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\Help\\lsv2lib.chm",
+      "name": "lsv2lib.chm",
+      "sha256": "183e3b4be053216bd4e9792058fd3a59085cda311ab7318ced3d21559c1e9a2e",
+      "size": 959074
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\Doc\\LSV2LIB32.txt",
+      "name": "LSV2LIB32.txt",
+      "sha256": "55548a80c6eb231390e1daea71850ec8a416e043dcb93da259eed7adb474bf81",
+      "size": 20293
+    },
+    {
+      "path": "C:\\Program Files (x86)\\HEIDENHAIN\\SDK\\RemoTools\\Doc\\LSV2ctrl.txt",
+      "name": "LSV2ctrl.txt",
+      "sha256": "30961e3d6d17fd06f4cace9aeeb57b3fe574a2f52cee59795ceb4dc46eb26031",
+      "size": 37360
+    }
+  ]
+}
