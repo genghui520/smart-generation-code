@@ -39,8 +39,10 @@ from ..sdk_type_index import (
     load_or_build_sdk_type_index, validate_struct_member_access,
     sdk_index_prompt_context, sdk_environment_identity,
 )
+from ..api_log_templates import api_metadata
 from ..history_examples import retrieve_verified_api_examples
 from ..deterministic_cpp_assembler import assemble_core_cpp, DeterministicAssemblyError
+from ..sdk_cpp_generator import assemble_capture_call, SdkCallAssemblyError, output_symbol_name
 
 
 def sdk_type_context_for_abi(abi: str) -> str:
@@ -1409,6 +1411,7 @@ def _record_generation_response(state: WorkflowState, llm_client: LlmClient, *, 
         "response_keys": sorted(payload) if isinstance(payload, dict) else [],
         "parse_error": str(getattr(llm_client, "last_json_parse_error", "") or ""),
         "contains_cpp_marker": "core_cpp" in text or "fragment_cpp" in text,
+        "contains_bare_call_marker": "call_expr" in text or "api_fragments" in text,
     })
 
 
@@ -1755,6 +1758,19 @@ def generate_scenario_core_with_llm(
     planned call without inventing a return value.
     """
     assert state.plan is not None
+    # Compatibility callers now use the same bare-call bundle path as
+    # production. The legacy free-form core prompt below is intentionally
+    # unreachable and is retained only for source compatibility during the
+    # migration of older integrations.
+    return generate_api_fragments_with_llm(
+        state,
+        executable_steps,
+        nc_program,
+        llm_client,
+        previous=existing_fragment,
+        diagnostics=repair_diagnostics,
+        wrap=False,
+    )
     abi = official_focas_abi_context(selected_functions)
     sdk_types = sdk_type_context_for_abi(abi)
     required_semantics = []
@@ -1896,13 +1912,10 @@ def generate_api_fragments_with_llm(
     diagnostics: str = "",
     wrap: bool = True,
 ) -> str:
-    """Generate an ordered fragment bundle with one model invocation.
+    """Generate an ordered locally assembled bundle with one model invocation.
 
-    The initial request contains the complete ExecutionPlan.  The model
-    returns one statements-only fragment per executable API step in the same
-    order.  On repair, diagnostics select only the affected step IDs; one
-    repair request can still update several related fragments without
-    regenerating the unaffected operations.
+    The model returns only bare API calls. The SDK assembler owns declarations,
+    parameter logs, output serializers, and the fixed ``ctx.call`` wrapper.
     """
     assert state.plan is not None
     fragment_rows: list[tuple[PlanStep, list[str]]] = []
@@ -1974,11 +1987,11 @@ def generate_api_fragments_with_llm(
                 llm_client,
                 diagnostics=diagnostics,
                 existing_fragments={
-                    str(key): str(value.get("core_cpp", ""))
+                    str(key): value.get("call_specs", [])
                     for key, value in cache.items()
                     if isinstance(value, dict)
                     and str(key) in requested_ids
-                    and str(value.get("core_cpp", "")).strip()
+                    and value.get("call_specs")
                 },
             )
         except Exception as exc:
@@ -2025,6 +2038,21 @@ def generate_api_fragments_with_llm(
     return wrap_capture_fragment(normalized) if wrap else normalized
 
 
+def _runtime_symbols_before_step(all_steps: list[PlanStep], step_id: str) -> dict[str, str]:
+    """Expose only deterministic output symbols from earlier plan steps."""
+    symbols: dict[str, str] = {}
+    for step in all_steps:
+        if str(step.step_id) == str(step_id):
+            break
+        for api_name in protocol_function_names(step.protocol_function):
+            metadata = api_metadata(api_name)
+            for parameter in metadata.output_parameters:
+                if "*" in parameter.type:
+                    symbols[parameter.name] = output_symbol_name(step.step_id, parameter.name)
+                    symbols[f"{step.step_id}.{parameter.name}"] = output_symbol_name(step.step_id, parameter.name)
+    return symbols
+
+
 def generate_api_fragment_bundle_with_llm(
     state: WorkflowState,
     all_steps: list[PlanStep],
@@ -2033,7 +2061,7 @@ def generate_api_fragment_bundle_with_llm(
     llm_client: LlmClient,
     *,
     diagnostics: str = "",
-    existing_fragments: dict[str, str] | None = None,
+    existing_fragments: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Call the model once and parse an ordered ``step_id`` fragment bundle."""
     assert state.plan is not None
@@ -2059,42 +2087,38 @@ def generate_api_fragment_bundle_with_llm(
             )),
         )
     state.plan.rag_context["verified_api_examples"] = history
-    requested_prompt_rows = [
-        {
+    requested_prompt_rows = []
+    for step, names in requested_rows:
+        requested_prompt_rows.append({
             "step_id": str(step.step_id),
             "apis": names,
             "phase": step.phase,
             "action": step.action,
             "parameters": step.parameters,
-        }
-        for step, names in requested_rows
-    ]
+            "available_runtime_symbols": _runtime_symbols_before_step(all_steps, step.step_id),
+        })
     existing = existing_fragments or {}
     system_prompt = (
-        "You are CodeGenerationAgent generating API operation fragments for a fixed FANUC FOCAS C++17 harness. "
-        "Return JSON only with key api_fragments, whose value is an array of objects with step_id, apis and core_cpp. "
-        "Generate exactly one statements-only core_cpp fragment for every requested step_id, in the requested order. "
-        "Do not return main(), the callback wrapper, includes, structs, typedefs, connection, cleanup, or markdown. "
-        "The harness already provides FocasApi api, unsigned short handle, CaptureContext ctx, bool ok, short ret, "
-        "nc_payload/nc_buffer/nc_length and the SDK dynamic bindings. Use only official Fwlib32.h types, fields and "
-        "api.<function> members. Preserve the complete ExecutionPlan order and use real variables produced by earlier "
-        "steps for runtime dependencies; never invent an upstream output or replace it with a guessed literal. "
-        "The exact harness signature is template<class Fn, class Invoke, class Output> short call("
-        "const std::string& step, const std::string& name, const std::string& parameters, Fn symbol, "
-        "Invoke invoke, Output build_output). A legal example is: "
-        "ret = ctx.call(\"S001\", \"cnc_statinfo\", \"FlibHndl=\" + std::to_string(handle), "
-        "api.cnc_statinfo, [&]() -> short { return api.cnc_statinfo(handle, &status); }, "
-        "[&](short) -> std::string { return \"run=\" + std::to_string(status.run); });. "
-        "Each requested API must use exactly the six-argument CaptureContext contract: "
-        "ctx.call(step_id, api_name, parameter_text, api.<function>, "
-        "[&]() -> short { return api.<function>(...); }, "
-        "[&](short) -> std::string { return ...; }). "
-        "The four-argument form ctx.call(api_name, lambda, input_map, output_map) is forbidden. "
-        "Each call must record the exact return code, input parameters and output logging. "
-        "Do not emit api.function(...), target_api(...), TODO or ellipsis. Avoid duplicate local declarations "
-        "across fragments by prefixing new locals with the step_id. Repair only requested fragments when diagnostics are "
-        "present; leave unrelated cached fragments unchanged."
+        "You are CodeGenerationAgent generating bare FANUC FOCAS API expressions for a fixed C++17 harness. "
+        "Return JSON only with key api_fragments. Each item must contain step_id and calls; each call must contain "
+        "api_name, call_expr, and parameter_values (use an empty object only when the API has no named inputs). "
+        "The call_expr must be exactly one bare expression such as "
+        "api.cnc_statinfo(handle, &__out_statinfo). The local assembler will create SDK declarations, parameter logs, "
+        "output serializers, lambdas, and the six-argument ctx.call wrapper. "
+        "Never emit ctx.call, lambda syntax, semicolons, declarations, main(), includes, structs, typedefs, connection, "
+        "cleanup, logging code, Markdown, api.function(...), target_api, TODO, or ellipsis. "
+        "Use only the supplied Fwlib32.h prototype and SDK type context. Current output pointers must use the placeholder "
+        "&__out_<formal_parameter_name>; earlier output values must use only the available_runtime_symbols supplied for "
+        "that step. Do not invent an upstream output or replace a missing runtime value with a guessed literal. "
+        "Preserve the complete ExecutionPlan order and return at least one call entry for each planned API. "
+        "When parameter combinations contain multiple cases, return one call entry per case in deterministic order; "
+        "repeated api_name values within one step are valid and must not be collapsed. "
+        "Parameter expressions may contain documented constants, literals, handle, and previously bound runtime symbols. "
+        "The local assembler, not the model, owns return-code handling, input/output CSV format and PCAP boundaries. "
+        "Repair only requested step_ids and leave unrelated cached calls unchanged."
     )
+    if state.plan.rag_context.get("agent_soul"):
+        system_prompt += "\nAgent operating guidance:\n" + str(state.plan.rag_context["agent_soul"])
     user_prompt = (
         f"Task: {state.request.description}\n"
         f"Scenario: {state.plan.scenario_type}\n"
@@ -2111,45 +2135,97 @@ def generate_api_fragment_bundle_with_llm(
         f"NC program already embedded by the harness:\n{nc_program}\n"
         f"Repair diagnostics:\n{diagnostics}\n"
         f"Existing fragments for the requested steps:\n{json.dumps(existing, ensure_ascii=False, indent=2)}\n"
-        "Return JSON with this shape: {\"api_fragments\":[{\"step_id\":\"S001\",\"apis\":[\"cnc_statinfo\"],\"core_cpp\":\"...\"}]}"
+        "Return JSON with this shape: {\"api_fragments\":[{\"step_id\":\"S001\",\"calls\":[{\"api_name\":\"cnc_statinfo\",\"call_expr\":\"api.cnc_statinfo(handle, &__out_statinfo)\",\"parameter_values\":{}}]}]}"
     )
     payload = llm_client.invoke_json(system_prompt, user_prompt)
     _record_generation_response(state, llm_client, stage="api_fragment_bundle_generation")
     rows = payload.get("api_fragments") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
         retry_payload = llm_client.invoke_json(
-            "Return JSON only with api_fragments. Include every requested step_id exactly once; each core_cpp must be non-empty statements-only C++.",
+            "Return JSON only with api_fragments. Include every requested step_id exactly once; each call must contain one bare api.<function>(...) expression and no ctx.call.",
             user_prompt,
         )
         _record_generation_response(state, llm_client, stage="api_fragment_bundle_generation_retry")
         payload = retry_payload
         rows = payload.get("api_fragments") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
-        # Keep compatibility with providers that return one combined core_cpp;
-        # it is accepted only when one fragment was requested.
-        if len(requested_rows) == 1:
-            core = _core_cpp_from_payload(payload)
-            if core:
-                return {str(requested_rows[0][0].step_id): _normalize_model_core(core)}
-        raise ValueError("CODEGEN_FRAGMENT_BUNDLE_FORMAT: expected JSON api_fragments array")
+        raise ValueError("CODEGEN_FRAGMENT_BUNDLE_FORMAT: expected JSON api_fragments array of bare calls")
     expected = {str(step.step_id): names for step, names in requested_rows}
     result: dict[str, str] = {}
+    seen_step_ids: set[str] = set()
     for row in rows:
         if not isinstance(row, dict):
             continue
         step_id = str(row.get("step_id", "")).strip()
         if step_id not in expected:
             raise ValueError(f"CODEGEN_FRAGMENT_BUNDLE_UNPLANNED_STEP: {step_id or '<missing>'}")
+        if step_id in seen_step_ids:
+            raise ValueError(f"CODEGEN_FRAGMENT_BUNDLE_DUPLICATE_STEP: step_id={step_id}")
+        seen_step_ids.add(step_id)
         returned_apis = row.get("apis", expected[step_id])
         if not isinstance(returned_apis, list) or set(str(item) for item in returned_apis) != set(expected[step_id]):
             raise ValueError(
                 f"CODEGEN_FRAGMENT_BUNDLE_API_MISMATCH: step_id={step_id}; "
                 f"expected={expected[step_id]}; returned={returned_apis}"
             )
-        core = _core_cpp_from_payload({"core_cpp": row.get("core_cpp", "")})
-        if not core:
-            raise ValueError(f"CODEGEN_CORE_EMPTY[step={step_id}]: fragment core_cpp is empty")
-        result[step_id] = _normalize_model_core(core)
+        if row.get("core_cpp") or row.get("fragment_cpp"):
+            raise ValueError(
+                f"CODEGEN_MODEL_OUTPUT_CONTRACT[step={step_id}]: core_cpp is forbidden; return bare call_expr"
+            )
+        calls = row.get("calls")
+        if calls is None and row.get("call_expr"):
+            calls = [{
+                "api_name": row.get("api_name") or (expected[step_id][0] if len(expected[step_id]) == 1 else ""),
+                "call_expr": row.get("call_expr"),
+                "parameter_values": row.get("parameter_values", {}),
+            }]
+        if not isinstance(calls, list) or not calls:
+            raise ValueError(f"CODEGEN_CALLS_EMPTY[step={step_id}]: return calls with bare call_expr entries")
+        returned_call_names: list[str] = []
+        assembled: list[str] = []
+        for call in calls:
+            if not isinstance(call, dict):
+                raise ValueError(f"CODEGEN_CALL_SPEC_INVALID[step={step_id}]: call entry must be an object")
+            api_name = str(call.get("api_name", "")).strip()
+            call_expr = str(call.get("call_expr", "")).strip()
+            if api_name not in expected[step_id]:
+                raise ValueError(
+                    f"CODEGEN_CALL_API_MISMATCH: step_id={step_id}; expected={expected[step_id]}; returned={api_name}"
+                )
+            parameter_values = call.get("parameter_values", {})
+            if not isinstance(parameter_values, dict):
+                raise ValueError(f"CODEGEN_CALL_PARAMETERS_INVALID: step_id={step_id}; api={api_name}")
+            try:
+                # Each combination needs a unique local output object name,
+                # while the externally visible step_id remains the plan's
+                # step_id for logging and PCAP correlation.
+                combination_index = len(assembled) + 1
+                fragment, _outputs = assemble_capture_call(
+                    step_id=step_id,
+                    api_name=api_name,
+                    call_expr=call_expr,
+                    parameter_values=parameter_values,
+                    available_symbols=_runtime_symbols_before_step(all_steps, step_id),
+                    symbol_step_id=(step_id if combination_index == 1 else f"{step_id}_C{combination_index:03d}"),
+                )
+            except SdkCallAssemblyError as exc:
+                raise ValueError(f"CODEGEN_CALL_ASSEMBLY_FAILED[step={step_id},api={api_name}]: {exc}") from exc
+            returned_call_names.append(api_name)
+            assembled.append(fragment)
+        if not set(expected[step_id]).issubset(set(returned_call_names)):
+            raise ValueError(
+                f"CODEGEN_CALL_API_MISMATCH: step_id={step_id}; expected={expected[step_id]}; returned={returned_call_names}"
+            )
+        result[step_id] = "\n".join(assembled)
+        # Persist each valid assembled step immediately. If a later step in
+        # the same batch is malformed, repair can reuse this step unchanged.
+        state.plan.rag_context.setdefault("codegen_api_call_specs", {})[step_id] = calls
+        state.plan.rag_context.setdefault("codegen_api_fragments", {})[step_id] = {
+            "step_id": step_id,
+            "functions": list(expected[step_id]),
+            "call_specs": calls,
+            "core_cpp": result[step_id],
+        }
     missing = [step_id for step_id in expected if step_id not in result]
     if missing:
         raise ValueError("CODEGEN_FRAGMENT_BUNDLE_MISSING_STEPS: " + ", ".join(missing))
@@ -4246,6 +4322,13 @@ def generate_cpp_api_script_with_llm(
     llm_client: LlmClient,
 ) -> str:
     assert state.plan is not None
+    # Deprecated compatibility entry point: keep the model on the same bare
+    # API contract as the production path.  The local SDK assembler produces
+    # the statements-only capture fragment; this function no longer asks the
+    # model for a complete source file or a ``ctx.call`` wrapper.
+    return generate_api_fragments_with_llm(
+        state, executable_steps, nc_program, llm_client, wrap=False,
+    )
     selected_functions = sorted(
         {
             function_name

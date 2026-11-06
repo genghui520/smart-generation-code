@@ -137,6 +137,22 @@ class ValidateFocasCppToolTests(unittest.TestCase):
         self.assertTrue(any("CAPTURE_CALL_SIGNATURE_MISMATCH" in error for error in result.errors))
         self.assertIn("CaptureContext::call six-argument contract", result.checked_rules)
 
+    def test_raw_model_output_contract_rejects_capture_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cpp = root / "api_script.cpp"
+            cpp.write_text(BASE_CPP, encoding="utf-8")
+            result = ValidateFocasCppTool().invoke(
+                ValidateFocasCppInput(
+                    cpp,
+                    nc_program="O1234\nM30\n",
+                    model_output='ctx.call("S001", "cnc_statinfo", "", api.cnc_statinfo, [](){}, [](){})',
+                    model_api_name="cnc_statinfo",
+                )
+            )
+        self.assertFalse(result.success)
+        self.assertTrue(any("MODEL_BARE_API_CONTRACT" in error for error in result.errors))
+
 
 if __name__ == "__main__":
     unittest.main()

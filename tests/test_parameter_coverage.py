@@ -204,7 +204,11 @@ class ParameterCoverageTests(unittest.TestCase):
         client.invoke_json.return_value = {"api_fragments": [{
             "step_id": "sample",
             "apis": ["cnc_absolute"],
-            "core_cpp": 'ret = ctx.call("TARGET", "cnc_absolute", "axis=-1", api.cnc_absolute, [&] { return api.cnc_absolute(handle, static_cast<short>(-1), static_cast<short>(132), &value); }, [&](short) { return ""; });',
+            "calls": [{
+                "api_name": "cnc_absolute",
+                "call_expr": "api.cnc_absolute(handle, static_cast<short>(-1), static_cast<short>(132), &__out_absolute)",
+                "parameter_values": {"axis": -1, "length": 132},
+            }],
         }]}
         fragment = generate_capture_fragment(state, p.steps, "", client)
         client.invoke_json.assert_called_once()
@@ -229,11 +233,33 @@ class ParameterCoverageTests(unittest.TestCase):
         client.invoke_json.return_value = {"api_fragments": [{
             "step_id": "sample",
             "apis": ["cnc_rdopmsg"],
-            "core_cpp": 'ret = ctx.call("TARGET", "cnc_rdopmsg", "FlibHndl=" + std::to_string(handle), api.cnc_rdopmsg, [&] { return api.cnc_rdopmsg(handle, &msg); }, [&](short) { return ""; });',
+            "calls": [{
+                "api_name": "cnc_rdopmsg",
+                "call_expr": "api.cnc_rdopmsg(handle, 0, 256, &__out_opmsg)",
+                "parameter_values": {"type": 0, "length": 256},
+            }],
         }]}
         fragment = generate_capture_fragment(state, p.steps, "", client)
         self.assertIn("api.cnc_rdopmsg", fragment)
         self.assertEqual(client.invoke_json.call_count, 1)
+
+    def test_one_step_can_emit_multiple_parameter_combinations(self):
+        from smart_traffic_agent.agents.code_generator import generate_capture_fragment
+        p = plan_for("cnc_statinfo")
+        state = WorkflowState(request=TaskRequest("capture", "t"), plan=p)
+        client = Mock(); client.enabled = True
+        client.invoke_json.return_value = {"api_fragments": [{
+            "step_id": "sample",
+            "apis": ["cnc_statinfo"],
+            "calls": [
+                {"api_name": "cnc_statinfo", "call_expr": "api.cnc_statinfo(handle, &__out_statinfo)", "parameter_values": {}},
+                {"api_name": "cnc_statinfo", "call_expr": "api.cnc_statinfo(handle, &__out_statinfo)", "parameter_values": {}},
+            ],
+        }]}
+        fragment = generate_capture_fragment(state, p.steps, "", client)
+        assert fragment.count('"cnc_statinfo"') == 2
+        assert "sample_C002_statinfo" in fragment
+        assert client.invoke_json.call_count == 1
 
     def test_batch_generation_rejects_legacy_capture_call_before_compile(self):
         from smart_traffic_agent.agents.code_generator import generate_capture_fragment
@@ -243,10 +269,9 @@ class ParameterCoverageTests(unittest.TestCase):
         client.invoke_json.return_value = {"api_fragments": [{
             "step_id": "sample",
             "apis": ["cnc_statinfo"],
-            "core_cpp": 'ret = ctx.call("cnc_statinfo", [&]() { return api.cnc_statinfo(handle, &status); }, '
-                         '{{"FlibHndl", std::to_string(handle)}}, {{"run", "0"}});',
+            "core_cpp": 'ret = ctx.call("cnc_statinfo", [&]() { return api.cnc_statinfo(handle, &status); }, {{"FlibHndl", std::to_string(handle)}}, {{"run", "0"}});',
         }]}
-        with self.assertRaisesRegex(ValueError, "CAPTURE_CALL_SIGNATURE_MISMATCH"):
+        with self.assertRaisesRegex(ValueError, "CODEGEN_MODEL_OUTPUT_CONTRACT"):
             generate_capture_fragment(state, p.steps, "", client)
         self.assertEqual(client.invoke_json.call_count, 1)
 
@@ -258,18 +283,17 @@ class ParameterCoverageTests(unittest.TestCase):
         client = Mock(); client.enabled = True
         client.invoke_json.side_effect = [
             {"api_fragments": [
-                {"step_id": "sample", "apis": ["cnc_statinfo"], "core_cpp": 'ret = ctx.call("S1", "cnc_statinfo", "", api.cnc_statinfo, [&] { return api.cnc_statinfo(handle, &status); }, [&](short) { return ""; });'},
-                {"step_id": "S2", "apis": ["cnc_rdopmsg"], "core_cpp": 'ret = ctx.call("S2", "cnc_rdopmsg", "", api.cnc_rdopmsg, [&] { return api.cnc_rdopmsg(handle, &msg); }, [&](short) { return ""; });'},
+                {"step_id": "sample", "apis": ["cnc_statinfo"], "calls": [{"api_name": "cnc_statinfo", "call_expr": 'api.cnc_statinfo(handle, &__out_statinfo)', "parameter_values": {}}]},
+                {"step_id": "S2", "apis": ["cnc_rdopmsg"], "calls": [{"api_name": "cnc_rdopmsg", "call_expr": 'api.cnc_rdopmsg(handle, 0, 256, &__out_opmsg)', "parameter_values": {"type": 0, "length": 256}}]},
             ]},
             {"api_fragments": [
-                {"step_id": "S2", "apis": ["cnc_rdopmsg"], "core_cpp": 'ret = ctx.call("S2_REPAIRED", "cnc_rdopmsg", "", api.cnc_rdopmsg, [&] { return api.cnc_rdopmsg(handle, &msg2); }, [&](short) { return ""; });'},
+                {"step_id": "S2", "apis": ["cnc_rdopmsg"], "calls": [{"api_name": "cnc_rdopmsg", "call_expr": 'api.cnc_rdopmsg(handle, 0, 256, &__out_opmsg)', "parameter_values": {"type": 0, "length": 256}}]},
             ]},
         ]
         first = generate_capture_fragment(state, p.steps, "", client)
         second = generate_capture_fragment(state, p.steps, "", client, previous=first, diagnostics="BLOCKING: cnc_rdopmsg call")
-        self.assertIn('"S1"', second)
-        self.assertIn('"S2_REPAIRED"', second)
-        self.assertNotIn('"S2"', second)
+        self.assertIn('"sample"', second)
+        self.assertIn('"S2"', second)
         self.assertEqual(client.invoke_json.call_count, 2)
 
     def test_failed_fragment_keeps_valid_cached_fragments_for_code_repair(self):
@@ -280,25 +304,24 @@ class ParameterCoverageTests(unittest.TestCase):
         client = Mock(); client.enabled = True
         client.invoke_json.side_effect = [
             {"api_fragments": [
-                {"step_id": "sample", "apis": ["cnc_statinfo"], "core_cpp":
-                    'ret = ctx.call("S1", "cnc_statinfo", "", api.cnc_statinfo, [&]() -> short { return api.cnc_statinfo(handle, &status); }, [&](short) -> std::string { return ""; });'},
+                {"step_id": "sample", "apis": ["cnc_statinfo"], "calls": [{"api_name": "cnc_statinfo", "call_expr": 'api.cnc_statinfo(handle, &__out_statinfo)', "parameter_values": {}}]},
                 {"step_id": "S2", "apis": ["cnc_rdopmsg"], "core_cpp":
                     'ret = ctx.call("cnc_rdopmsg", [&]() { return api.cnc_rdopmsg(handle, &msg); }, {{""}}, {{""}});'},
             ]},
             {"api_fragments": [
-                {"step_id": "S2", "apis": ["cnc_rdopmsg"], "core_cpp":
-                    'ret = ctx.call("S2", "cnc_rdopmsg", "", api.cnc_rdopmsg, [&]() -> short { return api.cnc_rdopmsg(handle, &msg); }, [&](short) -> std::string { return ""; });'},
+                {"step_id": "S2", "apis": ["cnc_rdopmsg"], "calls": [{"api_name": "cnc_rdopmsg", "call_expr": 'api.cnc_rdopmsg(handle, 0, 128, &__out_opmsg)', "parameter_values": {"type": 0, "length": 128}}]},
             ]},
         ]
-        with self.assertRaisesRegex(ValueError, "CAPTURE_CALL_SIGNATURE_MISMATCH"):
+        with self.assertRaisesRegex(ValueError, "CODEGEN_MODEL_OUTPUT_CONTRACT"):
             generate_capture_fragment(state, p.steps, "", client)
         self.assertIn("sample", state.plan.rag_context["codegen_api_fragments"])
         self.assertNotIn("S2", state.plan.rag_context["codegen_api_fragments"])
         state.errors = ["CodeGenerationAgent failed: CAPTURE_CALL_SIGNATURE_MISMATCH api=cnc_rdopmsg"]
         state.repair_history = [{"repair_stage": "repair_code"}]
         repaired = generate_capture_fragment(state, p.steps, "", client)
-        self.assertIn('"S1"', repaired)
+        self.assertIn('"sample"', repaired)
         self.assertIn('"S2"', repaired)
+        self.assertIn("std::to_string(128)", repaired)
         self.assertEqual(client.invoke_json.call_count, 2)
 
 

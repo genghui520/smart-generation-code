@@ -465,7 +465,15 @@ int main() { return cnc_statinfo_fn(handle, nullptr); }
             enabled = True
 
             def invoke_json(self, system_prompt: str, user_prompt: str) -> dict:
-                return {"core_cpp": "ret = api.cnc_actf(handle, &actual_feed); ok = check_rc(ret, \"cnc_actf\") && ok;"}
+                return {"api_fragments": [{
+                    "step_id": "S001",
+                    "apis": ["cnc_actf"],
+                    "calls": [{
+                        "api_name": "cnc_actf",
+                        "call_expr": "api.cnc_actf(handle, &__out_actualfeed)",
+                        "parameter_values": {},
+                    }],
+                }]}
 
         from smart_traffic_agent.agents.code_generator import render_code_only_cpp_artifacts
 
@@ -496,7 +504,7 @@ int main() { return cnc_statinfo_fn(handle, nullptr); }
         self.assertIn("SCENARIO_CORE_BEGIN", fragment)
         # Code-only rendering uses the same one-request API-fragment contract
         # as production capture when an LLM is configured.
-        self.assertIn("api.cnc_actf(handle, &actual_feed)", fragment)
+        self.assertIn("api.cnc_actf(handle, &S001_actualfeed)", fragment)
 
     def test_scenario_fragment_rejects_main_and_loader_ownership_leaks(self) -> None:
         fragment = build_scenario_fragment(

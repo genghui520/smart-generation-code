@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import re
 
 from .base import AgentTool
 from ..execution_contracts import ExecutionContract
@@ -20,6 +21,11 @@ class ValidateFocasCppInput:
     code_only_evaluation: bool = False
     code_spec: Any = None
     production_contract: ExecutionContract | None = None
+    # Optional raw model fragment for the generation-time contract gate.  The
+    # normal production validation path leaves this unset because the raw
+    # response is consumed immediately by CodeGenerationAgent.
+    model_output: str | None = None
+    model_api_name: str | None = None
 
 
 @dataclass(slots=True)
@@ -47,6 +53,30 @@ class ValidateFocasCppTool(AgentTool[ValidateFocasCppInput, ValidateFocasCppOutp
             )
 
         source = tool_input.cpp_path.read_text(encoding="utf-8")
+        generation_contract_errors: list[str] = []
+        if tool_input.model_output is not None:
+            raw_model = str(tool_input.model_output)
+            forbidden = []
+            if "ctx.call" in raw_model:
+                forbidden.append("ctx.call")
+            if re.search(r"\b(?:main|run_generated_scenario)\s*\(", raw_model):
+                forbidden.append("function wrapper")
+            if re.search(r"\[\s*&?\s*\]\s*\(", raw_model):
+                forbidden.append("lambda")
+            if "```" in raw_model or re.search(r"(?m)^\s*(?:#\s*include|typedef|struct|class)\b", raw_model):
+                forbidden.append("declaration/markdown wrapper")
+            if forbidden:
+                generation_contract_errors.append(
+                    "BLOCKING: MODEL_BARE_API_CONTRACT: model output contains "
+                    + ", ".join(sorted(set(forbidden)))
+                    + "; expected one bare api.<function>(...) expression per call"
+                )
+            elif tool_input.model_api_name:
+                from ..sdk_cpp_generator import SdkCallAssemblyError, parse_bare_api_call
+                try:
+                    parse_bare_api_call(raw_model, str(tool_input.model_api_name))
+                except SdkCallAssemblyError as exc:
+                    generation_contract_errors.append("BLOCKING: MODEL_BARE_API_CONTRACT: " + str(exc))
         shell = source
         fragment = ""
         if tool_input.fragment_path is not None:
@@ -135,6 +165,7 @@ class ValidateFocasCppTool(AgentTool[ValidateFocasCppInput, ValidateFocasCppOutp
             diagnostics.extend(validate_official_output_usage(source, tool_input.code_spec))
             diagnostics.extend(validate_download_payload(source, tool_input.code_spec))
 
+        diagnostics.extend(generation_contract_errors)
         errors = [item for item in diagnostics if item.startswith("BLOCKING:")]
         warnings = [item for item in diagnostics if not item.startswith("BLOCKING:")]
         return ValidateFocasCppOutput(
@@ -152,6 +183,7 @@ class ValidateFocasCppTool(AgentTool[ValidateFocasCppInput, ValidateFocasCppOutp
                 "planned API coverage and semantic bindings",
                 "scenario fragment boundary",
                 "CaptureContext::call six-argument contract",
+                "model bare API expression contract" if tool_input.model_output is not None else "model bare API expression contract (deferred to CodeGenerationAgent)",
                 "NC payload framing",
             ],
         )
@@ -162,6 +194,8 @@ class ValidateFocasCppTool(AgentTool[ValidateFocasCppInput, ValidateFocasCppOutp
             "fragment_path": str(tool_input.fragment_path) if tool_input.fragment_path else None,
             "executable_step_count": len(tool_input.executable_steps),
             "code_only_evaluation": tool_input.code_only_evaluation,
+            "model_output_present": tool_input.model_output is not None,
+            "model_api_name": tool_input.model_api_name,
             "production_contract": tool_input.production_contract.to_dict() if tool_input.production_contract else None,
         }
 

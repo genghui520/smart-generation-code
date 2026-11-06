@@ -126,3 +126,96 @@ def test_sdk_cpp_generator_converts_json_plan_without_model_authored_cpp():
     assert "api.cnc_wrrelpos(handle, wrrelpos_length, &wrrelpos_value)" in core
     assert "IDBWRR" in core
     assert "api.function(" not in core
+
+
+def test_sdk_call_assembler_wraps_bare_call_and_builds_local_logging():
+    from smart_traffic_agent.sdk_cpp_generator import assemble_capture_call
+
+    fragment, outputs = assemble_capture_call(
+        step_id="S001",
+        api_name="cnc_statinfo",
+        call_expr="api.cnc_statinfo(handle, &__out_statinfo)",
+        parameter_values={},
+    )
+    assert "ODBST S001_statinfo{};" in fragment
+    assert 'ctx.call("S001", "cnc_statinfo"' in fragment
+    assert "api.cnc_statinfo(handle, &S001_statinfo)" in fragment
+    assert "run=" in fragment
+    assert outputs["statinfo"] == "S001_statinfo"
+
+
+def test_sdk_call_assembler_rejects_model_owned_capture_wrapper_and_wrong_arity():
+    from smart_traffic_agent.sdk_cpp_generator import SdkCallAssemblyError, assemble_capture_call
+
+    for expression, expected in (
+        ('ctx.call("S", "cnc_statinfo", "", api.cnc_statinfo, [](){}, [](){})', "SDK_CALL_EXPRESSION_INVALID"),
+        ("api.cnc_statinfo(handle)", "SDK_CALL_ARGUMENT_COUNT_MISMATCH"),
+    ):
+        try:
+            assemble_capture_call(step_id="S001", api_name="cnc_statinfo", call_expr=expression)
+        except SdkCallAssemblyError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError("invalid model call must be rejected")
+
+
+def test_sdk_call_assembler_preserves_relative_axis_length_order():
+    from smart_traffic_agent.sdk_cpp_generator import assemble_capture_call
+
+    fragment, _ = assemble_capture_call(
+        step_id="S002",
+        api_name="cnc_relative",
+        call_expr="api.cnc_relative(handle, axis, length, &__out_relative)",
+        parameter_values={"axis": "axis", "length": "length"},
+        available_symbols={"axis": "axis", "length": "length"},
+    )
+    assert "api.cnc_relative(handle, axis, length, &S002_relative)" in fragment
+
+
+def test_sdk_call_assembler_rejects_named_axis_length_swap():
+    from smart_traffic_agent.sdk_cpp_generator import SdkCallAssemblyError, assemble_capture_call
+
+    try:
+        assemble_capture_call(
+            step_id="S003",
+            api_name="cnc_relative",
+            call_expr="api.cnc_relative(handle, length, axis, &__out_relative)",
+            parameter_values={"axis": "axis", "length": "length"},
+            available_symbols={"axis": "axis", "length": "length"},
+        )
+    except SdkCallAssemblyError as exc:
+        assert "SDK_CALL_PARAMETER_ORDER_MISMATCH" in str(exc)
+    else:
+        raise AssertionError("swapped named parameters must be rejected")
+
+
+def test_sdk_call_assembler_allows_runtime_member_expression():
+    from smart_traffic_agent.sdk_cpp_generator import assemble_capture_call
+
+    fragment, _ = assemble_capture_call(
+        step_id="S002",
+        api_name="cnc_relative",
+        call_expr="api.cnc_relative(handle, runtime_axis.value, length, &__out_relative)",
+        parameter_values={"axis": "runtime_axis.value", "length": "length"},
+        available_symbols={"runtime_axis": "runtime_axis", "length": "length"},
+    )
+    assert "runtime_axis.value" in fragment
+
+
+def test_sdk_call_assembler_uses_unique_output_names_for_combinations():
+    from smart_traffic_agent.sdk_cpp_generator import assemble_capture_call
+
+    first, _ = assemble_capture_call(
+        step_id="S001",
+        api_name="cnc_statinfo",
+        call_expr="api.cnc_statinfo(handle, &__out_statinfo)",
+        symbol_step_id="S001",
+    )
+    second, _ = assemble_capture_call(
+        step_id="S001",
+        api_name="cnc_statinfo",
+        call_expr="api.cnc_statinfo(handle, &__out_statinfo)",
+        symbol_step_id="S001_C002",
+    )
+    assert "ODBST S001_statinfo{};" in first
+    assert "ODBST S001_C002_statinfo{};" in second

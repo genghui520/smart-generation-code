@@ -86,7 +86,15 @@ goal: read a macro variable
         plan.steps = [PlanStep("S001", "during", "read macro", "ReadMacro", {}, protocol_function="cnc_rdmacro")]
         state = WorkflowState(request=request, plan=plan)
         llm = Mock()
-        llm.invoke_json.return_value = {"cpp_code": "int main(){return 0;}"}
+        llm.invoke_json.return_value = {"api_fragments": [{
+            "step_id": "S001",
+            "apis": ["cnc_rdmacro"],
+            "calls": [{
+                "api_name": "cnc_rdmacro",
+                "call_expr": "api.cnc_rdmacro(handle, 1, 8, &__out_macro)",
+                "parameter_values": {"number": 1, "length": 8},
+            }],
+        }]}
         with patch("smart_traffic_agent.agents.code_generator.official_focas_abi_context", return_value="ABI"), \
              patch("smart_traffic_agent.agents.code_generator.sdk_type_context_for_abi", return_value="SDK"):
             generate_cpp_api_script_with_llm(state, plan.steps, "", llm)
